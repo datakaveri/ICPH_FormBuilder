@@ -1,0 +1,56 @@
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python caching
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# React build artifacts
+frontend/node_modules/
+frontend/dist/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Project specific ignores (Large data, caches, models)
+data/
+output/
+Terminologies/
+cache/
+SchemaTerminologies/
+nltk_data/
+
+# Keep the small ICPH meta-form schema bundle while continuing to ignore
+# large terminology/model artifacts under SchemaTerminologies.
+!SchemaTerminologies/
+SchemaTerminologies/*
+!SchemaTerminologies/README.md
+!SchemaTerminologies/schemas/
+SchemaTerminologies/schemas/*
+!SchemaTerminologies/schemas/fhir/
+!SchemaTerminologies/schemas/fhir/**
+!SchemaTerminologies/schemas/ICPH_MetaForms/
+!SchemaTerminologies/schemas/ICPH_MetaForms/**
+SchemaTerminologies/**/.DS_Store
+
+# Local implementation notes and one-off audit reports
+DETERMINISM_GENERALIZATION_PORTING_GUIDE.md
+NEW_DETERMINISTIC_GENERALIZATION_README.md
+hardcoded_analysis.md
+
+# Keep empty directories if they contain .gitkeep
+!data/.gitkeep
+!output/.gitkeep
+!cache/.gitkeep

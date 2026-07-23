@@ -1,0 +1,52 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "clinic_north",
+      "properties": {
+        "title": "North Clinic",
+        "facility_type": "clinic",
+        "zone": "north"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [77.5946, 12.9716]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "clinic_south",
+      "properties": {
+        "title": "South Clinic",
+        "facility_type": "clinic",
+        "zone": "south"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [77.615, 12.9352]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "study_catchment",
+      "properties": {
+        "title": "Study Catchment Area",
+        "facility_type": "polygon",
+        "zone": "catchment"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [77.57, 12.93],
+            [77.64, 12.93],
+            [77.64, 12.99],
+            [77.57, 12.99],
+            [77.57, 12.93]
+          ]
+        ]
+      }
+    }
+  ]
+}

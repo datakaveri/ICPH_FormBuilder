@@ -1,0 +1,62 @@
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets and local runtime config
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+*.p12
+*.ovpn
+
+# Python environments and caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Node/Vite artifacts
+node_modules/
+dist/
+build/
+.vite/
+.next/
+coverage/
+
+# Local app outputs and uploaded/generated data
+output/
+agentic-entity-mapper/output/
+agentic-entity-mapper/cache/
+agentic-entity-mapper/data/
+form-builder/dist/
+
+# Large terminology/model assets. Keep lightweight schemas tracked.
+agentic-entity-mapper/SchemaTerminologies/artifacts/
+agentic-entity-mapper/SchemaTerminologies/terminologies/
+agentic-entity-mapper/SchemaTerminologies/cache/
+agentic-entity-mapper/SchemaTerminologies/nltk_data/
+
+# Local ODK runtimes and mutable Central data
+ODK/.venv-xlsform/
+ODK/central/.env
+ODK/central/files/
+ODK/central/*/files/
+ODK/central/*/node_modules/
+ODK/central/*/tmp/
+
+# Local Git metadata backups created while consolidating this repository
+.git-unlinked-backups/

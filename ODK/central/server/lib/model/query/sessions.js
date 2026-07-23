@@ -1,0 +1,66 @@
+// Copyright 2017 ODK Central Developers
+// See the NOTICE file at the top-level directory of this distribution and at
+// https://github.com/getodk/central-backend/blob/master/NOTICE.
+// This file is part of ODK Central. It is subject to the license terms in
+// the LICENSE file found in the top-level directory of this distribution and at
+// https://www.apache.org/licenses/LICENSE-2.0. No part of ODK Central,
+// including this file, may be copied, modified, propagated, or distributed
+// except according to the terms contained in the LICENSE file.
+
+const { sql } = require('slonik');
+const { map } = require('ramda');
+const { Actor, Session } = require('../frames');
+const { generateToken, isValidToken } = require('../../util/crypto');
+const { unjoiner } = require('../../util/db');
+const { construct } = require('../../util/util');
+const Option = require('../../util/option');
+const config = require('config');
+
+const create = (actor, expiresAt) => ({ one }) => {
+  const expirySqlFragment = (expiresAt instanceof Date ? sql`${expiresAt.toISOString()}` : sql`statement_timestamp() + ${config.default.sessionLifetime + ' s'}::interval`);
+  return one(sql`
+      INSERT INTO sessions (
+        "actorId",
+        token,
+        csrf,
+        "createdAt",
+        "expiresAt"
+      )
+      VALUES (
+        ${actor.id},
+        ${generateToken()},
+        ${generateToken()},
+        statement_timestamp(),
+        ${expirySqlFragment}
+      )
+      RETURNING *
+    `)
+    .then(construct(Session));
+};
+
+const _unjoiner = unjoiner(Session, Actor);
+const getByBearerToken = (token) => ({ maybeOne }) => (isValidToken(token) ? maybeOne(sql`
+select ${_unjoiner.fields} from sessions
+join actors on actors.id=sessions."actorId"
+where token=${token} and sessions."expiresAt" > now()`)
+  .then(map(_unjoiner)) : Promise.resolve(Option.none()));
+
+const terminateByActorId = (actorId, current = undefined) => ({ run }) =>
+  run(sql`DELETE FROM sessions WHERE "actorId"=${actorId}
+${current == null ? sql`` : sql`AND token <> ${current}`}`);
+
+const terminate = (session) => ({ run }) =>
+  run(sql`delete from sessions where token=${session.token}`);
+
+terminate.audit = (session) => (log) => {
+  // don't audit user logouts, since they're just normal user actions.
+  if (session.actor.type === 'user') return;
+  const prefix = (session.actor.type != null) ? `${session.actor.type}.` : '';
+  return log(`${prefix}session.end`, session.actor);
+};
+
+const reap = () => ({ run }) =>
+  run(sql`delete from sessions where "expiresAt" < now()`);
+
+module.exports = { create, getByBearerToken, terminateByActorId, terminate, reap };
+

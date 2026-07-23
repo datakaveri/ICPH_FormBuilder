@@ -1,0 +1,473 @@
+const should = require('should');
+const { testService, withClosedForm } = require('../setup');
+const testData = require('../../data/xml');
+
+describe('api: /projects/:id/forms/:id/public-links', () => {
+  describe('POST', () => {
+    it('should return 403 unless the user is allowed to create', testService((service) =>
+      service.login('chelsea', asChelsea =>
+        asChelsea.post('/v1/projects/1/forms/simple/public-links')
+          .send({ displayName: 'test1' })
+          .expect(403))));
+
+    it('should return the created key', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links')
+          .send({ displayName: 'test1' })
+          .expect(200)
+          .then(({ body }) => {
+            body.should.be.a.PublicLink();
+            body.displayName.should.equal('test1');
+            should.not.exist(body.once);
+          }))));
+
+    it('should return the once attribute if given', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links')
+          .send({ displayName: 'test2', once: true })
+          .expect(200)
+          .then(({ body }) => {
+            body.should.be.a.PublicLink();
+            body.once.should.equal(true);
+          }))));
+
+    it('should allow project managers to create', testService((service) =>
+      service.login('bob', (asBob) =>
+        asBob.post('/v1/projects/1/forms/simple/public-links')
+          .send({ displayName: 'test1' })
+          .expect(200))));
+
+    it('should allow the created user to submit to the given form', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links')
+          .send({ displayName: 'test1' })
+          .expect(200)
+          .then(({ body }) => body.token)
+          .then((key) => service.post(`/v1/key/${key}/projects/1/forms/simple/submissions`)
+            .set('Content-Type', 'text/xml')
+            .send(testData.instances.simple.one)
+            .expect(200)))));
+
+    it('should log the action in the audit log', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links')
+          .send({ displayName: 'test1' })
+          .expect(200)
+          .then(() => asAlice.get('/v1/audits?action=public_link.create')
+            .expect(200)
+            .then(({ body }) => {
+              body.length.should.equal(1);
+              body[0].actorId.should.equal(5);
+              body[0].acteeId.should.be.a.uuid();
+            })))));
+
+    it('should set actor property values when creating public link', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'region' }).expect(200);
+
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({
+          displayName: 'test link',
+          properties: { region: 'north' }
+        })
+        .expect(200);
+
+      await asAlice.get(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .set('X-Extended-Metadata', 'true')
+        .expect(200)
+        .then(({ body }) => {
+          body.properties.should.eql({ region: 'north' });
+        });
+    }));
+
+    it('should log the property set in the audit log', testService(async (service, container) => {
+      const asAlice = await service.login('alice');
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'region' }).expect(200);
+
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({
+          displayName: 'test link',
+          properties: { region: 'north' }
+        })
+        .expect(200);
+
+      const actor = await container.Actors.getById(pl.id).then((o) => o.get());
+
+      const { body: audits } = await asAlice.get('/v1/audits?action=public_link.property.set').expect(200);
+      audits.length.should.equal(1);
+      audits[0].actorId.should.equal(5); // alice
+      audits[0].acteeId.should.equal(actor.acteeId);
+      audits[0].details.properties.should.eql({ region: 'north' });
+    }));
+  });
+
+  describe('GET', () => {
+    it('should return 403 unless the user is allowed to list', testService((service) =>
+      service.login('chelsea', (asChelsea) =>
+        asChelsea.get('/v1/projects/1/forms/simple/public-links').expect(403))));
+
+    it('should return a list of links in order with merged data', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 1' }).expect(200)
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 2', once: true }).expect(200))
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 3' }).expect(200))
+          .then(() => asAlice.get('/v1/projects/1/forms/simple/public-links')
+            .expect(200)
+            .then(({ body }) => {
+              body.map((link) => link.displayName).should.eql([ 'test 3', 'test 2', 'test 1' ]);
+              // eslint-disable-next-line semi
+              body.forEach((link) => { link.should.be.a.PublicLink() });
+              body[1].once.should.equal(true);
+            })))));
+
+    it('should only return tokens from the requested form', testService((service) =>
+      service.login('alice', (asAlice) => Promise.all([
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 1' }).expect(200)
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 2' }).expect(200)),
+        asAlice.post('/v1/projects/1/forms/withrepeat/public-links').send({ displayName: 'test 3' }).expect(200)
+      ])
+        .then(() => asAlice.get('/v1/projects/1/forms/simple/public-links')
+          .expect(200)
+          .then(({ body }) => {
+            body.length.should.equal(2);
+            body[0].displayName.should.equal('test 2');
+            body[1].displayName.should.equal('test 1');
+          })))));
+
+    it('should leave tokens out if the session is ended', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'compromised' }).expect(200)
+          .then(({ body }) => asAlice.delete('/v1/sessions/' + body.token).expect(200))
+          .then(() => asAlice.get('/v1/projects/1/forms/simple/public-links')
+            .expect(200)
+            .then(({ body }) => {
+              body.length.should.equal(1);
+              const [ key ] = body;
+              key.should.be.a.PublicLink();
+              should(key.token).equal(null);
+            })))));
+
+    it('should sort revoked links to the bottom', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 1' }).expect(200)
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 2' }).expect(200))
+          .then(({ body }) => asAlice.delete('/v1/sessions/' + body.token).expect(200))
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 3' }).expect(200))
+          .then(() => asAlice.get('/v1/projects/1/forms/simple/public-links')
+            .expect(200)
+            .then(({ body }) => {
+              body.length.should.equal(3);
+              body.forEach((key) => key.should.be.a.PublicLink());
+              body.map((key) => key.displayName).should.eql([ 'test 3', 'test 1', 'test 2' ]);
+            })))));
+
+    it('should join through additional data if extended metadata is requested', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 1' }).expect(200)
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 2' }).expect(200))
+          .then(() => asAlice.get('/v1/projects/1/forms/simple/public-links')
+            .set('X-Extended-Metadata', 'true')
+            .expect(200)
+            .then(({ body }) => body.forEach((obj) => {
+              obj.should.be.an.ExtendedPublicLink();
+              obj.createdBy.displayName.should.equal('Alice');
+            }))))));
+
+    it('should sort revoked field keys to the bottom in extended metadata', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 1' }).expect(200)
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 2' }).expect(200))
+          .then(({ body }) => asAlice.delete('/v1/sessions/' + body.token).expect(200))
+          .then(() => asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 3' }).expect(200))
+          .then(() => asAlice.get('/v1/projects/1/forms/simple/public-links')
+            .set('X-Extended-Metadata', true)
+            .expect(200)
+            .then(({ body }) => {
+              body.length.should.equal(3);
+              body.forEach((key) => key.should.be.an.ExtendedPublicLink());
+              body.map((key) => key.displayName).should.eql([ 'test 3', 'test 1', 'test 2' ]);
+            })))));
+
+    it('should include properties in extended metadata', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'region' }).expect(200);
+
+      const { body: pl1 } = await asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 1' }).expect(200);
+      const { body: pl2 } = await asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test 2' }).expect(200);
+
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl1.id}`)
+        .send({ properties: { region: 'north' } })
+        .expect(200);
+
+      await asAlice.get('/v1/projects/1/forms/simple/public-links')
+        .set('X-Extended-Metadata', 'true')
+        .expect(200)
+        .then(({ body }) => {
+          body.find((pl) => pl.id === pl1.id).properties.should.eql({ region: 'north' });
+          should(body.find((pl) => pl.id === pl2.id).properties).be.null();
+        });
+    }));
+  });
+
+  describe('/:id GET', () => {
+    it('should return 403 unless the user can read', testService(async (service) => {
+      const [asAlice, asChelsea] = await service.login(['alice', 'chelsea']);
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test1' }).expect(200);
+      await asChelsea.get(`/v1/projects/1/forms/simple/public-links/${pl.id}`).expect(403);
+    }));
+
+    it('should return the public link', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      const { body: created } = await asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test1' }).expect(200);
+      await asAlice.get(`/v1/projects/1/forms/simple/public-links/${created.id}`)
+        .expect(200)
+        .then(({ body }) => {
+          body.should.be.a.PublicLink();
+          body.displayName.should.equal('test1');
+        });
+    }));
+
+    it('should return 404 if the public link is not on the form', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test1' }).expect(200);
+      await asAlice.get(`/v1/projects/1/forms/withrepeat/public-links/${pl.id}`).expect(404);
+    }));
+
+    it('should return extended metadata if requested', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      const { body: created } = await asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test1' }).expect(200);
+      await asAlice.get(`/v1/projects/1/forms/simple/public-links/${created.id}`)
+        .set('X-Extended-Metadata', 'true')
+        .expect(200)
+        .then(({ body }) => {
+          body.should.be.an.ExtendedPublicLink();
+          body.createdBy.displayName.should.equal('Alice');
+        });
+    }));
+
+    it('should return null properties when no actor properties are defined on the project', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      const { body: created } = await asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'test1' }).expect(200);
+      await asAlice.get(`/v1/projects/1/forms/simple/public-links/${created.id}`)
+        .set('X-Extended-Metadata', 'true')
+        .expect(200)
+        .then(({ body }) => {
+          should(body.properties).be.null();
+        });
+    }));
+  });
+
+  describe('/:id PATCH', () => {
+    it('should set actor property values on a public link', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'region' }).expect(200);
+
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({ displayName: 'test link' })
+        .expect(200);
+
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .send({ properties: { region: 'north' } })
+        .expect(200)
+        .then(({ body }) => {
+          body.properties.should.eql({ region: 'north' });
+        });
+    }));
+
+    it('should set multiple actor properties at once', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'region' }).expect(200);
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'worker_id' }).expect(200);
+
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({ displayName: 'test link' })
+        .expect(200);
+
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .send({ properties: { region: 'north', worker_id: '42' } })
+        .expect(200)
+        .then(({ body }) => {
+          body.properties.should.eql({ region: 'north', worker_id: '42' });
+        });
+    }));
+
+    it('should unset an actor property when passed null', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'region' }).expect(200);
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'worker_id' }).expect(200);
+
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({ displayName: 'test link' })
+        .expect(200);
+
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .send({ properties: { region: 'north', worker_id: '42' } })
+        .expect(200);
+
+      // unset one — the other remains
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .send({ properties: { region: null } })
+        .expect(200)
+        .then(({ body }) => {
+          body.properties.should.eql({ worker_id: '42' });
+        });
+
+      // unset the last one — properties is null
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .send({ properties: { worker_id: null } })
+        .expect(200)
+        .then(({ body }) => {
+          should(body.properties).be.null();
+        });
+    }));
+
+    it('should return 400 if the actor property does not exist', testService(async (service) => {
+      const asAlice = await service.login('alice');
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({ displayName: 'test link' })
+        .expect(200);
+
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .send({ properties: { nonexistent: 'value' } })
+        .expect(400);
+    }));
+
+    // Additional behavior tested in app-users test because the machinery of setting properties is the same.
+
+    it('should log the property set in the audit log', testService(async (service, container) => {
+      const asAlice = await service.login('alice');
+      await asAlice.post('/v1/projects/1/actor-properties').send({ name: 'region' }).expect(200);
+
+      const { body: pl } = await asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({ displayName: 'test link' })
+        .expect(200);
+
+      await asAlice.patch(`/v1/projects/1/forms/simple/public-links/${pl.id}`)
+        .send({ properties: { region: 'north' } })
+        .expect(200);
+
+      const actor = await container.Actors.getById(pl.id).then((o) => o.get());
+
+      const { body: audits } = await asAlice.get('/v1/audits?action=public_link.property.set').expect(200);
+      audits.length.should.equal(1);
+      audits[0].actorId.should.equal(5); // alice
+      audits[0].acteeId.should.equal(actor.acteeId);
+      audits[0].details.properties.should.eql({ region: 'north' });
+    }));
+  });
+
+  describe('/:id DELETE', () => {
+    it('should return 403 unless the user can delete', testService((service) =>
+      service.login(['alice', 'chelsea'], (asAlice, asChelsea) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'condemned' }).expect(200)
+          .then(({ body }) =>
+            asChelsea.delete('/v1/projects/1/forms/simple/public-links/' + body.id).expect(403)))));
+
+    it('should delete the token', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'condemned' }).expect(200)
+          .then(({ body }) => asAlice.delete('/v1/projects/1/forms/simple/public-links/' + body.id).expect(200))
+          .then(() => asAlice.get('/v1/projects/1/forms/simple/public-links')
+            .expect(200)
+            .then(({ body }) => body.should.eql([]))))));
+
+    it('should allow project managers to delete', testService((service) =>
+      service.login('bob', (asBob) =>
+        asBob.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'condemned' }).expect(200)
+          .then(({ body }) => asBob.delete('/v1/projects/1/forms/simple/public-links/' + body.id).expect(200)))));
+
+    it('should only delete the token if it is part of the form', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/withrepeat/public-links')
+          .send({ displayName: 'condemned' })
+          .expect(200)
+          .then(({ body }) => asAlice.delete(`/v1/projects/1/forms/simple/public-links/${body.id}`)
+            .expect(404)))));
+
+    it('should log the token deletion in the audit log', testService((service) =>
+      service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links').send({ displayName: 'condemned' }).expect(200)
+          .then(({ body }) => asAlice.delete('/v1/projects/1/forms/simple/public-links/' + body.id).expect(200))
+          .then(() => asAlice.get('/v1/audits?action=public_link')
+            .then(({ body }) => {
+              body.map((audit) => audit.action).should.eql([ 'public_link.delete', 'public_link.create', 'public_link.assignment.create' ]);
+            })))));
+  });
+});
+
+
+// Test the actual use of public links.
+describe('api: /key/:key', () => {
+  it('should return 403 if an invalid key is provided', testService((service) =>
+    service.get('/v1/key/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/users/current')
+      .expect(403)));
+
+  it('should allow cookie+public-link', testService((service) =>
+    service.authenticateUser('alice')
+      .then((aliceToken) => service.login('alice', (asAlice) =>
+        asAlice.post('/v1/projects/1/forms/simple/public-links')
+          .send({ displayName: 'linktest' })
+          .then(({ body }) => body.token)
+          .then((linkToken) => service.get(`/v1/key/${linkToken}/projects/1/forms/simple.xml`)
+            .set('Cookie', `session=${aliceToken}`)
+            .set('X-Forwarded-Proto', 'https')
+            .expect(200))))));
+
+  it('should passthrough to the appropriate route with successful auth', testService((service) =>
+    service.login('alice', (asAlice) =>
+      asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({ displayName: 'linktest' })
+        .then(({ body }) => body)
+        .then((link) => service.post(`/v1/key/${link.token}/projects/1/forms/simple/submissions`)
+          .send(testData.instances.simple.one)
+          .set('Content-Type', 'application/xml')
+          .expect(200)))));
+
+  it('should not allow creating submissions on other forms', testService((service) =>
+    service.login('alice', (asAlice) =>
+      asAlice.post('/v1/projects/1/forms/simple/public-links')
+        .send({ displayName: 'linktest' })
+        .then(({ body }) => body)
+        .then((link) => service.post(`/v1/key/${link.token}/projects/1/forms/withrepeat/submissions`)
+          .send(testData.instances.withrepeat.one)
+          .set('Content-Type', 'application/xml')
+          .expect(403)))));
+
+  it('should not be able access closed forms and its sub-resources', testService(withClosedForm(async (service) => {
+    const asAlice = await service.login('alice');
+
+    const link = await asAlice.post('/v1/projects/1/forms/withAttachments/public-links')
+      .send({ displayName: 'linktest' })
+      .then(({ body }) => body);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms`)
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/withAttachments`)
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/simple2.xls`)
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/withAttachments.xml`)
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/withAttachments/versions`)
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/withAttachments/fields`)
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/withAttachments/manifest`)
+      .set('X-OpenRosa-Version', '1.0')
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/withAttachments/attachments`)
+      .expect(403);
+
+    await service.get(`/v1/key/${link.token}/projects/1/forms/withAttachments/attachments/goodone.csv`)
+      .expect(403);
+  })));
+});
+
+

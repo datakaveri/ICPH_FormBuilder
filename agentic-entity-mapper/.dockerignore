@@ -1,0 +1,51 @@
+# Ignore data folder as requested
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.docker/
+
+# Kubernetes
+k8s/
+*.yaml
+!requirements.txt
+
+# Logs
+*.log
+
+# Test files
+*.test.py
+tests/
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# JSON output files
+*_output.json

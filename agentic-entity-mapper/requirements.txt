@@ -1,0 +1,54 @@
+# Medical Text Processing Pipeline Dependencies
+# macOS/Apple Silicon wheels use the normal PyPI versions (no Linux `+cpu` suffix).
+torch==2.12.0
+torchvision==0.27.0
+
+# Backend API
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+python-multipart==0.0.20
+
+# LangChain and LangGraph
+langchain==1.3.2
+langchain-core==1.4.0
+langchain-ollama==1.1.0
+langgraph==1.2.2
+
+# Pydantic
+pydantic==2.13.4
+
+# spaCy 
+spacy==3.7.5
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+
+# SciSpacy for clinical models and abbreviation detection
+scispacy==0.6.2
+en_core_sci_sm @ https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz
+
+# medspaCy for deterministic clinical context/assertion detection.
+# This is added alongside spaCy/scispaCy; it does not replace abbreviation handling.
+medspacy==1.3.1
+
+# Medical abbreviation expansion
+medialpy==0.0.4
+
+# FAISS for vector search
+faiss-cpu==1.14.2
+usearch==2.25.3
+turbovec==0.8.0
+
+# Torch (for SapBERT embeddings)
+transformers==5.9.0
+huggingface-hub==1.23.0
+
+# Data handling
+pandas==3.0.3
+numpy==1.26.4
+jsonschema==4.26.0
+httpx==0.28.1
+
+# ICPH meta-form preprocessing: DOCX -> Markdown and schema chunks
+markitdown[docx]==0.1.6
+
+# Pickle for metadata
+requests==2.34.2

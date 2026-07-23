@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="420" viewBox="0 0 720 420">
+  <rect width="720" height="420" rx="24" fill="#c9f0ff"/>
+  <circle cx="112" cy="104" r="54" fill="#ffffff" opacity="0.55"/>
+  <path d="M72 318 L218 168 L330 280 L414 204 L648 318 Z" fill="#ffffff" opacity="0.7"/>
+  <text x="48" y="70" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#14213d">Choice image: Yes</text>
+  <text x="48" y="370" font-family="Arial, sans-serif" font-size="24" fill="#14213d">Choice media attachment</text>
+</svg>

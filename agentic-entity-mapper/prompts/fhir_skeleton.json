@@ -1,0 +1,715 @@
+{
+    "resourceType": "Bundle",
+    "id": "",
+    "type": "collection",
+    "timestamp": "",
+    "entry": [
+        {
+            "fullUrl": "urn:uuid:patient-001",
+            "resource": {
+                "resourceType": "Patient",
+                "id": "patient-001",
+                "identifier": [
+                    {
+                        "system": "",
+                        "value": ""
+                    }
+                ],
+                "active": null,
+                "name": [
+                    {
+                        "family": "",
+                        "given": [],
+                        "prefix": []
+                    }
+                ],
+                "telecom": [
+                    {
+                        "system": "",
+                        "value": "",
+                        "use": ""
+                    }
+                ],
+                "gender": "",
+                "birthDate": "",
+                "address": [
+                    {
+                        "line": [],
+                        "city": "",
+                        "state": "",
+                        "postalCode": ""
+                    }
+                ],
+                "maritalStatus": {
+                    "coding": []
+                },
+                "communication": [
+                    {
+                        "language": {}
+                    }
+                ],
+                "managingOrganization": {
+                    "reference": "urn:uuid:organization-001"
+                }
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:practitioner-001",
+            "resource": {
+                "resourceType": "Practitioner",
+                "id": "practitioner-001",
+                "identifier": [
+                    {
+                        "system": "http://hl7.org/fhir/sid/us-npi",
+                        "value": ""
+                    }
+                ],
+                "active": null,
+                "name": [
+                    {
+                        "family": "",
+                        "given": []
+                    }
+                ],
+                "telecom": [],
+                "gender": "",
+                "qualification": [
+                    {
+                        "code": {}
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:organization-001",
+            "resource": {
+                "resourceType": "Organization",
+                "id": "organization-001",
+                "identifier": [],
+                "active": null,
+                "type": [
+                    {
+                        "coding": [
+                            {
+                                "system": "http://terminology.hl7.org/CodeSystem/organization-type"
+                            }
+                        ]
+                    }
+                ],
+                "name": "",
+                "telecom": [],
+                "address": []
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:encounter-001",
+            "resource": {
+                "resourceType": "Encounter",
+                "id": "encounter-001",
+                "status": "",
+                "class": {
+                    "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                    "code": ""
+                },
+                "type": [
+                    {
+                        "text": ""
+                    }
+                ],
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "participant": [
+                    {
+                        "individual": {
+                            "reference": "urn:uuid:practitioner-001"
+                        }
+                    }
+                ],
+                "period": {
+                    "start": "",
+                    "end": ""
+                },
+                "reasonCode": [],
+                "serviceProvider": {
+                    "reference": "urn:uuid:organization-001"
+                }
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:condition-001",
+            "resource": {
+                "resourceType": "Condition",
+                "id": "condition-001",
+                "clinicalStatus": {
+                    "coding": [
+                        {
+                            "system": "http://terminology.hl7.org/CodeSystem/condition-clinical"
+                        }
+                    ]
+                },
+                "verificationStatus": {
+                    "coding": [
+                        {
+                            "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status"
+                        }
+                    ]
+                },
+                "category": [
+                    {
+                        "coding": []
+                    }
+                ],
+                "severity": {},
+                "code": {
+                    "coding": [
+                        {
+                            "system": "http://snomed.info/sct"
+                        },
+                        {
+                            "system": "http://hl7.org/fhir/sid/icd-10"
+                        }
+                    ],
+                    "text": ""
+                },
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "encounter": {
+                    "reference": "urn:uuid:encounter-001"
+                },
+                "onsetDateTime": "",
+                "recordedDate": ""
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:family-history-001",
+            "resource": {
+                "resourceType": "FamilyMemberHistory",
+                "id": "family-history-001",
+                "status": "",
+                "patient": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "relationship": {
+                    "coding": [
+                        {
+                            "system": "http://terminology.hl7.org/CodeSystem/v3-RoleCode",
+                            "code": "",
+                            "display": ""
+                        }
+                    ]
+                },
+                "condition": [
+                    {
+                        "code": {
+                            "coding": [
+                                {
+                                    "system": "http://snomed.info/sct",
+                                    "code": "",
+                                    "display": ""
+                                }
+                            ],
+                            "text": ""
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:observation-001",
+            "resource": {
+                "resourceType": "Observation",
+                "id": "observation-001",
+                "status": "",
+                "category": [
+                    {
+                        "coding": [
+                            {
+                                "system": "http://terminology.hl7.org/CodeSystem/observation-category"
+                            }
+                        ]
+                    }
+                ],
+                "code": {
+                    "coding": [
+                        {
+                            "system": "http://loinc.org"
+                        }
+                    ],
+                    "text": ""
+                },
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "encounter": {
+                    "reference": "urn:uuid:encounter-001"
+                },
+                "effectiveDateTime": "",
+                "valueQuantity": {
+                    "value": null,
+                    "unit": "",
+                    "system": "http://unitsofmeasure.org",
+                    "code": ""
+                },
+                "valueCodeableConcept": {},
+                "valueString": "",
+                "interpretation": [],
+                "referenceRange": [
+                    {
+                        "low": {},
+                        "high": {},
+                        "text": ""
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:medrequest-001",
+            "resource": {
+                "resourceType": "MedicationRequest",
+                "id": "medrequest-001",
+                "status": "",
+                "intent": "",
+                "category": [],
+                "medicationCodeableConcept": {
+                    "coding": [
+                        {
+                            "system": "http://www.nlm.nih.gov/research/umls/rxnorm"
+                        }
+                    ],
+                    "text": ""
+                },
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "encounter": {
+                    "reference": "urn:uuid:encounter-001"
+                },
+                "authoredOn": "",
+                "requester": {
+                    "reference": "urn:uuid:practitioner-001"
+                },
+                "reasonReference": [
+                    {
+                        "reference": "urn:uuid:condition-001"
+                    }
+                ],
+                "dosageInstruction": [
+                    {
+                        "text": "",
+                        "timing": {},
+                        "doseAndRate": [
+                            {
+                                "doseQuantity": {}
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:medstatement-001",
+            "resource": {
+                "resourceType": "MedicationStatement",
+                "id": "medstatement-001",
+                "status": "",
+                "medicationCodeableConcept": {
+                    "coding": [
+                        {
+                            "system": "http://www.nlm.nih.gov/research/umls/rxnorm"
+                        }
+                    ]
+                },
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "effectiveDateTime": "",
+                "dateAsserted": "",
+                "dosage": [
+                    {
+                        "text": ""
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:allergy-001",
+            "resource": {
+                "resourceType": "AllergyIntolerance",
+                "id": "allergy-001",
+                "clinicalStatus": {},
+                "verificationStatus": {},
+                "type": "",
+                "category": [],
+                "criticality": "",
+                "code": {
+                    "coding": [
+                        {
+                            "system": "http://snomed.info/sct"
+                        }
+                    ]
+                },
+                "patient": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "recordedDate": "",
+                "reaction": [
+                    {
+                        "manifestation": [],
+                        "severity": ""
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:procedure-001",
+            "resource": {
+                "resourceType": "Procedure",
+                "id": "procedure-001",
+                "status": "",
+                "code": {
+                    "coding": [
+                        {
+                            "system": "http://snomed.info/sct"
+                        }
+                    ]
+                },
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "encounter": {
+                    "reference": "urn:uuid:encounter-001"
+                },
+                "performedDateTime": "",
+                "performer": [
+                    {
+                        "actor": {
+                            "reference": "urn:uuid:practitioner-001"
+                        }
+                    }
+                ],
+                "bodySite": [],
+                "outcome": {}
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:vaccine-001",
+            "resource": {
+                "resourceType": "Immunization",
+                "id": "vaccine-001",
+                "status": "",
+                "vaccineCode": {
+                    "coding": [
+                        {
+                            "system": "http://hl7.org/fhir/sid/cvx"
+                        }
+                    ]
+                },
+                "patient": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "occurrenceDateTime": "",
+                "primarySource": null,
+                "lotNumber": "",
+                "expirationDate": ""
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:report-001",
+            "resource": {
+                "resourceType": "DiagnosticReport",
+                "id": "report-001",
+                "status": "",
+                "category": [],
+                "code": {
+                    "coding": [
+                        {
+                            "system": "http://loinc.org"
+                        }
+                    ]
+                },
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "encounter": {
+                    "reference": "urn:uuid:encounter-001"
+                },
+                "effectiveDateTime": "",
+                "issued": "",
+                "performer": [],
+                "result": [
+                    {
+                        "reference": "urn:uuid:observation-001"
+                    }
+                ],
+                "conclusion": ""
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:careplan-001",
+            "resource": {
+                "resourceType": "CarePlan",
+                "id": "careplan-001",
+                "status": "",
+                "intent": "",
+                "category": [],
+                "title": "",
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "period": {},
+                "addresses": [
+                    {
+                        "reference": "urn:uuid:condition-001"
+                    }
+                ],
+                "goal": [],
+                "activity": [
+                    {
+                        "outcomeCodeableConcept": [],
+                        "detail": {
+                            "status": "",
+                            "description": ""
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:goal-001",
+            "resource": {
+                "resourceType": "Goal",
+                "id": "goal-001",
+                "lifecycleStatus": "",
+                "category": [],
+                "description": {
+                    "text": ""
+                },
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "target": [
+                    {
+                        "measure": {},
+                        "detailQuantity": {}
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:doc-001",
+            "resource": {
+                "resourceType": "DocumentReference",
+                "id": "doc-001",
+                "status": "",
+                "docStatus": "",
+                "type": {},
+                "category": [],
+                "subject": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "date": "",
+                "author": [],
+                "content": [
+                    {
+                        "attachment": {
+                            "contentType": "",
+                            "url": "",
+                            "data": "",
+                            "title": ""
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:coverage-001",
+            "resource": {
+                "resourceType": "Coverage",
+                "id": "coverage-001",
+                "identifier": [],
+                "status": "",
+                "type": {},
+                "subscriber": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "subscriberId": "",
+                "beneficiary": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "relationship": {
+                    "coding": [
+                        {
+                            "system": "http://terminology.hl7.org/CodeSystem/subscriber-relationship",
+                            "code": ""
+                        }
+                    ]
+                },
+                "period": {},
+                "payor": [
+                    {
+                        "reference": "urn:uuid:organization-001"
+                    }
+                ],
+                "class": [
+                    {
+                        "type": {
+                            "coding": [
+                                {
+                                    "system": "http://terminology.hl7.org/CodeSystem/coverage-class",
+                            "code": ""
+                                }
+                            ]
+                        },
+                        "value": ""
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:claim-001",
+            "resource": {
+                "resourceType": "Claim",
+                "id": "claim-001",
+                "status": "",
+                "type": {
+                    "coding": [
+                        {
+                            "system": "http://terminology.hl7.org/CodeSystem/claim-type"
+                        }
+                    ]
+                },
+                "use": "",
+                "patient": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "billablePeriod": {},
+                "created": "",
+                "provider": {
+                    "reference": "urn:uuid:organization-001"
+                },
+                "priority": {},
+                "insurance": [
+                    {
+                        "sequence": null,
+                        "focal": null,
+                        "coverage": {
+                            "reference": "urn:uuid:coverage-001"
+                        }
+                    }
+                ],
+                "item": [
+                    {
+                        "sequence": null,
+                        "productOrService": {
+                            "text": ""
+                        },
+                        "encounter": [
+                            {
+                                "reference": "urn:uuid:encounter-001"
+                            }
+                        ],
+                        "unitPrice": {
+                            "value": null,
+                            "currency": ""
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:eob-001",
+            "resource": {
+                "resourceType": "ExplanationOfBenefit",
+                "id": "eob-001",
+                "status": "",
+                "type": {},
+                "use": "",
+                "patient": {
+                    "reference": "urn:uuid:patient-001"
+                },
+                "created": "",
+                "insurer": {
+                    "reference": "urn:uuid:organization-001"
+                },
+                "provider": {
+                    "reference": "urn:uuid:organization-001"
+                },
+                "claim": {
+                    "reference": "urn:uuid:claim-001"
+                },
+                "outcome": "",
+                "insurance": [
+                    {
+                        "coverage": {
+                            "reference": "urn:uuid:coverage-001"
+                        }
+                    }
+                ],
+                "item": [
+                    {
+                        "sequence": null,
+                        "adjudication": [
+                            {
+                                "category": {},
+                                "amount": {
+                                    "value": null,
+                                    "currency": ""
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:device-001",
+            "resource": {
+                "resourceType": "Device",
+                "id": "device-001",
+                "identifier": [],
+                "definition": {},
+                "status": "",
+                "manufacturer": "",
+                "manufactureDate": "",
+                "expirationDate": "",
+                "lotNumber": "",
+                "serialNumber": "",
+                "deviceName": [
+                    {
+                        "name": "",
+                        "type": ""
+                    }
+                ],
+                "type": {},
+                "patient": {
+                    "reference": "urn:uuid:patient-001"
+                }
+            }
+        },
+        {
+            "fullUrl": "urn:uuid:appt-001",
+            "resource": {
+                "resourceType": "Appointment",
+                "id": "appt-001",
+                "status": "",
+                "serviceCategory": [],
+                "serviceType": [],
+                "description": "",
+                "start": "",
+                "end": "",
+                "created": "",
+                "comment": "",
+                "participant": [
+                    {
+                        "actor": {
+                            "reference": "urn:uuid:patient-001"
+                        },
+                        "status": ""
+                    }
+                ]
+            }
+        }
+    ]
+}

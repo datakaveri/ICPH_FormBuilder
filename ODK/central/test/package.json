@@ -1,0 +1,25 @@
+{
+  "name": "odk-central-tests",
+  "scripts": {
+    "lint": "ESLINT_USE_FLAT_CONFIG=false npx eslint --cache .",
+    "test:github-actions": "mocha ./github-actions.spec.js",
+    "test:nginx": "npm run test:nginx:mocha && npm run test:nginx:playwright",
+    "test:nginx:mocha": "NODE_TLS_REJECT_UNAUTHORIZED=0 mocha ./nginx/src/mocha",
+    "test:nginx:playwright": "NODE_TLS_REJECT_UNAUTHORIZED=0 playwright test",
+    "test:service": "mocha ./service.spec.js",
+    "test": "npm run lint && npm run test:github-actions && npm run test:nginx && npm run test:service"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.60.0",
+    "chai": "^5.3.3",
+    "deep-equal-in-any-order": "^2.2.0",
+    "eslint": "^9.28.0",
+    "eslint-plugin-no-only-tests": "^3.3.0",
+    "express": "^4.22.2",
+    "mocha": "^11.7.6",
+    "yaml": "^2.9.0"
+  },
+  "volta": {
+    "node": "24.16.0"
+  }
+}

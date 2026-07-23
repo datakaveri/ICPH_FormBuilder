@@ -1,0 +1,726 @@
+{
+  "resourceType": "Bundle",
+  "id": "synthea_seeded_expanded_bundle",
+  "type": "collection",
+  "timestamp": "2026-05-21T11:00:00Z",
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:Patient-synthea-patient-001",
+      "resource": {
+        "resourceType": "Patient",
+        "id": "synthea-patient-001",
+        "identifier": [
+          {
+            "system": "urn:synthea:synthetic-patient",
+            "value": "SYN-000001"
+          }
+        ],
+        "name": [
+          {
+            "use": "official",
+            "family": "Patel",
+            "given": [
+              "Meera"
+            ],
+            "text": "Meera Patel"
+          }
+        ],
+        "gender": "female",
+        "birthDate": "1971-02-02"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Practitioner-synthea-practitioner-001",
+      "resource": {
+        "resourceType": "Practitioner",
+        "id": "synthea-practitioner-001",
+        "name": [
+          {
+            "use": "official",
+            "text": "Dr. Arjun Sen",
+            "family": "Sen",
+            "given": [
+              "Arjun"
+            ],
+            "prefix": [
+              "Dr."
+            ]
+          }
+        ],
+        "qualification": [
+          {
+            "code": {
+              "text": "General Physician"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Organization-synthea-org-001",
+      "resource": {
+        "resourceType": "Organization",
+        "id": "synthea-org-001",
+        "active": true,
+        "type": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/organization-type",
+                "code": "prov",
+                "display": "Healthcare Provider"
+              }
+            ]
+          }
+        ],
+        "name": "Community Health Clinic",
+        "telecom": [
+          {
+            "system": "phone",
+            "value": "555-0199",
+            "use": "work"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Location-synthea-loc-001",
+      "resource": {
+        "resourceType": "Location",
+        "id": "synthea-loc-001",
+        "status": "active",
+        "name": "Ambulatory Examination Room 1",
+        "mode": "instance",
+        "managingOrganization": {
+          "reference": "Organization/synthea-org-001"
+        }
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:PractitionerRole-synthea-role-001",
+      "resource": {
+        "resourceType": "PractitionerRole",
+        "id": "synthea-role-001",
+        "active": true,
+        "practitioner": {
+          "reference": "Practitioner/synthea-practitioner-001"
+        },
+        "organization": {
+          "reference": "Organization/synthea-org-001"
+        },
+        "code": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/practitioner-role",
+                "code": "doctor",
+                "display": "Doctor"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Encounter-synthea-encounter-001",
+      "resource": {
+        "resourceType": "Encounter",
+        "id": "synthea-encounter-001",
+        "status": "finished",
+        "class": {
+          "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+          "code": "AMB",
+          "display": "ambulatory"
+        },
+        "type": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "185349003",
+                "display": "Encounter for check up"
+              }
+            ],
+            "text": "Encounter for check up"
+          }
+        ],
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "participant": [
+          {
+            "individual": {
+              "reference": "Practitioner/synthea-practitioner-001"
+            }
+          }
+        ],
+        "period": {
+          "start": "2026-05-02T09:00:00Z",
+          "end": "2026-05-02T09:30:00Z"
+        },
+        "reasonCode": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "49727002",
+                "display": "Cough"
+              }
+            ],
+            "text": "Cough"
+          }
+        ],
+        "location": [
+          {
+            "location": {
+              "reference": "Location/synthea-loc-001"
+            }
+          }
+        ],
+        "serviceProvider": {
+          "reference": "Organization/synthea-org-001"
+        }
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Condition-synthea-condition-001",
+      "resource": {
+        "resourceType": "Condition",
+        "id": "synthea-condition-001",
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+              "code": "active",
+              "display": "Active"
+            }
+          ]
+        },
+        "verificationStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+              "code": "confirmed",
+              "display": "Confirmed"
+            }
+          ]
+        },
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                "code": "encounter-diagnosis",
+                "display": "Encounter Diagnosis"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "49727002",
+              "display": "Cough"
+            }
+          ],
+          "text": "Cough"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "recordedDate": "2026-05-02T09:00:00Z"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:AllergyIntolerance-synthea-allergy-001",
+      "resource": {
+        "resourceType": "AllergyIntolerance",
+        "id": "synthea-allergy-001",
+        "clinicalStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+              "code": "active"
+            }
+          ]
+        },
+        "verificationStatus": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-verification",
+              "code": "confirmed"
+            }
+          ]
+        },
+        "category": [
+          "medication"
+        ],
+        "criticality": "high",
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "372531007",
+              "display": "Penicillin (substance)"
+            }
+          ],
+          "text": "Penicillin Allergy"
+        },
+        "patient": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "recordedDate": "2026-05-02T09:10:00Z"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Observation-synthea-observation-001",
+      "resource": {
+        "resourceType": "Observation",
+        "id": "synthea-observation-001",
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                "code": "vital-signs",
+                "display": "Vital Signs"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "75367002",
+              "display": "Blood pressure"
+            }
+          ],
+          "text": "Blood pressure"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "effectiveDateTime": "2026-05-02T09:00:00Z",
+        "issued": "2026-05-02T09:30:00Z",
+        "valueString": "130/84 mmHg"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Procedure-synthea-procedure-001",
+      "resource": {
+        "resourceType": "Procedure",
+        "id": "synthea-procedure-001",
+        "status": "completed",
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "113091000",
+              "display": "Magnetic resonance imaging"
+            }
+          ],
+          "text": "Magnetic resonance imaging"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "performedDateTime": "2026-05-02T09:00:00Z",
+        "performer": [
+          {
+            "actor": {
+              "reference": "Practitioner/synthea-practitioner-001"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Immunization-synthea-immunization-001",
+      "resource": {
+        "resourceType": "Immunization",
+        "id": "synthea-immunization-001",
+        "status": "completed",
+        "vaccineCode": {
+          "coding": [
+            {
+              "system": "http://hl7.org/fhir/sid/cvx",
+              "code": "197",
+              "display": "influenza, high-dose, quadrivalent"
+            }
+          ],
+          "text": "Influenza Vaccine"
+        },
+        "patient": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "occurrenceDateTime": "2026-05-02T09:20:00Z",
+        "primarySource": true
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:MedicationRequest-synthea-medicationrequest-001",
+      "resource": {
+        "resourceType": "MedicationRequest",
+        "id": "synthea-medicationrequest-001",
+        "status": "active",
+        "intent": "order",
+        "medicationCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "372567009",
+              "display": "Metformin (substance)"
+            }
+          ],
+          "text": "Metformin (substance)"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "authoredOn": "2026-05-02",
+        "requester": {
+          "reference": "Practitioner/synthea-practitioner-001"
+        },
+        "dosageInstruction": [
+          {
+            "text": "Take one tablet twice daily"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:MedicationStatement-synthea-medicationstatement-001",
+      "resource": {
+        "resourceType": "MedicationStatement",
+        "id": "synthea-medicationstatement-001",
+        "status": "active",
+        "medicationCodeableConcept": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "372567009",
+              "display": "Metformin (substance)"
+            }
+          ],
+          "text": "Metformin (substance)"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "context": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "effectiveDateTime": "2026-05-02T09:00:00Z",
+        "dosage": [
+          {
+            "text": "500 mg twice daily"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:ServiceRequest-synthea-servicerequest-001",
+      "resource": {
+        "resourceType": "ServiceRequest",
+        "id": "synthea-servicerequest-001",
+        "status": "active",
+        "intent": "order",
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "43016004",
+              "display": "Routine lipid panel"
+            }
+          ],
+          "text": "Lipid Panel Referral"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "authoredOn": "2026-05-02",
+        "requester": {
+          "reference": "Practitioner/synthea-practitioner-001"
+        }
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:DiagnosticReport-synthea-report-001",
+      "resource": {
+        "resourceType": "DiagnosticReport",
+        "id": "synthea-report-001",
+        "status": "final",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://terminology.hl7.org/CodeSystem/v2-0074",
+                "code": "LAB",
+                "display": "Laboratory"
+              }
+            ]
+          }
+        ],
+        "code": {
+          "coding": [
+            {
+              "system": "http://snomed.info/sct",
+              "code": "43016004",
+              "display": "Routine lipid panel"
+            }
+          ],
+          "text": "Lipid Panel Report"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "effectiveDateTime": "2026-05-02T10:00:00Z",
+        "issued": "2026-05-02T14:00:00Z",
+        "performer": [
+          {
+            "reference": "Organization/synthea-org-001"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:DocumentReference-synthea-docref-001",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "synthea-docref-001",
+        "status": "current",
+        "type": {
+          "coding": [
+            {
+              "system": "http://loinc.org",
+              "code": "11488-4",
+              "display": "Consultation Note"
+            }
+          ]
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "date": "2026-05-02T09:30:00Z",
+        "author": [
+          {
+            "reference": "Practitioner/synthea-practitioner-001"
+          }
+        ],
+        "content": [
+          {
+            "attachment": {
+              "contentType": "text/plain",
+              "data": "UGF0aWVudCBwcmVzZW50ZWQgd2l0aCBhIGNvdWdoLiBCUCBzdGFibGUu"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:CarePlan-synthea-careplan-001",
+      "resource": {
+        "resourceType": "CarePlan",
+        "id": "synthea-careplan-001",
+        "status": "active",
+        "intent": "plan",
+        "category": [
+          {
+            "coding": [
+              {
+                "system": "http://snomed.info/sct",
+                "code": "698360004",
+                "display": "Diabetes management plan"
+              }
+            ]
+          }
+        ],
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "encounter": {
+          "reference": "Encounter/synthea-encounter-001"
+        },
+        "period": {
+          "start": "2026-05-02"
+        },
+        "author": {
+          "reference": "Practitioner/synthea-practitioner-001"
+        },
+        "goal": [
+          {
+            "reference": "Goal/synthea-goal-001"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Goal-synthea-goal-001",
+      "resource": {
+        "resourceType": "Goal",
+        "id": "synthea-goal-001",
+        "lifecycleStatus": "active",
+        "description": {
+          "text": "Maintain HbA1c levels below 7.0%"
+        },
+        "subject": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "target": [
+          {
+            "measure": {
+              "coding": [
+                {
+                  "system": "http://loinc.org",
+                  "code": "4548-4",
+                  "display": "Hemoglobin A1c/Hemoglobin.total in Blood"
+                }
+              ]
+            },
+            "detailQuantity": {
+              "value": 7,
+              "comparator": "<",
+              "unit": "%",
+              "system": "http://unitsofmeasure.org",
+              "code": "%"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Device-synthea-device-001",
+      "resource": {
+        "resourceType": "Device",
+        "id": "synthea-device-001",
+        "identifier": [
+          {
+            "system": "urn:oid:1.2.840.10004.1.1.1",
+            "value": "DEV-998822"
+          }
+        ],
+        "manufacturer": "Acme Medical",
+        "deviceName": [
+          {
+            "name": "Blood Glucose Monitor",
+            "type": "user-friendly-name"
+          }
+        ],
+        "patient": {
+          "reference": "Patient/synthea-patient-001"
+        }
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:Claim-synthea-claim-001",
+      "resource": {
+        "resourceType": "Claim",
+        "id": "synthea-claim-001",
+        "status": "active",
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/claim-type",
+              "code": "professional"
+            }
+          ]
+        },
+        "use": "claim",
+        "patient": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "created": "2026-05-02T16:00:00Z",
+        "provider": {
+          "reference": "Organization/synthea-org-001"
+        },
+        "insurance": [
+          {
+            "sequence": 1,
+            "focal": true,
+            "coverage": {
+              "display": "Public Health Insurance"
+            }
+          }
+        ],
+        "item": [
+          {
+            "sequence": 1,
+            "productOrService": {
+              "coding": [
+                {
+                  "system": "http://snomed.info/sct",
+                  "code": "185349003",
+                  "display": "Encounter for check up"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:ExplanationOfBenefit-synthea-eob-001",
+      "resource": {
+        "resourceType": "ExplanationOfBenefit",
+        "id": "synthea-eob-001",
+        "status": "active",
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/claim-type",
+              "code": "professional"
+            }
+          ]
+        },
+        "use": "claim",
+        "patient": {
+          "reference": "Patient/synthea-patient-001"
+        },
+        "created": "2026-05-03T09:00:00Z",
+        "insurer": {
+          "display": "Public Health Insurance"
+        },
+        "provider": {
+          "reference": "Organization/synthea-org-001"
+        },
+        "claim": {
+          "reference": "Claim/synthea-claim-001"
+        },
+        "outcome": "complete",
+        "insurance": [
+          {
+            "sequence": 1,
+            "focal": true,
+            "coverage": {
+              "display": "Public Health Insurance"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

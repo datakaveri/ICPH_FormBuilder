@@ -1,0 +1,55 @@
+{
+  "extends": "airbnb-base",
+  "env": { "node": true },
+  "parserOptions": { "ecmaVersion": 2022 },
+  "plugins": [
+    "no-only-tests"
+  ],
+  "rules": {
+    "array-bracket-spacing": "off",
+    "arrow-parens": "off",
+    "class-methods-use-this": "off",
+    "camelcase": [ "error", { "ignoreDestructuring": true, "properties": "never" } ],
+    "comma-dangle": "off",
+    "consistent-return": "off",
+    "curly": "off",
+    "default-param-last": "off", // TODO enable this and refactor the code
+    "function-call-argument-newline": "off",
+    "function-paren-newline": "off",
+    "global-require": "off",
+    "implicit-arrow-linebreak": "off",
+    "import/newline-after-import": "off",
+    "import/no-unresolved": ["error", { "ignore": ["^uuid$"] }], // uuid v9+ uses ES modules; eslint-plugin-import has trouble resolving it but it works fine at runtime
+    "import/order": "off",
+    "lines-between-class-members": "off",
+    "max-classes-per-file": "off",
+    "max-len": "off",
+    "no-continue": "off",
+    "no-debugger": "off",
+    "no-else-return": "off",
+    "no-multiple-empty-lines": "off",
+    "no-nested-ternary": "off",
+    "no-only-tests/no-only-tests": [ "error", { "block": [ "describe", "it", "describeMigration" ] } ],
+    "no-restricted-syntax": [ "error",
+      {
+        "message": "Do not use async functions in .forEach()",
+        "selector": "CallExpression[callee.property.name='forEach'] > :matches(ArrowFunctionExpression, FunctionExpression)[async=true].arguments"
+      }
+    ],
+    "no-underscore-dangle": "off",
+    "nonblock-statement-body-position": "off",
+    "object-curly-newline": [ "error", {
+      "ObjectExpression": { "consistent": true },
+      "ObjectPattern": { "minProperties": 0 }
+    } ],
+    "object-property-newline": "off",
+    "operator-linebreak": "off",
+    "padded-blocks": "off",
+    "prefer-object-has-own": "error",
+    "prefer-object-spread": "off",
+    "prefer-template": "off",
+    "quotes": [ "error", "single", { "allowTemplateLiterals": true, "avoidEscape": true } ],
+    "space-infix-ops": "off",
+    "spaced-comment": "off"
+  }
+}

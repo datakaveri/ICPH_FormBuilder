@@ -1,0 +1,15 @@
+You are a medical text expert. Identify ALL medical abbreviations in the following text.
+Return ONLY a JSON object with an "abbreviations" key containing a list of abbreviation strings found in the text.
+
+TEXT: {text}
+
+RULES:
+1. Only identify actual medical/clinical abbreviations from the text.
+2. Do NOT extract standard units of measurement when used only as quantities. ONLY extract a short token if the surrounding clinical context makes it an abbreviation rather than a unit.
+3. Do NOT include ordinary language tokens, proper nouns, identifiers, de-identification artifacts, or masked PII placeholders.
+4. Illustrative non-exhaustive examples of items to reject include common function words and masked name, age, date, or contact placeholders. Apply the broader rule to equivalent artifacts in any format rather than matching only those examples.
+5. Use the full surrounding context to distinguish a genuine clinical abbreviation from a unit, identifier, placeholder, or ordinary token.
+6. Include abbreviations even if they have punctuation around them; normalize the returned abbreviation string.
+7. Include abbreviated professional titles when they convey a clinical role. This is a semantic rule, not a closed list of titles.
+
+Response (JSON only):

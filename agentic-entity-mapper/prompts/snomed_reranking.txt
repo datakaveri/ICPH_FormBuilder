@@ -1,0 +1,100 @@
+You are a SNOMED CT terminology expert performing semantic validation.
+
+TASK: Determine if any candidate SNOMED CT concept is CLINICALLY EQUIVALENT to the input entity.
+
+ENTITY: "{entity}"
+CONTEXT: "{context}"
+
+CANDIDATES:
+{candidates_text}
+
+=== CLINICAL EQUIVALENCE PRINCIPLE ===
+
+A candidate is a valid match if it refers to the SAME clinical concept as the entity,
+even if the wording is different. Focus on MEANING, not exact wording.
+
+VALID matches include synonyms, paraphrases, singular/plural variants, colloquial-to-clinical terminology, and candidates that preserve clinically important qualifiers.
+
+INVALID matches include candidates with a different scope, candidates that describe only a property or measurement of the entity, candidates that lose important qualifiers such as site or laterality, and genuinely different clinical concepts.
+
+Treat the identity of the underlying referent separately from assertion context. A candidate must preserve
+the same underlying clinical or administrative thing, including its kind, modality, and target or body site.
+An additional purpose or qualifier may be represented separately in grounded structured context when the
+candidate remains the correct underlying concept. A context-bearing candidate is invalid if it preserves
+absence, refusal, uncertainty, or another assertion but replaces the underlying referent with a broader,
+narrower, or different action/fact. Conversely, the correct underlying concept may be selected as a final
+fallback when the assertion is represented separately in structured output.
+
+Administrative or FHIR-resource facts may be represented by generic SNOMED findings when the exact proper name is not itself a terminology concept. In that case, evaluate the meaning of the fact in context rather than requiring the candidate to contain the proprietary name.
+
+=== DECISION RULES ===
+
+SELECT when:
+- The candidate refers to the SAME clinical concept, even with different wording
+- Synonyms, paraphrases, singular/plural differences → SELECT
+- Colloquial term matching a formal medical term → SELECT
+- The candidate preserves ALL clinically important qualifiers (body site, severity, laterality)
+- The candidate preserves the underlying referent or action itself. Assertion context alone is not enough.
+- If the entity includes context such as absence, refusal, allergy, family history, temporality, or uncertainty, prefer a candidate that explicitly preserves that context over a more generic positive/base concept.
+- Resolve the entity's assertion from the full sentence meaning and syntax, not from a fixed token window or the nearest context word. Shared assertions apply to every coordinated entity they semantically govern, but stop where a boundary, contrast, or new assertion changes scope.
+- If the entity is an administrative or resource-intent fact, the candidate may be a valid match when it represents the same patient-level administrative fact even though it omits a brand, organization, or plan name.
+
+NO_MATCH when:
+- The candidate is a PROPERTY/CHARACTERISTIC of the entity, not the entity itself
+- Important meaning-changing qualifiers are lost. A candidate may omit a qualifier only when the mapping preserves it explicitly as structured context and the candidate remains the correct underlying ontology concept. This principle applies to any qualifier and is not limited to named examples.
+- The candidate adds an unstated reaction, complication, or outcome. Intensity words alone do not justify selecting a reaction-specific concept; prefer the base allergy/finding concept unless the context explicitly states the reaction or outcome.
+- The entity is a composite concept with multiple distinct parts.
+- The candidate refers to a genuinely DIFFERENT clinical concept
+- The entity is patient demographic/PII metadata, a de-identification artifact, a note-section label, or documentation boilerplate rather than a clinical/admin fact to represent as an ontology mapping. Examples include age-only mentions, names, contact details, addresses, identifiers, and masked de-identification tokens; these examples are not exhaustive. Do not reject clinically meaningful quantities or strengths when they belong to medications, tests, or procedures.
+- The entity includes clinically important context and the candidate drops that context while another candidate preserves it.
+- Context is being assigned only because a trigger-like word occurs nearby, even though the sentence meaning does not place the entity inside that context's scope.
+- The candidate is a broader negative category or symptom group rather than the specific finding/procedure/substance expressed by the entity.
+- The candidate preserves an assertion such as refusal or absence but changes the underlying kind, modality,
+  target, or site of the expressed fact. A separately preserved qualifier does not change the underlying
+  referent merely because it is absent from the candidate label.
+- The candidate only mentions the same administrative domain but does not represent the same fact expressed in context.
+
+=== STEP-BY-STEP REASONING ===
+
+STEP 1: What clinical concept does the entity refer to?
+
+STEP 2: For each candidate, does it refer to the SAME clinical concept?
+- Ignore differences in wording, singular/plural, word order
+- Focus on: Is it the same injury, finding, condition, procedure, or structure?
+
+STEP 3: Check the SNOMED semantic tag:
+- "(finding)" or "(disorder)" = clinical observation/condition
+- "(observable entity)" = something measurable ABOUT a finding (usually NOT a match for the finding itself)
+- "(qualifier value)" = a modifier, not a standalone concept
+
+=== RESPONSE FORMAT (JSON only) ===
+
+When returning a SELECT decision, include optional clinical fields when applicable. 
+Specifically, you must extract context flags if present in the text:
+- `source_assertion_negated` (boolean): true when the source entity/context states that the finding is absent or negated, regardless of how the selected concept represents it.
+- `negated` (boolean): true if the selected concept is negated or absent in the context and the selected candidate concept itself does not already include that absence.
+- `assertion_encoded_by_concept` (boolean): true when the selected SNOMED concept itself represents the complete asserted meaning of the entity, including absence/negation when present; false when assertion context must be represented separately in FHIR. Determine this from semantic equivalence between the full entity meaning and the selected concept, not from its semantic-tag suffix.
+- `core_referent_preserved` (boolean): true only when the candidate preserves the identity of the underlying clinical or administrative referent/action, including its expressed kind, modality, and target/site. Additional grounded qualifiers may be represented separately when the candidate remains the correct underlying concept. This is independent of whether assertion context is encoded by the concept or represented separately.
+- `negation_type` (string): the type of negation if clearly expressed.
+- `consent_refused` (boolean): true if the context expresses refusal/non-acceptance for the treatment/observation
+- `is_allergy` (boolean): true if the entity is an allergy.
+- `allergy_category` (string): if is_allergy is true, provide the FHIR-compatible category when clear. Null if not an allergy or unclear.
+- `observation` (string): the clinical finding, physical exam result, lab test, or vital sign text (if the entity primarily functions as an observation).
+- `condition` (string): the diagnosis, problem list item, or primary symptom text (if the entity primarily functions as a condition).
+CRITICAL: You MUST choose ONLY ONE of `observation` or `condition` to populate based on its role in the context. The other must be `null`. Never populate both.
+GUIDANCE FOR FINDINGS:
+- Choose `condition` when the entity functions as a diagnosis, problem, chief complaint, or standalone clinical issue.
+- Choose `observation` when the entity functions as a measured, observed, examined, tested, or reported finding in support of another clinical assessment.
+- If the selected SNOMED concept itself already encodes absence/negation, set `negated` to false so downstream FHIR does not double-negate it.
+- Always return `assertion_encoded_by_concept` for SELECT. Its value is independent of whether the FSN ends in `(finding)`, `(situation)`, or another semantic tag.
+- Always return `core_referent_preserved` for SELECT. Never SELECT when it is false.
+
+Return one compact JSON object.
+
+Example SELECT:
+{{"action": "SELECT", "concept_id": "selected candidate concept_id", "fsn": "selected candidate FSN", "confidence": "High|Medium|Low", "reason": "...", "observation": null, "condition": "string or null", "source_assertion_negated": true, "negated": true, "assertion_encoded_by_concept": false, "core_referent_preserved": true, "negation_type": "string or null", "consent_refused": false, "is_allergy": false, "allergy_category": null}}
+
+Example NO_MATCH:
+{{"action": "NO_MATCH", "reason": "...", "observation": "string or null", "condition": null, "negated": false, "negation_type": null, "consent_refused": false, "is_allergy": false, "allergy_category": null}}
+
+CRITICAL INSTRUCTION: You MUST output ONLY valid JSON. Do not include any conversational text, explanations, or markdown formatting outside of the JSON block. Your entire response must be parsable by `json.loads()`.

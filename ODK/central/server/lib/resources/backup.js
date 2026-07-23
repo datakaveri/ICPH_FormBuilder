@@ -1,0 +1,26 @@
+// Copyright 2020 ODK Central Developers
+// See the NOTICE file at the top-level directory of this distribution and at
+// https://github.com/getodk/central-backend/blob/master/NOTICE.
+// This file is part of ODK Central. It is subject to the license terms in
+// the LICENSE file found in the top-level directory of this distribution and at
+// https://www.apache.org/licenses/LICENSE-2.0. No part of ODK Central,
+// including this file, may be copied, modified, propagated, or distributed
+// except according to the terms contained in the LICENSE file.
+
+const { Config } = require('../model/frames');
+const { getEncryptedPgDumpStream } = require('../util/backup');
+
+
+const backup = (passphrase, response) => {
+  response.set('Content-Disposition', `attachment; filename="central-backup-${(new Date()).toISOString()}.pgdump.enc.bin"`);
+  response.set('Content-Type', 'application/octet-stream');
+  return getEncryptedPgDumpStream(passphrase);
+};
+
+
+module.exports = (service, endpoint) => {
+  service.post('/backup', endpoint((_, { auth, body }, __, response) =>
+    auth.canOrReject('backup.run', Config.species)
+      .then(() => backup(body.passphrase, response))));
+};
+
