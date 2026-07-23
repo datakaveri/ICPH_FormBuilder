@@ -74,6 +74,27 @@ def list_name_for(question: dict) -> str:
     return odk_name(question.get("listName") or fallback, fallback)
 
 
+def choice_name_for(option: dict, index: int) -> str:
+    name = str(option.get("name") or option.get("value") or "").strip()
+    if name:
+        return name
+    label = str(option.get("label") or "").strip()
+    return slug(label or f"choice_{index + 1}")
+
+
+def choice_signature(row: dict) -> tuple:
+    extras = tuple(sorted((row.get("extraColumns") or {}).items()))
+    return (
+        row.get("label") or "",
+        row.get("image") or "",
+        row.get("audio") or "",
+        row.get("video") or "",
+        row.get("big-image") or "",
+        row.get("geometry") or "",
+        extras,
+    )
+
+
 def xls_type(question: dict) -> str:
     qtype = question.get("type", "text")
     if qtype in {"select_one", "select_multiple", "rank"}:
@@ -145,16 +166,18 @@ def main() -> int:
 
     survey_headers = ordered_headers(SURVEY_HEADERS, questions)
     choice_rows = []
+    choices_by_list = {}
     for question in questions:
         if question.get("type") not in {"select_one", "select_multiple", "rank"}:
             continue
         list_name = list_name_for(question)
-        for option in question.get("options") or []:
-            name = str(option.get("name") or option.get("value") or "").strip()
+        list_choices = choices_by_list.setdefault(list_name, {})
+        for option_index, option in enumerate(question.get("options") or []):
+            name = choice_name_for(option, option_index)
             label = str(option.get("label") or "").strip()
             if not name or not label:
                 continue
-            choice_rows.append({
+            row = {
                 "list_name": list_name,
                 "name": name,
                 "label": label,
@@ -164,7 +187,19 @@ def main() -> int:
                 "big-image": option.get("bigImage") or option.get("big-image") or None,
                 "geometry": option.get("geometry") or None,
                 "extraColumns": option.get("extraColumns") or {},
-            })
+            }
+            existing = list_choices.get(name)
+            if existing:
+                # Shared XLSForm choice lists must be written once. Imported
+                # forms often reuse the same list on many questions.
+                if choice_signature(existing) != choice_signature(row):
+                    print(
+                        f"Warning: duplicate choice '{name}' in list '{list_name}' has conflicting values; keeping the first.",
+                        file=sys.stderr,
+                    )
+                continue
+            list_choices[name] = row
+            choice_rows.append(row)
     choice_headers = ordered_headers(CHOICES_HEADERS, choice_rows)
     settings_extra = form.get("settingsExtraColumns") or {}
     settings_headers = list(SETTINGS_HEADERS)
