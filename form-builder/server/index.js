@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -101,6 +101,67 @@ function cleanWorkspaceId(workspaceId) {
   const base = path.basename(text).replace(/[^0-9A-Za-z._-]+/g, "_").trim();
   if (!base || base === "." || base === "..") throw new Error("workspaceId is required.");
   return base;
+}
+
+function splitWorkspaceVersion(workspaceId) {
+  const cleanId = cleanWorkspaceId(workspaceId);
+  const match = cleanId.match(/^(.*)_v(\d+)$/i);
+  return {
+    baseId: match ? match[1] : cleanId,
+    versionNumber: match ? Number(match[2]) : 1
+  };
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
+}
+
+function formBuildSnapshot(form = {}) {
+  return {
+    title: form.title || "",
+    formId: form.formId || "",
+    defaultLanguage: form.defaultLanguage || "",
+    style: form.style || "",
+    settingsExtraColumns: form.settingsExtraColumns || {},
+    publicKey: form.publicKey || "",
+    submissionUrl: form.submissionUrl || "",
+    allowChoiceDuplicates: form.allowChoiceDuplicates || "",
+    primaryIdentifierVariable: form.primaryIdentifierVariable || "",
+    entities: form.entities || [],
+    questions: form.questions || []
+  };
+}
+
+function formHasVersionChanges(form = {}) {
+  if (!form.previousVersionWorkspaceId || !form.versionBaseline) return true;
+  return stableStringify(formBuildSnapshot(form)) !== stableStringify(form.versionBaseline);
+}
+
+function describeVersionChanges(form = {}) {
+  const baseline = form.versionBaseline || {};
+  const beforeQuestions = new Map((baseline.questions || []).map((question) => [question.name || question.id, question]));
+  const afterQuestions = new Map((form.questions || []).map((question) => [question.name || question.id, question]));
+  const changes = [];
+  for (const [key, question] of afterQuestions) {
+    if (!beforeQuestions.has(key)) {
+      changes.push(`Added question ${question.name || key}`);
+    } else if (stableStringify(question) !== stableStringify(beforeQuestions.get(key))) {
+      changes.push(`Changed question ${question.name || key}`);
+    }
+  }
+  for (const [key, question] of beforeQuestions) {
+    if (!afterQuestions.has(key)) changes.push(`Removed question ${question.name || key}`);
+  }
+  const beforeSettings = { ...baseline };
+  const afterSettings = { ...formBuildSnapshot(form) };
+  delete beforeSettings.questions;
+  delete afterSettings.questions;
+  if (stableStringify(beforeSettings) !== stableStringify(afterSettings)) changes.unshift("Changed form settings");
+  return changes;
 }
 
 function instanceNameForPrimaryIdentifier(primaryIdentifierVariable) {
@@ -304,12 +365,15 @@ function runCommand(command, args, options = {}) {
 async function createForm(payload) {
   const title = String(payload.title || "Untitled ICPH Form").trim();
   const formId = slugify(payload.formId || title).replace(/-/g, "_");
-  const workspaceId = `${timestampId()}_${slugify(title)}`;
+  const versionBaseId = `${timestampId()}_${slugify(title)}`;
+  const workspaceId = `${versionBaseId}_v1`;
   const outputDir = await ensureWorkspace(workspaceId);
   const draft = {
     title,
     formId,
     version: payload.version || "1",
+    versionNumber: 1,
+    versionBaseId,
     instanceName: "",
     defaultLanguage: "english",
     questions: [],
@@ -434,6 +498,56 @@ function latestSnomedLookupPath() {
   }
 }
 
+function latestSharedLookupPath(vocabulary, fileName) {
+  const lookupRoot = path.join(mapperRoot, "SchemaTerminologies", "artifacts", "shared", vocabulary);
+  if (!existsSync(lookupRoot)) return null;
+  try {
+    const versions = readdirSync(lookupRoot)
+      .filter((name) => existsSync(path.join(lookupRoot, name, "lookups", fileName)))
+      .sort((a, b) => a.localeCompare(b));
+    const latest = versions.at(-1);
+    return latest ? path.join(lookupRoot, latest, "lookups", fileName) : null;
+  } catch {
+    return null;
+  }
+}
+
+function latestLoincPath() {
+  const loincRoot = path.join(mapperRoot, "SchemaTerminologies", "terminologies", "loinc");
+  if (!existsSync(loincRoot)) return null;
+  try {
+    const versions = readdirSync(loincRoot)
+      .map((name) => path.join(loincRoot, name, "LoincTable", "Loinc.csv"))
+      .filter((candidate) => existsSync(candidate))
+      .sort((a, b) => a.localeCompare(b));
+    return versions.at(-1) || null;
+  } catch {
+    return null;
+  }
+}
+
+function latestRxNormMetadataPath() {
+  const rxnormRoot = path.join(mapperRoot, "SchemaTerminologies", "artifacts");
+  if (!existsSync(rxnormRoot)) return null;
+  const matches = [];
+  const visit = (dir) => {
+    for (const name of readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = path.join(dir, name.name);
+      if (name.isDirectory()) {
+        visit(fullPath);
+      } else if (name.name === "rxnorm_metadata.json" && fullPath.includes(`${path.sep}rxnorm${path.sep}`)) {
+        matches.push(fullPath);
+      }
+    }
+  };
+  try {
+    visit(rxnormRoot);
+    return matches.sort((a, b) => a.localeCompare(b)).at(-1) || null;
+  } catch {
+    return null;
+  }
+}
+
 function parseCsvLine(line) {
   const values = [];
   let value = "";
@@ -477,13 +591,67 @@ function snomedSemanticTag(fsn) {
   return match ? match[1].toLowerCase() : "";
 }
 
-let snomedSearchPromise = null;
+const VOCABULARY_CONFIG = {
+  snomed: {
+    key: "snomed",
+    label: "SNOMED CT",
+    systemUri: "http://snomed.info/sct",
+    csvPath: latestSnomedLookupPath,
+    fromCsv(values, headerIndex) {
+      return {
+        code: values[headerIndex.code] || "",
+        display: values[headerIndex.display] || "",
+        fsn: values[headerIndex.fsn] || "",
+        preferredTerm: values[headerIndex.preferred_term] || values[headerIndex.display] || "",
+        status: values[headerIndex.status] || "",
+        systemUri: values[headerIndex.system_uri] || "http://snomed.info/sct"
+      };
+    }
+  },
+  icd10: {
+    key: "icd10",
+    label: "ICD-10",
+    systemUri: "http://hl7.org/fhir/sid/icd-10-cm",
+    csvPath: () => latestSharedLookupPath("icd10", "icd10_lookup.csv"),
+    fromCsv(values, headerIndex) {
+      return {
+        code: values[headerIndex.code] || "",
+        display: values[headerIndex.display] || "",
+        fsn: values[headerIndex.display] || "",
+        preferredTerm: values[headerIndex.display] || "",
+        status: values[headerIndex.status] || "",
+        aliases: values[headerIndex.aliases] || "",
+        systemUri: values[headerIndex.system_uri] || "http://hl7.org/fhir/sid/icd-10-cm"
+      };
+    }
+  },
+  loinc: {
+    key: "loinc",
+    label: "LOINC",
+    systemUri: "http://loinc.org",
+    csvPath: latestLoincPath,
+    fromCsv(values, headerIndex) {
+      const code = values[headerIndex.LOINC_NUM] || values[headerIndex.loinc_num] || "";
+      const longName = values[headerIndex.LONG_COMMON_NAME] || "";
+      const shortName = values[headerIndex.SHORTNAME] || "";
+      const component = values[headerIndex.COMPONENT] || "";
+      return {
+        code,
+        display: longName || shortName || component,
+        fsn: longName || `${component} ${values[headerIndex.PROPERTY] || ""} ${values[headerIndex.SYSTEM] || ""}`.trim(),
+        preferredTerm: shortName || longName || component,
+        status: values[headerIndex.STATUS] || "",
+        systemUri: "http://loinc.org"
+      };
+    }
+  }
+};
 
-async function loadSnomedSearchIndex() {
-  if (snomedSearchPromise) return snomedSearchPromise;
-  snomedSearchPromise = (async () => {
-    const lookupPath = latestSnomedLookupPath();
-    if (!lookupPath) throw new Error("Local SNOMED lookup CSV was not found.");
+const vocabularySearchPromises = new Map();
+
+async function loadCsvVocabularyIndex(config) {
+  const lookupPath = config.csvPath();
+  if (!lookupPath) throw new Error(`Local ${config.label} lookup was not found.`);
     const text = await readFile(lookupPath, "utf8");
     const lines = text.split(/\r?\n/).filter(Boolean);
     const headers = parseCsvLine(lines.shift() || "");
@@ -494,16 +662,11 @@ async function loadSnomedSearchIndex() {
 
     for (const line of lines) {
       const values = parseCsvLine(line);
-      const row = {
-        code: values[headerIndex.code] || "",
-        display: values[headerIndex.display] || "",
-        fsn: values[headerIndex.fsn] || "",
-        preferredTerm: values[headerIndex.preferred_term] || values[headerIndex.display] || "",
-        status: values[headerIndex.status] || "",
-        systemUri: values[headerIndex.system_uri] || "http://snomed.info/sct"
-      };
+      const row = config.fromCsv(values, headerIndex);
       if (!row.code) continue;
-      row.searchText = normalizeSearchText(`${row.display} ${row.preferredTerm} ${row.fsn}`);
+      row.vocabulary = config.key;
+      row.vocabularyLabel = config.label;
+      row.searchText = normalizeSearchText(`${row.display} ${row.preferredTerm} ${row.fsn} ${row.aliases || ""}`);
       row.tokens = searchTokens(row.searchText);
       const rowIndex = rows.push(row) - 1;
       for (const value of [row.display, row.preferredTerm, row.fsn]) {
@@ -516,11 +679,65 @@ async function loadSnomedSearchIndex() {
       }
     }
     return { rows, tokenIndex, exactIndex, lookupPath };
-  })();
-  return snomedSearchPromise;
 }
 
-function scoreSnomedRow(row, query, queryKey, tokens, exactCode) {
+async function loadRxNormSearchIndex(config) {
+  const lookupPath = latestRxNormMetadataPath();
+  if (!lookupPath) throw new Error("Local RxNorm lookup metadata was not found.");
+  const data = JSON.parse(await readFile(lookupPath, "utf8"));
+  const sourceRows = Array.isArray(data.rows) ? data.rows : [];
+  const rows = [];
+  const tokenIndex = new Map();
+  const exactIndex = new Map();
+
+  for (const source of sourceRows) {
+    const row = {
+      code: String(source.code || ""),
+      display: String(source.display || source.indexed_term || ""),
+      fsn: String(source.display || source.indexed_term || ""),
+      preferredTerm: String(source.display || source.indexed_term || ""),
+      status: String(source.status || ""),
+      systemUri: String(source.system_uri || config.systemUri),
+      vocabulary: config.key,
+      vocabularyLabel: config.label
+    };
+    if (!row.code) continue;
+    row.searchText = normalizeSearchText(`${row.display} ${row.preferredTerm} ${row.fsn}`);
+    row.tokens = searchTokens(row.searchText);
+    const rowIndex = rows.push(row) - 1;
+    for (const value of [row.display, row.preferredTerm, row.fsn]) {
+      const key = normalizeSearchText(value);
+      if (key && !exactIndex.has(key)) exactIndex.set(key, rowIndex);
+    }
+    for (const token of row.tokens) {
+      if (!tokenIndex.has(token)) tokenIndex.set(token, []);
+      tokenIndex.get(token).push(rowIndex);
+    }
+  }
+  return { rows, tokenIndex, exactIndex, lookupPath };
+}
+
+async function loadVocabularySearchIndex(vocabulary) {
+  const key = normalizeVocabularyKey(vocabulary);
+  if (vocabularySearchPromises.has(key)) return vocabularySearchPromises.get(key);
+  const config = key === "rxnorm"
+    ? { key: "rxnorm", label: "RxNorm", systemUri: "http://rxnorm.info/rxcui" }
+    : VOCABULARY_CONFIG[key];
+  if (!config) throw new Error(`Unsupported vocabulary: ${vocabulary}`);
+  const promise = key === "rxnorm" ? loadRxNormSearchIndex(config) : loadCsvVocabularyIndex(config);
+  vocabularySearchPromises.set(key, promise);
+  return promise;
+}
+
+function normalizeVocabularyKey(value) {
+  const text = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (text.includes("loinc")) return "loinc";
+  if (text.includes("rxnorm") || text.includes("rxcui")) return "rxnorm";
+  if (text.includes("icd")) return "icd10";
+  return "snomed";
+}
+
+function scoreVocabularyRow(row, query, queryKey, tokens, exactCode) {
   const rowKeys = [row.display, row.preferredTerm, row.fsn].map(normalizeSearchText).filter(Boolean);
   let score = 0;
   if (exactCode && row.code === exactCode) score += 2000;
@@ -545,12 +762,13 @@ function scoreSnomedRow(row, query, queryKey, tokens, exactCode) {
   return score;
 }
 
-async function searchSnomedTerms(query, options = {}) {
+async function searchVocabularyTerms(query, options = {}) {
   const cleanQuery = String(query || "").trim();
-  if (!cleanQuery) return { ok: true, query: cleanQuery, results: [] };
+  const vocabulary = normalizeVocabularyKey(options.vocabulary || "snomed");
+  if (!cleanQuery) return { ok: true, vocabulary, query: cleanQuery, results: [] };
   const limit = Math.min(Math.max(Number(options.limit || 20), 1), 50);
   const exactCode = String(options.selectedCode || "").trim();
-  const { rows, tokenIndex, exactIndex } = await loadSnomedSearchIndex();
+  const { rows, tokenIndex, exactIndex } = await loadVocabularySearchIndex(vocabulary);
   const queryKey = normalizeSearchText(cleanQuery);
   const tokens = searchTokens(cleanQuery);
   const candidateIds = new Set();
@@ -570,7 +788,7 @@ async function searchSnomedTerms(query, options = {}) {
   const scored = [...candidateIds]
     .map((rowIndex) => {
       const row = rows[rowIndex];
-      return { row, score: scoreSnomedRow(row, cleanQuery, queryKey, tokens, exactCode) };
+      return { row, score: scoreVocabularyRow(row, cleanQuery, queryKey, tokens, exactCode) };
     })
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)
@@ -583,11 +801,17 @@ async function searchSnomedTerms(query, options = {}) {
       preferredTerm: row.preferredTerm,
       status: row.status,
       systemUri: row.systemUri,
+      vocabulary: row.vocabulary || vocabulary,
+      vocabularyLabel: row.vocabularyLabel || VOCABULARY_CONFIG[vocabulary]?.label || "Vocabulary",
       score: Number(score.toFixed(2)),
       selected: Boolean(exactCode && row.code === exactCode)
     }));
 
-  return { ok: true, query: cleanQuery, results: scored };
+  return { ok: true, vocabulary, query: cleanQuery, results: scored };
+}
+
+async function searchSnomedTerms(query, options = {}) {
+  return searchVocabularyTerms(query, { ...options, vocabulary: "snomed" });
 }
 
 async function defaultTerminologyStatus(workspaceId, outputDir, status = "not_started") {
@@ -626,6 +850,9 @@ async function startTerminologyExtraction(workspaceId, options = {}) {
   const { cleanId, outputDir } = await requireWorkspace(workspaceId);
   const draftPath = path.join(outputDir, "drafts", "form.json");
   const resultPath = terminologyResultPath(outputDir);
+  const questionIds = Array.isArray(options.questionIds)
+    ? [...new Set(options.questionIds.map((id) => String(id || "").trim()).filter(Boolean))]
+    : [];
   await mkdir(path.dirname(resultPath), { recursive: true });
 
   if (!options.force && existsSync(resultPath)) {
@@ -648,9 +875,10 @@ async function startTerminologyExtraction(workspaceId, options = {}) {
     processedQuestionCount: 0,
     entityCount: 0,
     questions: [],
-    warnings: [],
-    terminologyPath: resultPath
-  };
+	    warnings: [],
+	    rerunQuestionIds: questionIds,
+	    terminologyPath: resultPath
+	  };
   await writeFile(resultPath, JSON.stringify(initial, null, 2) + "\n", "utf8");
 
   if (!existsSync(mapperPythonBin)) {
@@ -665,11 +893,18 @@ async function startTerminologyExtraction(workspaceId, options = {}) {
     return { workspaceId: cleanId, started: false, ...failed };
   }
 
-  const child = spawn(
-    mapperPythonBin,
-    [terminologyExtractorPath, draftPath, resultPath, "--mapper-root", mapperRoot],
-    { cwd: mapperRoot, env: { ...process.env, PYTHONUNBUFFERED: "1" }, stdio: "ignore", detached: true }
-  );
+	  const child = spawn(
+	    mapperPythonBin,
+	    [
+	      terminologyExtractorPath,
+	      draftPath,
+	      resultPath,
+	      "--mapper-root",
+	      mapperRoot,
+	      ...(questionIds.length ? ["--question-ids", questionIds.join(","), "--merge-existing"] : [])
+	    ],
+	    { cwd: mapperRoot, env: { ...process.env, PYTHONUNBUFFERED: "1" }, stdio: "ignore", detached: true }
+	  );
   child.once("error", async (error) => {
     const failed = {
       ...initial,
@@ -686,6 +921,81 @@ async function startTerminologyExtraction(workspaceId, options = {}) {
   return { ok: true, workspaceId: cleanId, started: true, status: "running", terminologyPath: resultPath };
 }
 
+async function saveTerminologyReview(workspaceId, payload) {
+  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
+  const resultPath = terminologyResultPath(outputDir);
+  if (!existsSync(resultPath)) throw new Error("Run terminology extraction before saving vocabulary review.");
+  const terminology = payload?.terminology;
+  if (!terminology || typeof terminology !== "object") throw new Error("Terminology review payload is required.");
+  const body = {
+    ...terminology,
+    ok: terminology.ok !== false,
+    workspaceId: cleanId,
+    reviewUpdatedAt: isoStamp(),
+    terminologyPath: resultPath
+  };
+  await mkdir(path.dirname(resultPath), { recursive: true });
+  await writeFile(resultPath, JSON.stringify(body, null, 2) + "\n", "utf8");
+  return { ok: true, workspaceId: cleanId, terminologyPath: resultPath, ...body };
+}
+
+async function copyDirIfExists(source, target) {
+  if (!existsSync(source)) return;
+  await mkdir(target, { recursive: true });
+  await cp(source, target, { recursive: true, force: true });
+}
+
+async function createFormVersion(workspaceId) {
+  const loaded = await loadDraft(workspaceId);
+  const sourceId = loaded.workspaceId;
+  const sourceDraft = loaded.draft;
+  const split = splitWorkspaceVersion(sourceDraft.versionBaseId || sourceId);
+  const versionBaseId = sourceDraft.versionBaseId || split.baseId;
+  await mkdir(outputRoot, { recursive: true });
+  const existingNames = await readdir(outputRoot);
+  const nextVersionNumber = existingNames.reduce((max, name) => {
+    const match = name.match(new RegExp(`^${versionBaseId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}_v(\\d+)$`, "i"));
+    return match ? Math.max(max, Number(match[1])) : max;
+  }, splitWorkspaceVersion(sourceId).versionNumber) + 1;
+  const nextWorkspaceId = `${versionBaseId}_v${nextVersionNumber}`;
+  const outputDir = await ensureWorkspace(nextWorkspaceId);
+  const now = isoStamp();
+  const nextDraft = {
+    ...sourceDraft,
+    version: String(nextVersionNumber),
+    versionNumber: nextVersionNumber,
+    versionBaseId,
+    previousVersionWorkspaceId: sourceId,
+    previousVersionNumber: sourceDraft.versionNumber || splitWorkspaceVersion(sourceId).versionNumber,
+    versionBaseline: formBuildSnapshot(sourceDraft),
+    versionChangeSummary: [],
+    createdAt: now,
+    updatedAt: now
+  };
+  delete nextDraft.buildFinishedAt;
+  const draftPath = path.join(outputDir, "drafts", "form.json");
+  await writeFile(draftPath, JSON.stringify(nextDraft, null, 2) + "\n", "utf8");
+  await copyDirIfExists(path.join(loaded.outputDir, "attachments"), path.join(outputDir, "attachments"));
+  const sourceTerminologyPath = terminologyResultPath(loaded.outputDir);
+  if (existsSync(sourceTerminologyPath)) {
+    const targetTerminologyPath = terminologyResultPath(outputDir);
+    const copiedTerminology = JSON.parse(await readFile(sourceTerminologyPath, "utf8"));
+    await mkdir(path.dirname(targetTerminologyPath), { recursive: true });
+    await writeFile(
+      targetTerminologyPath,
+      JSON.stringify({
+        ...copiedTerminology,
+        workspaceId: nextWorkspaceId,
+        terminologyPath: targetTerminologyPath,
+        copiedFromWorkspaceId: sourceId,
+        copiedAt: now
+      }, null, 2) + "\n",
+      "utf8"
+    );
+  }
+  return loadDraft(nextWorkspaceId);
+}
+
 async function checkpointForm(payload) {
   const { cleanId: workspaceId, outputDir } = await requireWorkspace(payload.workspaceId);
   const draft = { ...payload.form, updatedAt: isoStamp() };
@@ -700,6 +1010,13 @@ async function checkpointForm(payload) {
 async function exportForm(payload) {
   const { cleanId: workspaceId, outputDir } = await requireWorkspace(payload.workspaceId);
   const draft = { ...payload.form, updatedAt: isoStamp() };
+  const existingMeta = await workspaceMeta(workspaceId);
+  if (!existingMeta.hasXml && draft.previousVersionWorkspaceId && !formHasVersionChanges(draft)) {
+    throw new Error("Edit at least one Build item before publishing a new version.");
+  }
+  if (draft.previousVersionWorkspaceId) {
+    draft.versionChangeSummary = describeVersionChanges(draft);
+  }
   const fieldNames = new Set((draft.questions || []).map((question) => question.name).filter(Boolean));
   if (draft.primaryIdentifierVariable && !fieldNames.has(draft.primaryIdentifierVariable)) {
     throw new Error(`Primary identifier variable "${draft.primaryIdentifierVariable}" is not present in this form.`);
@@ -731,18 +1048,9 @@ async function exportForm(payload) {
   if (existsSync(xls2xformBin)) {
     xmlResult = await runCommand(xls2xformBin, [xlsxPath, xmlPath]);
   }
-  let terminology = null;
-  if (xmlResult.code === 0) {
-    try {
-      terminology = await startTerminologyExtraction(workspaceId, { force: true });
-    } catch (error) {
-      terminology = {
-        ok: false,
-        status: "error",
-        error: `Terminology extraction did not start: ${error.message || String(error)}`
-      };
-    }
-  }
+  const terminology = xmlResult.code === 0 && existsSync(terminologyResultPath(outputDir))
+    ? await loadTerminology(workspaceId)
+    : null;
 
   return {
     ok: xmlResult.code === 0,
@@ -803,7 +1111,8 @@ function normalizeMetaFormLink(payload) {
 async function importXlsx(payload) {
   const originalName = cleanXlsxName(payload.filename);
   const title = originalName.replace(/\.[^.]+$/, "");
-  const workspaceId = `${timestampId()}_${slugify(title)}`;
+  const versionBaseId = `${timestampId()}_${slugify(title)}`;
+  const workspaceId = `${versionBaseId}_v1`;
   const outputDir = await ensureWorkspace(workspaceId);
   const xlsxPath = path.join(outputDir, "xlsform", originalName);
   const draftPath = path.join(outputDir, "drafts", "form.json");
@@ -834,14 +1143,17 @@ async function importXlsx(payload) {
     throw new Error(`Primary identifier variable "${primaryIdentifierVariable}" is not present in the XLSForm survey name column.`);
   }
   const metaFormLink = normalizeMetaFormLink(payload);
-  const updatedDraft = {
-    ...draft,
-    importedFrom: originalName,
-    metaFormLink,
-    primaryIdentifierVariable,
-    createdAt: isoStamp(),
-    updatedAt: isoStamp()
-  };
+	  const updatedDraft = {
+	    ...draft,
+		    importedFrom: originalName,
+		    metaFormLink,
+		    primaryIdentifierVariable,
+		    instanceName: instanceNameForPrimaryIdentifier(primaryIdentifierVariable),
+		    versionNumber: 1,
+	    versionBaseId,
+	    createdAt: isoStamp(),
+	    updatedAt: isoStamp()
+	  };
   await writeFile(draftPath, JSON.stringify(updatedDraft, null, 2) + "\n", "utf8");
   const attachmentCount = await syncAttachmentsToXlsDir(workspaceId, xlsxPath);
 
@@ -1195,10 +1507,12 @@ async function workspaceMeta(workspaceId) {
   try {
     mtime = (await stat(outputDir)).mtime;
   } catch {}
+  const versionInfo = splitWorkspaceVersion(draft?.versionBaseId || cleanId);
   let pipelineStage = "Building";
-  if (xmlFiles.length) pipelineStage = "Publishing";
-  if (entries.length) pipelineStage = "Data collection";
   if (fhirFiles.length) pipelineStage = "FHIR";
+  else if (entries.length) pipelineStage = "Data collection";
+  else if (xmlFiles.length) pipelineStage = "Publishing";
+  else if (draft?.buildFinishedAt) pipelineStage = "Terminology";
   return {
     workspaceId: cleanId,
     outputDir,
@@ -1211,10 +1525,17 @@ async function workspaceMeta(workspaceId) {
     hasXml: xmlFiles.length > 0,
     hasXlsx: xlsxFiles.length > 0,
     hasFhir: fhirFiles.length > 0,
-    hasTerminology: Boolean(terminology),
-    terminologyStatus: terminology?.status || "not_started",
-    terminologyEntityCount: terminology?.entityCount || 0,
-    terminologyPath: existsSync(terminologyPath) ? terminologyPath : null,
+	    hasTerminology: Boolean(terminology),
+	    terminologyStatus: terminology?.status || "not_started",
+	    terminologyEntityCount: terminology?.entityCount || 0,
+	    terminologyPath: existsSync(terminologyPath) ? terminologyPath : null,
+	    buildFinishedAt: draft?.buildFinishedAt || null,
+    versionNumber: draft?.versionNumber || versionInfo.versionNumber,
+    versionBaseId: draft?.versionBaseId || versionInfo.baseId,
+    previousVersionWorkspaceId: draft?.previousVersionWorkspaceId || null,
+    previousVersionNumber: draft?.previousVersionNumber || null,
+    versionChangeSummary: draft?.versionChangeSummary || [],
+    hasVersionChanges: formHasVersionChanges(draft || {}),
     attachmentCount: attachmentFiles.length,
     attachmentNames: attachmentFiles.sort((a, b) => a.localeCompare(b)),
     xmlPath: xmlFiles[0] ? path.join(xmlDir, xmlFiles[0]) : null,
@@ -1224,6 +1545,7 @@ async function workspaceMeta(workspaceId) {
     importedFrom: draft?.importedFrom || null,
     metaFormLink: draft?.metaFormLink || null,
     primaryIdentifierVariable: draft?.primaryIdentifierVariable || null,
+    buildFinishedAt: draft?.buildFinishedAt || null,
   };
 }
 
@@ -1277,6 +1599,13 @@ const server = createServer(async (req, res) => {
         selectedCode: url.searchParams.get("selectedCode")
       }));
     }
+    if (req.method === "GET" && pathname === "/api/terminology/search") {
+      return jsonResponse(res, 200, await searchVocabularyTerms(url.searchParams.get("query"), {
+        vocabulary: url.searchParams.get("vocabulary"),
+        limit: url.searchParams.get("limit"),
+        selectedCode: url.searchParams.get("selectedCode")
+      }));
+    }
     if (req.method === "POST" && pathname === "/api/schema-documents/upload") {
       return jsonResponse(res, 200, await uploadSchemaDocument(await requestBody(req)));
     }
@@ -1291,7 +1620,9 @@ const server = createServer(async (req, res) => {
     const entriesMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries$/);
     const fhirMatch = pathname.match(/^\/api\/forms\/([^/]+)\/fhir$/);
     const terminologyMatch = pathname.match(/^\/api\/forms\/([^/]+)\/terminology$/);
-    const xmlMatch = pathname.match(/^\/api\/forms\/([^/]+)\/xml$/);
+	    const terminologyReviewMatch = pathname.match(/^\/api\/forms\/([^/]+)\/terminology\/review$/);
+	    const versionMatch = pathname.match(/^\/api\/forms\/([^/]+)\/versions$/);
+	    const xmlMatch = pathname.match(/^\/api\/forms\/([^/]+)\/xml$/);
     const attachmentsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/attachments$/);
     const attachmentFileMatch = pathname.match(/^\/api\/forms\/([^/]+)\/attachments\/([^/]+)$/);
     const odkSubmissionMatch = pathname.match(/^\/api\/forms\/([^/]+)\/odk-submissions$/);
@@ -1336,9 +1667,19 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && mapperMatch) {
       return jsonResponse(res, 200, await passToMapper(decodeURIComponent(mapperMatch[1])));
     }
-    if (req.method === "POST" && terminologyMatch) {
-      return jsonResponse(res, 200, await startTerminologyExtraction(decodeURIComponent(terminologyMatch[1]), { force: true }));
-    }
+	    if (req.method === "POST" && terminologyMatch) {
+	      const body = await requestBody(req);
+	      return jsonResponse(res, 200, await startTerminologyExtraction(decodeURIComponent(terminologyMatch[1]), {
+	        force: true,
+	        questionIds: body.questionIds || body.selectedQuestionIds || []
+	      }));
+	    }
+	    if (req.method === "POST" && terminologyReviewMatch) {
+	      return jsonResponse(res, 200, await saveTerminologyReview(decodeURIComponent(terminologyReviewMatch[1]), await requestBody(req)));
+	    }
+	    if (req.method === "POST" && versionMatch) {
+	      return jsonResponse(res, 200, await createFormVersion(decodeURIComponent(versionMatch[1])));
+	    }
     if (req.method === "POST" && pathname === "/api/forms/new") {
       return jsonResponse(res, 200, await createForm(await requestBody(req)));
     }

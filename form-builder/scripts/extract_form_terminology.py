@@ -422,6 +422,8 @@ def main() -> int:
     parser.add_argument("draft_path", type=Path)
     parser.add_argument("output_path", type=Path)
     parser.add_argument("--mapper-root", type=Path, required=True)
+    parser.add_argument("--question-ids", default="", help="Comma-separated question IDs/names to rerun.")
+    parser.add_argument("--merge-existing", action="store_true", help="Preserve non-selected question results already in the output file.")
     args = parser.parse_args()
 
     sys.path.insert(0, str(args.mapper_root))
@@ -429,6 +431,22 @@ def main() -> int:
     started_at = utc_stamp()
     form = json.loads(args.draft_path.read_text(encoding="utf-8"))
     questions = list(form.get("questions") or [])
+    selected_ids = {item.strip() for item in args.question_ids.split(",") if item.strip()}
+    existing_by_key: dict[str, dict[str, Any]] = {}
+    existing_questions: list[dict[str, Any]] = []
+    if args.merge_existing and args.output_path.is_file():
+        try:
+            existing_payload = json.loads(args.output_path.read_text(encoding="utf-8"))
+            existing_questions = list(existing_payload.get("questions") or [])
+            for item in existing_questions:
+                key = clean_text(item.get("id") or item.get("name"))
+                if key:
+                    existing_by_key[key] = item
+                name = clean_text(item.get("name"))
+                if name:
+                    existing_by_key[name] = item
+        except Exception:
+            existing_questions = []
     payload: dict[str, Any] = {
         "ok": True,
         "status": "running",
@@ -436,11 +454,12 @@ def main() -> int:
         "completedAt": None,
         "formTitle": form.get("title") or "",
         "formId": form.get("formId") or "",
-        "questionCount": len(questions),
+        "questionCount": len(selected_ids) if selected_ids else len(questions),
         "processedQuestionCount": 0,
         "entityCount": 0,
-        "questions": [],
+        "questions": existing_questions if selected_ids and existing_questions else [],
         "warnings": [],
+        "rerunQuestionIds": sorted(selected_ids),
     }
     write_json(args.output_path, payload)
 
@@ -449,7 +468,35 @@ def main() -> int:
         payload["warnings"].append({"stage": "SNOMED", "message": lookup.error})
         write_json(args.output_path, payload)
 
+    output_by_key = {}
+    if payload["questions"]:
+        for existing in payload["questions"]:
+            key = clean_text(existing.get("id") or existing.get("name"))
+            if key:
+                output_by_key[key] = existing
+            name = clean_text(existing.get("name"))
+            if name:
+                output_by_key[name] = existing
+    processed_count = 0
     for index, question in enumerate(questions, start=1):
+        question_id = clean_text(question.get("id") or f"question_{index}")
+        question_name = clean_text(question.get("name"))
+        if selected_ids and question_id not in selected_ids and question_name not in selected_ids:
+            if not existing_by_key.get(question_id) and not existing_by_key.get(question_name):
+                result = {
+                    "id": question.get("id") or f"question_{index}",
+                    "name": question.get("name") or "",
+                    "label": display_text(question.get("label")) or question.get("name") or f"Question {index}",
+                    "type": clean_text(question.get("type")),
+                    "sourceText": question_text(question),
+                    "status": "not_rerun",
+                    "processedText": "",
+                    "entities": [],
+                    "warnings": [],
+                }
+                payload["questions"].append(result)
+                output_by_key[question_id] = result
+            continue
         qtype = clean_text(question.get("type"))
         source_text = question_text(question)
         result = {
@@ -474,8 +521,16 @@ def main() -> int:
                 result["status"] = "error"
                 result["warnings"] = [{"stage": "TERMINOLOGY", "message": str(exc)}]
 
-        payload["questions"].append(result)
-        payload["processedQuestionCount"] = index
+        existing = output_by_key.get(question_id) or output_by_key.get(question_name)
+        if existing in payload["questions"]:
+            payload["questions"][payload["questions"].index(existing)] = result
+        else:
+            payload["questions"].append(result)
+        output_by_key[question_id] = result
+        if question_name:
+            output_by_key[question_name] = result
+        processed_count += 1
+        payload["processedQuestionCount"] = processed_count
         payload["entityCount"] = sum(len(item.get("entities") or []) for item in payload["questions"])
         write_json(args.output_path, payload)
 
