@@ -1,10 +1,25 @@
-# Agentic Entity Mapper Backend
+# ICPH Entity Mapper
 
-Backend-only medical entity mapping and FHIR R4 bundle generation for ICPH.
-The user-facing ICPH interface lives in `../form-builder`; this repository now
-provides the mapper services and scripts that the form-builder calls.
+Lean mapper support for the local ICPH form-builder workflow.
 
-## Integration
+The user-facing application lives in `../form-builder`. This directory now keeps
+only the pieces that are called by that app:
+
+| Path | Purpose |
+| --- | --- |
+| `generic_form_fhir_agent.py` | Converts a saved form draft plus submitted answer CSV into per-patient FHIR R4 bundles. |
+| `preprocess_icph_metaforms.py` | Converts ICPH MetaForm DOCX files into Markdown plus JSONL chunks. |
+| `SchemaTerminologies/` | Stores pruned terminology lookup assets and ICPH MetaForm source/processed metadata. |
+
+The old clinical-text agent stack, standalone FastAPI backend, prompt files,
+Docker/Kubernetes wrappers, and agent-specific tests were removed from this ICPH
+copy because the current local app does not call them.
+
+Dense Faiss/USearch/TurboVec indexes and local embedding model copies were also
+removed. The form-builder terminology UI now relies on lightweight shared
+lookup files for SNOMED CT, ICD-10, and RxNorm, plus the raw `Loinc.csv` table.
+
+## Integration With Form Builder
 
 `../form-builder/server/index.js` points to this directory as:
 
@@ -12,35 +27,55 @@ provides the mapper services and scripts that the form-builder calls.
 const mapperRoot = path.join(icphRoot, "agentic-entity-mapper");
 ```
 
-When a filled ICPH form is passed to the mapper, form-builder writes a mapper
+When the user passes submitted form data to FHIR, form-builder writes a mapper
 CSV and runs:
 
 ```bash
 <mapper>/.venv/bin/python ../form-builder/scripts/run_icph_mapper.py <csv> <result-json>
 ```
 
-The runner executes with `cwd` set to this repository, so it imports
-`icph_csv_agent.py` from the mapper backend without ambiguity.
+The runner imports `generic_form_fhir_agent.py` with this directory as its
+working directory.
 
-## Main Components
+The MetaForms document processor is called by form-builder when the user clicks
+the process action for uploaded schema metadata:
 
-| Path | Purpose |
-| --- | --- |
-| `react_api.py` | FastAPI backend endpoints for headless pipeline jobs, saved FHIR bundles, and ICPH CSV upload. |
-| `pipeline_service.py` | UI-independent orchestration for the clinical text pipeline. |
-| `generic_form_fhir_agent.py` | Form-builder/XLSForm draft plus submitted answer CSV to FHIR Questionnaire/QuestionnaireResponse bundles. |
-| `icph_csv_agent.py` | Standalone legacy ICPH MetaForm CSV ingestion backed by processed ICPH_MetaForms schema chunks. |
-| `preprocess_icph_metaforms.py` | Converts ICPH meta-form DOCX files into Markdown and JSONL schema chunks. |
-| `*_agent.py` | Extraction, terminology enrichment, context, and FHIR agents. |
-| `SchemaTerminologies/schemas/ICPH_MetaForms/` | ICPH MetaForm context used for protocol linking and standalone schema inspection, not form-builder FHIR creation. |
-| `output/` and `cache/` | Generated runtime artifacts; intentionally ignored by Git. |
+```bash
+<mapper>/.venv/bin/python preprocess_icph_metaforms.py
+```
 
-Large terminology/model assets under `SchemaTerminologies/` remain ignored by
-Git. Lightweight FHIR and ICPH_MetaForms schemas can be tracked with the app.
+## FHIR Output
 
-## Setup
+The retained mapper creates one FHIR `Bundle` per patient identifier. Each
+bundle contains:
 
-Use Python 3.11 for dependency compatibility.
+- one `Questionnaire` for the form definition
+- one `Patient`
+- one `Encounter` per submitted row
+- one `QuestionnaireResponse` per submitted row
+
+Choice answers preserve both the submitted code and the display label from the
+form's choices, so numeric values such as `0`/`1` remain clinically readable in
+the generated bundle.
+
+If the form workspace has reviewed terminology output, form-builder passes that
+JSON to the mapper with `--terminology-review`. Only admin-approved mappings are
+used. These approved SNOMED CT, LOINC, ICD-10, and RxNorm codes are added as
+FHIR codings on the relevant question definitions and as an approved-terminology
+extension on response items. Suggestions that were not approved in the UI are
+ignored.
+
+Derived `Observation` resources are disabled by default. They can be enabled for
+compatibility checks with:
+
+```bash
+ICPH_INCLUDE_DERIVED_OBSERVATIONS=1
+```
+
+## Dependencies
+
+The FHIR generator uses only the Python standard library. The only package in
+`requirements.txt` is for DOCX preprocessing:
 
 ```bash
 python3.11 -m venv .venv
@@ -49,41 +84,17 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## Running The Backend API
+## Checks
 
-The form-builder uses the local script handoff and does not require this API to
-be running. Start FastAPI only when you need direct API access:
-
-```bash
-./.venv/bin/python -m uvicorn react_api:app --reload
-```
-
-Health check:
+From this directory:
 
 ```bash
-curl http://127.0.0.1:8000/api/health
+./.venv/bin/python -m py_compile generic_form_fhir_agent.py preprocess_icph_metaforms.py
+./.venv/bin/python -m unittest discover tests
 ```
 
-## Form-Builder FHIR Handoff
+## Size Note
 
-The form-builder FHIR path uses only the exported/submitted form data and its
-saved draft JSON. MetaForms may be linked in the UI for context, provenance,
-and future cross-form grouping, but they are not used to create FHIR bundles.
-
-You can test the same backend path used by form-builder with:
-
-```bash
-./.venv/bin/python ../form-builder/scripts/run_icph_mapper.py \
-  /path/to/mapper-input.csv \
-  /tmp/icph_mapper_result.json \
-  --primary-identifier participant_id \
-  --generic-form-draft /path/to/form-builder/drafts/form.json
-```
-
-The generated bundles use FHIR R4 `Questionnaire` and `QuestionnaireResponse`
-as the canonical form/answer representation. Derived `Observation` resources
-are off by default and can be enabled only for compatibility by setting:
-
-```bash
-ICPH_INCLUDE_DERIVED_OBSERVATIONS=1
-```
+Most of this folder's disk usage is now expected to come from `.venv/`. Rebuild
+the virtual environment if you need to shrink the remaining local footprint
+further.

@@ -120,6 +120,7 @@ MEANINGFUL_WORDS = {
     "alcohol",
     "assault",
     "autopsy",
+    "birth",
     "bicycle",
     "bike",
     "bleeding",
@@ -129,12 +130,18 @@ MEANINGFUL_WORDS = {
     "burns",
     "chest",
     "child",
+    "cholesterol",
+    "consent",
     "death",
     "deceased",
     "drowning",
+    "diabetes",
+    "diabetic",
+    "diastolic",
     "fall",
     "fatal",
     "fracture",
+    "gestational",
     "gender",
     "gunshot",
     "head",
@@ -142,25 +149,98 @@ MEANINGFUL_WORDS = {
     "helmet",
     "homicide",
     "injury",
+    "insulin",
     "intent",
     "mechanism",
     "medical",
+    "menstrual",
     "motorcycle",
     "neck",
     "patient",
+    "period",
     "pedestrian",
     "poisoning",
     "postmortem",
     "pregnancy",
     "pregnant",
+    "pressure",
     "road",
     "seatbelt",
     "sex",
+    "sugar",
+    "systolic",
     "substance",
     "suicide",
     "transport",
     "trauma",
     "vehicle",
+}
+
+KNOWN_TERM_PATTERNS = [
+    (r"\bdate\s+of\s+birth\b", "Date of birth"),
+    (r"\bbirth\s+date\b", "Date of birth"),
+    (r"\bgestational\s+age\b", "Gestational age"),
+    (r"\blast\s+menstrual\s+period\b", "Last menstrual period"),
+    (r"\bmenstrual\s+period\b", "Menstrual period"),
+    (r"\binformed\s+consent\b", "Informed consent"),
+    (r"\bblood\s+pressure\b", "Blood pressure"),
+    (r"\bsystolic\s+blood\s+pressure\b", "Systolic blood pressure"),
+    (r"\bdiastolic\s+blood\s+pressure\b", "Diastolic blood pressure"),
+    (r"\bblood\s+sugar\b", "Blood sugar"),
+    (r"\bgestational\s+diabetes\b", "Gestational diabetes"),
+    (r"\bdiabetes\b", "Diabetes"),
+    (r"\bcholesterol\b", "Cholesterol"),
+    (r"\bpreeclampsia\b", "Preeclampsia"),
+    (r"\beclampsia\b", "Eclampsia"),
+    (r"\basthma\b", "Asthma"),
+    (r"\bkidney\s+disease\b", "Kidney disease"),
+    (r"\bheart\s+disease\b", "Heart disease"),
+    (r"\bphone\s+number\b", "Phone number"),
+    (r"\btelephone\s+number\b", "Phone number"),
+]
+
+MEANINGFUL_WORDS -= {"birth", "gestational", "menstrual", "period"}
+
+VOCABULARY_LABELS = {
+    "snomed": "SNOMED CT",
+    "loinc": "LOINC",
+    "icd10": "ICD-10",
+    "rxnorm": "RxNorm",
+}
+
+VOCABULARY_SYSTEM_URIS = {
+    "snomed": "http://snomed.info/sct",
+    "loinc": "http://loinc.org",
+    "icd10": "http://hl7.org/fhir/sid/icd-10-cm",
+    "rxnorm": "http://rxnorm.info/rxcui",
+}
+
+SEARCH_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+
+AUTO_APPROVE_SKIP_KEYS = {
+    "health",
+    "individual",
+    "medical",
+    "name",
+    "patient",
+    "person",
+    "respondent",
 }
 
 
@@ -220,6 +300,12 @@ def question_text(question: dict[str, Any]) -> str:
 def compact_entity(mapping: dict[str, Any]) -> dict[str, Any]:
     entity = clean_text(mapping.get("entity") or mapping.get("original_entity"))
     original = clean_text(mapping.get("original_entity") or entity)
+    vocabulary = clean_text(mapping.get("vocabulary") or "")
+    vocabulary_label = clean_text(
+        mapping.get("vocabularyLabel")
+        or mapping.get("terminology")
+        or VOCABULARY_LABELS.get(vocabulary, "")
+    )
     code = clean_text(
         mapping.get("snomed_code")
         or mapping.get("concept_id")
@@ -232,23 +318,59 @@ def compact_entity(mapping: dict[str, Any]) -> dict[str, Any]:
         or mapping.get("concept_name")
         or mapping.get("label")
     )
+    approved_mappings = mapping.get("approved_mappings") or mapping.get("approvedMappings") or []
+    candidate_mappings = mapping.get("candidate_mappings") or mapping.get("candidateMappings") or []
     return {
         "entity": entity,
         "originalEntity": original,
-        "terminology": "SNOMED CT" if code else "",
+        "sourceComponent": clean_text(mapping.get("source_component") or mapping.get("sourceComponent")),
+        "sourceLabel": clean_text(mapping.get("source_label") or mapping.get("sourceLabel")),
+        "sourceText": clean_text(mapping.get("source_text") or mapping.get("sourceText")),
+        "sourceQuestion": clean_text(mapping.get("source_question") or mapping.get("sourceQuestion")),
+        "decompositionMethod": clean_text(mapping.get("decomposition_method") or mapping.get("decompositionMethod") or "form_definition_phrase_candidates"),
+        "vocabulary": vocabulary,
+        "vocabularyLabel": vocabulary_label,
+        "terminology": vocabulary_label if code else "",
         "code": code,
         "term": term,
+        "display": clean_text(mapping.get("display") or term or entity),
+        "fsn": clean_text(mapping.get("fsn") or mapping.get("fully_specified_name") or term),
+        "systemUri": clean_text(mapping.get("systemUri") or mapping.get("system_uri") or VOCABULARY_SYSTEM_URIS.get(vocabulary, "")),
+        "candidateMappings": candidate_mappings,
+        "approvedMappings": approved_mappings,
+        "validationStatus": clean_text(mapping.get("validationStatus") or mapping.get("validation_status")),
+        "validated": bool(mapping.get("validated")),
         "negated": bool(mapping.get("source_assertion_negated") or mapping.get("negated")),
         "allergy": bool(mapping.get("is_allergy")),
         "raw": mapping,
     }
 
 
-def latest_snomed_lookup_path(mapper_root: Path) -> Path | None:
-    lookup_root = mapper_root / "SchemaTerminologies" / "artifacts" / "shared" / "snomed_ct"
+def latest_shared_lookup_path(mapper_root: Path, vocabulary: str, file_name: str) -> Path | None:
+    lookup_root = mapper_root / "SchemaTerminologies" / "artifacts" / "shared" / vocabulary
     if not lookup_root.is_dir():
         return None
-    candidates = sorted(lookup_root.glob("*/lookups/snomed_ct_lookup.csv"))
+    candidates = sorted(lookup_root.glob(f"*/lookups/{file_name}"))
+    return candidates[-1] if candidates else None
+
+
+def latest_snomed_lookup_path(mapper_root: Path) -> Path | None:
+    return latest_shared_lookup_path(mapper_root, "snomed_ct", "snomed_ct_lookup.csv")
+
+
+def latest_icd10_lookup_path(mapper_root: Path) -> Path | None:
+    return latest_shared_lookup_path(mapper_root, "icd10", "icd10_lookup.csv")
+
+
+def latest_rxnorm_metadata_path(mapper_root: Path) -> Path | None:
+    return latest_shared_lookup_path(mapper_root, "rxnorm", "rxnorm_metadata.json")
+
+
+def latest_loinc_lookup_path(mapper_root: Path) -> Path | None:
+    loinc_root = mapper_root / "SchemaTerminologies" / "terminologies" / "loinc"
+    if not loinc_root.is_dir():
+        return None
+    candidates = sorted(loinc_root.glob("*/LoincTable/Loinc.csv"))
     return candidates[-1] if candidates else None
 
 
@@ -261,42 +383,291 @@ def lookup_keys(value: Any) -> set[str]:
     return {key for key in keys if key}
 
 
-class ExactSnomedLookup:
+def normalize_search_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", re.sub(r"\([^()]*\)\s*$", " ", str(value or "").lower()))).strip()
+
+
+def search_tokens(value: Any) -> list[str]:
+    return [
+        token
+        for token in dict.fromkeys(normalize_search_text(value).split())
+        if len(token) >= 3 and token not in SEARCH_STOP_WORDS
+    ]
+
+
+def split_aliases(value: Any) -> list[str]:
+    text = clean_text(value)
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return [clean_text(item) for item in data if clean_text(item)]
+        except Exception:
+            pass
+    return [clean_text(item) for item in re.split(r"[;|]", text) if clean_text(item)]
+
+
+def row_search_values(row: dict[str, str]) -> list[str]:
+    values = row_primary_values(row)
+    values.extend(split_aliases(row.get("aliases", "")))
+    seen = set()
+    unique = []
+    for value in values:
+        text = clean_text(value)
+        key = normalize_search_text(text)
+        if text and key and key not in seen:
+            seen.add(key)
+            unique.append(text)
+    return unique
+
+
+def row_primary_values(row: dict[str, str]) -> list[str]:
+    return [
+        row.get("display", ""),
+        row.get("preferredTerm", ""),
+        row.get("fsn", ""),
+    ]
+
+
+def score_vocabulary_row(row: dict[str, Any], query: str, query_key: str, tokens: list[str], exact: bool) -> float:
+    row_keys = [normalize_search_text(value) for value in row_search_values(row)]
+    row_keys = [key for key in row_keys if key]
+    score = 1000.0 if exact else 0.0
+    if any(key.startswith(query_key) or query_key.startswith(key) for key in row_keys):
+        score += 160
+    if query_key and query_key in row.get("searchText", ""):
+        score += 130
+    row_token_set = set(row.get("tokens") or [])
+    overlap = len([token for token in tokens if token in row_token_set])
+    coverage = overlap / len(tokens) if tokens else 0
+    score += overlap * 35 + coverage * 80
+    preferred_key = normalize_search_text(row.get("preferredTerm") or row.get("display"))
+    if preferred_key and query_key and query_key in preferred_key:
+        score += 40
+    if clean_text(row.get("status")).lower() in {"active", "active_or_unknown", "active or unknown"}:
+        score += 10
+    if preferred_key or row.get("searchText"):
+        score -= abs(len(preferred_key or row.get("searchText", "")) - len(query_key)) * (0.75 if len(tokens) == 1 else 0.12)
+    return round(score, 2)
+
+
+def is_high_confidence_match(row: dict[str, Any], query: str, query_key: str, tokens: list[str], exact: bool, primary_exact: bool, score: float) -> bool:
+    if query_key in AUTO_APPROVE_SKIP_KEYS:
+        return False
+    if row.get("vocabulary") == "icd10":
+        return primary_exact
+    if exact:
+        return True
+    if len(tokens) < 2:
+        return False
+    row_token_set = set(row.get("tokens") or [])
+    if not all(token in row_token_set for token in tokens):
+        return False
+    row_keys = [normalize_search_text(value) for value in row_search_values(row)]
+    compact_query = query_key.replace(" ", "")
+    for key in row_keys:
+        if not key:
+            continue
+        compact_key = key.replace(" ", "")
+        tight_length = len(compact_key) <= max(len(compact_query) * 2.4, len(compact_query) + 20)
+        if tight_length and (key.startswith(query_key) or query_key.startswith(key) or query_key in key):
+            return score >= 240
+    return False
+
+
+class BruteVocabularyLookup:
     def __init__(self, mapper_root: Path):
-        self.records: dict[str, dict[str, str]] = {}
-        self.error = ""
-        path = latest_snomed_lookup_path(mapper_root)
-        if path is None:
-            self.error = "SNOMED lookup CSV was not found; entities are shown without codes."
+        self.indices: dict[str, dict[str, Any]] = {}
+        self.warnings: list[dict[str, str]] = []
+        self._load_snomed(mapper_root)
+        self._load_loinc(mapper_root)
+        self._load_icd10(mapper_root)
+        self._load_rxnorm(mapper_root)
+
+    def _new_index(self) -> dict[str, Any]:
+        return {"rows": [], "tokenIndex": {}, "exactIndex": {}}
+
+    def _add_row(self, index: dict[str, Any], vocabulary: str, row: dict[str, str]) -> None:
+        code = clean_text(row.get("code"))
+        if not code:
             return
+        label = VOCABULARY_LABELS[vocabulary]
+        row = {
+            "vocabulary": vocabulary,
+            "vocabularyLabel": label,
+            "code": code,
+            "display": clean_text(row.get("display")),
+            "preferredTerm": clean_text(row.get("preferredTerm") or row.get("display")),
+            "fsn": clean_text(row.get("fsn") or row.get("preferredTerm") or row.get("display")),
+            "aliases": clean_text(row.get("aliases")),
+            "status": clean_text(row.get("status")),
+            "systemUri": clean_text(row.get("systemUri") or VOCABULARY_SYSTEM_URIS[vocabulary]),
+        }
+        values = row_search_values(row)
+        row["searchText"] = normalize_search_text(" ".join(values))
+        row["tokens"] = search_tokens(row["searchText"])
+        row_index = len(index["rows"])
+        index["rows"].append(row)
+        for value in values:
+            for key in lookup_keys(value):
+                index["exactIndex"].setdefault(key, row_index)
+        for token in row["tokens"]:
+            index["tokenIndex"].setdefault(token, []).append(row_index)
+
+    def _load_csv(self, vocabulary: str, path: Path | None, missing_message: str, row_mapper) -> None:
+        if path is None:
+            self.warnings.append({"stage": VOCABULARY_LABELS[vocabulary], "message": missing_message})
+            return
+        index = self._new_index()
         try:
             with path.open("r", encoding="utf-8", newline="") as handle:
-                reader = csv.DictReader(handle)
-                for row in reader:
-                    code = clean_text(row.get("code"))
-                    if not code:
-                        continue
-                    record = {
-                        "code": code,
-                        "term": clean_text(row.get("preferred_term") or row.get("display") or row.get("fsn")),
-                        "fsn": clean_text(row.get("fsn") or row.get("display") or row.get("preferred_term")),
-                        "system_uri": clean_text(row.get("system_uri") or "http://snomed.info/sct"),
-                    }
-                    for value in (row.get("display"), row.get("preferred_term"), row.get("fsn")):
-                        for key in lookup_keys(value):
-                            self.records.setdefault(key, record)
+                for row in csv.DictReader(handle):
+                    self._add_row(index, vocabulary, row_mapper(row))
         except Exception as exc:
-            self.records = {}
-            self.error = f"Could not load SNOMED lookup CSV; entities are shown without codes: {exc}"
+            self.warnings.append({"stage": VOCABULARY_LABELS[vocabulary], "message": f"Could not load lookup: {exc}"})
+            return
+        self.indices[vocabulary] = index
 
-    def match(self, entity: str) -> dict[str, str] | None:
-        for key in lookup_keys(entity):
-            if key in self.records:
-                return self.records[key]
-        words = words_for(entity)
-        if len(words) == 1 and len(words[0]) > 3 and words[0].endswith("s"):
-            return self.records.get(words[0][:-1])
-        return None
+    def _load_snomed(self, mapper_root: Path) -> None:
+        self._load_csv(
+            "snomed",
+            latest_snomed_lookup_path(mapper_root),
+            "SNOMED lookup CSV was not found; SNOMED auto-mapping is disabled.",
+            lambda row: {
+                "code": row.get("code", ""),
+                "display": row.get("display", ""),
+                "preferredTerm": row.get("preferred_term") or row.get("display", ""),
+                "fsn": row.get("fsn") or row.get("display", ""),
+                "status": row.get("status", ""),
+                "systemUri": row.get("system_uri") or VOCABULARY_SYSTEM_URIS["snomed"],
+            },
+        )
+
+    def _load_loinc(self, mapper_root: Path) -> None:
+        self._load_csv(
+            "loinc",
+            latest_loinc_lookup_path(mapper_root),
+            "LOINC table was not found; LOINC auto-mapping is disabled.",
+            lambda row: {
+                "code": row.get("LOINC_NUM") or row.get("loinc_num") or "",
+                "display": row.get("LONG_COMMON_NAME") or row.get("SHORTNAME") or row.get("COMPONENT") or "",
+                "preferredTerm": row.get("SHORTNAME") or row.get("LONG_COMMON_NAME") or row.get("COMPONENT") or "",
+                "fsn": row.get("LONG_COMMON_NAME") or " ".join(
+                    clean_text(row.get(key)) for key in ("COMPONENT", "PROPERTY", "SYSTEM") if clean_text(row.get(key))
+                ),
+                "aliases": row.get("RELATEDNAMES2") or "",
+                "status": row.get("STATUS") or "",
+                "systemUri": VOCABULARY_SYSTEM_URIS["loinc"],
+            },
+        )
+
+    def _load_icd10(self, mapper_root: Path) -> None:
+        self._load_csv(
+            "icd10",
+            latest_icd10_lookup_path(mapper_root),
+            "ICD-10 lookup CSV was not found; ICD-10 auto-mapping is disabled.",
+            lambda row: {
+                "code": row.get("code", ""),
+                "display": row.get("display", ""),
+                "preferredTerm": row.get("display", ""),
+                "fsn": row.get("display", ""),
+                "aliases": row.get("aliases", ""),
+                "status": row.get("status", ""),
+                "systemUri": row.get("system_uri") or VOCABULARY_SYSTEM_URIS["icd10"],
+            },
+        )
+
+    def _load_rxnorm(self, mapper_root: Path) -> None:
+        path = latest_rxnorm_metadata_path(mapper_root)
+        if path is None:
+            self.warnings.append({"stage": VOCABULARY_LABELS["rxnorm"], "message": "RxNorm metadata was not found; RxNorm auto-mapping is disabled."})
+            return
+        index = self._new_index()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for row in data.get("rows") or []:
+                self._add_row(index, "rxnorm", {
+                    "code": row.get("code", ""),
+                    "display": row.get("display") or row.get("indexed_term") or "",
+                    "preferredTerm": row.get("display") or row.get("indexed_term") or "",
+                    "fsn": row.get("display") or row.get("indexed_term") or "",
+                    "status": row.get("status", ""),
+                    "systemUri": row.get("system_uri") or VOCABULARY_SYSTEM_URIS["rxnorm"],
+                })
+        except Exception as exc:
+            self.warnings.append({"stage": VOCABULARY_LABELS["rxnorm"], "message": f"Could not load lookup: {exc}"})
+            return
+        self.indices["rxnorm"] = index
+
+    def search(self, entity: str, limit_per_vocabulary: int = 3) -> list[dict[str, Any]]:
+        query_key = candidate_key(entity)
+        if not query_key:
+            return []
+        tokens = search_tokens(entity)
+        all_results: list[dict[str, Any]] = []
+        for vocabulary, index in self.indices.items():
+            candidate_ids = set()
+            exact = False
+            for key in lookup_keys(entity):
+                if key in index["exactIndex"]:
+                    candidate_ids.add(index["exactIndex"][key])
+                    exact = True
+            words = words_for(entity)
+            if len(words) == 1 and len(words[0]) > 3 and words[0].endswith("s"):
+                singular = words[0][:-1]
+                if singular in index["exactIndex"]:
+                    candidate_ids.add(index["exactIndex"][singular])
+                    exact = True
+            for token in tokens:
+                postings = index["tokenIndex"].get(token, [])
+                if len(postings) > 50000:
+                    continue
+                candidate_ids.update(postings)
+            scored = []
+            for row_index in candidate_ids:
+                row = index["rows"][row_index]
+                entity_keys = lookup_keys(entity)
+                row_exact = any(index["exactIndex"].get(key) == row_index for key in entity_keys)
+                row_primary_exact = any(lookup_keys(value) & entity_keys for value in row_primary_values(row))
+                score = score_vocabulary_row(row, entity, query_key, tokens, row_exact)
+                if score <= 0:
+                    continue
+                high_confidence = is_high_confidence_match(row, entity, query_key, tokens, row_exact, row_primary_exact, score)
+                scored.append((score, high_confidence, row_exact, row_primary_exact, row))
+            scored.sort(key=lambda item: (item[1], item[3], item[2], item[0]), reverse=True)
+            for score, high_confidence, row_exact, row_primary_exact, row in scored[:limit_per_vocabulary]:
+                all_results.append({
+                    "vocabulary": row["vocabulary"],
+                    "vocabularyLabel": row["vocabularyLabel"],
+                    "terminology": row["vocabularyLabel"],
+                    "code": row["code"],
+                    "display": row["preferredTerm"] or row["display"] or row["fsn"],
+                    "term": row["preferredTerm"] or row["display"] or row["fsn"],
+                    "preferredTerm": row["preferredTerm"],
+                    "fsn": row["fsn"],
+                    "systemUri": row["systemUri"],
+                    "status": row["status"],
+                    "score": score,
+                    "matchKind": "exact" if row_primary_exact else ("alias_exact" if row_exact else "lexical"),
+                    "confidence": "High" if high_confidence else "Candidate",
+                })
+        all_results.sort(key=lambda item: (item["confidence"] == "High", item["matchKind"] == "exact", item["score"]), reverse=True)
+        return all_results
+
+    def high_confidence_matches(self, entity: str) -> list[dict[str, Any]]:
+        seen_vocabularies = set()
+        matches = []
+        for match in self.search(entity, limit_per_vocabulary=3):
+            if match.get("confidence") != "High":
+                continue
+            vocabulary = match.get("vocabulary")
+            if vocabulary in seen_vocabularies:
+                continue
+            seen_vocabularies.add(vocabulary)
+            matches.append(match)
+        return matches
 
 
 def humanize_name(value: Any) -> str:
@@ -342,15 +713,18 @@ def phrase_candidates(value: Any, *, include_option: bool = False) -> list[str]:
 
     semantic_words = [word for word in words if word not in QUESTION_WORD_DROP]
     meaningful_words = [word for word in semantic_words if word in MEANINGFUL_WORDS]
+    if "aged" in semantic_words and "age" not in meaningful_words:
+        meaningful_words.append("age")
     candidates: list[str] = []
 
+    for pattern, canonical in KNOWN_TERM_PATTERNS:
+        if re.search(pattern, normalized):
+            candidates.append(canonical)
+
     if meaningful_words:
-        compact_words = [word for word in semantic_words if word not in {"completed", "performed"}]
-        if compact_words:
-            candidates.append(title_candidate(compact_words[:8]))
         candidates.extend(title_candidate([word]) for word in meaningful_words)
-    elif include_option and len(semantic_words) >= 2:
-        candidates.append(title_candidate(semantic_words[:8]))
+    elif include_option and 2 <= len(semantic_words) <= 4:
+        candidates.append(title_candidate(semantic_words))
 
     clean_candidates = []
     seen = set()
@@ -363,29 +737,99 @@ def phrase_candidates(value: Any, *, include_option: bool = False) -> list[str]:
     return clean_candidates
 
 
-def extract_form_entities(question: dict[str, Any], lookup: ExactSnomedLookup | None = None) -> list[dict[str, Any]]:
+def sourced_phrase_candidates(
+    value: Any,
+    *,
+    source_component: str,
+    source_label: str,
+    include_option: bool = False,
+) -> list[dict[str, str]]:
+    source_text = display_text(value)
+    return [
+        {
+            "candidate": candidate,
+            "source_component": source_component,
+            "source_label": source_label,
+            "source_text": source_text,
+        }
+        for candidate in phrase_candidates(value, include_option=include_option)
+    ]
+
+
+def option_display_text(option: dict[str, Any]) -> str:
+    label = display_text(option.get("label"))
+    name = clean_text(option.get("name"))
+    if label and name:
+        return f"{label} ({name})"
+    return label or name
+
+
+def approved_mapping(match: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "vocabulary": match.get("vocabulary", ""),
+        "vocabularyLabel": match.get("vocabularyLabel", ""),
+        "terminology": match.get("terminology") or match.get("vocabularyLabel", ""),
+        "code": match.get("code", ""),
+        "display": match.get("display", ""),
+        "term": match.get("term") or match.get("display", ""),
+        "preferredTerm": match.get("preferredTerm", ""),
+        "fsn": match.get("fsn", ""),
+        "systemUri": match.get("systemUri", ""),
+        "confidence": match.get("confidence", ""),
+        "matchKind": match.get("matchKind", ""),
+        "score": match.get("score", 0),
+        "approvedAt": utc_stamp(),
+        "approvedVia": "automatic_high_confidence_brute_search",
+    }
+
+
+def extract_form_entities(question: dict[str, Any], lookup: BruteVocabularyLookup | None = None) -> list[dict[str, Any]]:
     qtype = clean_text(question.get("type"))
     if qtype in SKIP_TYPES:
         return []
 
-    candidates: list[str] = []
-    for value in (
+    candidates: list[dict[str, str]] = []
+    candidates.extend(sourced_phrase_candidates(
         question.get("label"),
+        source_component="label",
+        source_label="Question",
+    ))
+    candidates.extend(sourced_phrase_candidates(
         question.get("hint"),
+        source_component="hint",
+        source_label="Question hint",
+    ))
+    candidates.extend(sourced_phrase_candidates(
         question.get("guidanceHint") or question.get("guidance_hint"),
-    ):
-        candidates.extend(phrase_candidates(value))
+        source_component="guidance_hint",
+        source_label="Guidance hint",
+    ))
 
     if not candidates:
-        candidates.extend(phrase_candidates(humanize_name(question.get("name"))))
+        candidates.extend(sourced_phrase_candidates(
+            humanize_name(question.get("name")),
+            source_component="name",
+            source_label="Question name",
+        ))
 
     if qtype.startswith("select_"):
         for option in question.get("options") or []:
-            candidates.extend(phrase_candidates(option.get("label") or option.get("name"), include_option=True))
+            option_text = option_display_text(option)
+            option_candidates = sourced_phrase_candidates(
+                option.get("label") or option.get("name"),
+                source_component="option",
+                source_label="Option/choice",
+                include_option=True,
+            )
+            if option_text:
+                for item in option_candidates:
+                    item["source_text"] = option_text
+            candidates.extend(option_candidates)
 
     entities = []
     seen = set()
-    for candidate in candidates:
+    for item in candidates:
+        candidate = item["candidate"]
         key = candidate_key(candidate)
         if not key or key in seen:
             continue
@@ -396,16 +840,43 @@ def extract_form_entities(question: dict[str, Any], lookup: ExactSnomedLookup | 
             "matched_via": "form_definition_text",
             "confidence": "Extracted",
             "source_question": question.get("name") or question.get("id") or "",
+            "source_component": item.get("source_component") or "",
+            "source_label": item.get("source_label") or "",
+            "source_text": item.get("source_text") or "",
+            "decomposition_method": "field_level_phrase_candidates",
         }
-        match = lookup.match(candidate) if lookup is not None else None
-        if match:
+        candidates_from_vocabularies = lookup.search(candidate) if lookup is not None else []
+        high_confidence_matches = [
+            match
+            for match in candidates_from_vocabularies
+            if match.get("confidence") == "High"
+        ]
+        high_confidence_by_vocabulary = []
+        seen_vocabularies = set()
+        for match in high_confidence_matches:
+            vocabulary = match.get("vocabulary")
+            if vocabulary in seen_vocabularies:
+                continue
+            seen_vocabularies.add(vocabulary)
+            high_confidence_by_vocabulary.append(match)
+        if candidates_from_vocabularies:
+            mapping["candidate_mappings"] = candidates_from_vocabularies[:12]
+        if high_confidence_by_vocabulary:
+            match = high_confidence_by_vocabulary[0]
             mapping.update(
                 {
-                    "concept_id": match.get("code", ""),
+                    "code": match.get("code", ""),
+                    "display": match.get("display", ""),
                     "term": match.get("term", ""),
                     "fsn": match.get("fsn", ""),
-                    "system_uri": match.get("system_uri", "http://snomed.info/sct"),
-                    "matched_via": "form_definition_exact_snomed",
+                    "systemUri": match.get("systemUri", ""),
+                    "vocabulary": match.get("vocabulary", ""),
+                    "vocabularyLabel": match.get("vocabularyLabel", ""),
+                    "terminology": match.get("terminology") or match.get("vocabularyLabel", ""),
+                    "approved_mappings": [approved_mapping(item) for item in high_confidence_by_vocabulary],
+                    "validation_status": "auto_approved",
+                    "validated": True,
+                    "matched_via": "form_definition_brute_vocabulary_search",
                     "confidence": "High",
                 }
             )
@@ -463,9 +934,9 @@ def main() -> int:
     }
     write_json(args.output_path, payload)
 
-    lookup = ExactSnomedLookup(args.mapper_root)
-    if lookup.error:
-        payload["warnings"].append({"stage": "SNOMED", "message": lookup.error})
+    lookup = BruteVocabularyLookup(args.mapper_root)
+    if lookup.warnings:
+        payload["warnings"].extend(lookup.warnings)
         write_json(args.output_path, payload)
 
     output_by_key = {}

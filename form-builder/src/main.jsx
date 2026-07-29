@@ -7,8 +7,10 @@ import {
   Calendar,
   Check,
   ChevronDown,
+  ChevronRight,
   ClipboardList,
   Copy,
+  Download,
   ExternalLink,
   FileJson,
   FileSpreadsheet,
@@ -34,8 +36,46 @@ import {
   X
 } from "lucide-react";
 import "./styles.css";
+import cdpgLogo from "./assets/cdpg-logo.png";
 
 const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || "http://localhost:8787";
+const ADMIN_TOKEN_KEY = "icph_admin_token";
+let runtimeAdminToken = "";
+let runtimeAdminPassword = "";
+
+function getAdminToken() {
+  if (runtimeAdminToken) return runtimeAdminToken;
+  try {
+    runtimeAdminToken = window.localStorage.getItem(ADMIN_TOKEN_KEY) || "";
+    return runtimeAdminToken;
+  } catch {
+    return "";
+  }
+}
+
+function saveAdminToken(token) {
+  runtimeAdminToken = token || "";
+  try {
+    if (token) window.localStorage.setItem(ADMIN_TOKEN_KEY, token);
+    else window.localStorage.removeItem(ADMIN_TOKEN_KEY);
+  } catch {}
+}
+
+function saveAdminPassword(password) {
+  runtimeAdminPassword = password || "";
+}
+
+function adminAuthHeaders() {
+  const token = getAdminToken();
+  return {
+    ...(token ? { "x-admin-token": token } : {}),
+    ...(runtimeAdminPassword ? { "x-admin-password": runtimeAdminPassword } : {})
+  };
+}
+
+function normalizeAccessCodeInput(value) {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5);
+}
 
 const QUESTION_TYPES = [
   { type: "text", label: "Text", icon: TextCursorInput },
@@ -164,6 +204,42 @@ function newQuestion(type, index) {
     base.listName = "choices.csv";
   }
   return base;
+}
+
+function questionTypeLabel(type) {
+  return QUESTION_TYPES.find((item) => item.type === type)?.label || String(type || "Question");
+}
+
+function questionTypePatch(question, nextType) {
+  const currentType = question?.type || "text";
+  const patch = { type: nextType };
+  if (NON_REQUIRED_TYPES.has(nextType)) patch.required = false;
+  else if (NON_REQUIRED_TYPES.has(currentType)) patch.required = true;
+  if (nextType === "calculate") {
+    patch.required = false;
+    patch.readOnly = true;
+    patch.calculation = question?.calculation || "today()";
+  } else if (currentType === "calculate") {
+    patch.readOnly = false;
+  }
+  if (nextType === "select_one" || nextType === "select_multiple" || nextType === "rank") {
+    patch.listName = question?.listName || `${question?.name || "q"}_choices`;
+    patch.options = question?.options?.length
+      ? question.options
+      : [
+          { id: crypto.randomUUID(), name: "0", label: "No" },
+          { id: crypto.randomUUID(), name: "1", label: "Yes" }
+        ];
+  }
+  if (nextType === "select_one_from_file" || nextType === "select_multiple_from_file") {
+    patch.listName = question?.listName || "choices.csv";
+  }
+  return patch;
+}
+
+function questionNumberLabel(form, questionId) {
+  const index = (form.questions || []).findIndex((question) => question.id === questionId);
+  return index >= 0 ? `question ${index + 1}` : "the selected question";
 }
 
 function defaultForm() {
@@ -494,7 +570,11 @@ function validateAnswers(form, answers) {
 }
 
 async function requestJson(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, options);
+  const headers = {
+    ...adminAuthHeaders(),
+    ...(options.headers || {})
+  };
+  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
   const text = await response.text();
   let data = {};
   try {
@@ -937,6 +1017,7 @@ const RESPONDENT_INPUT_TYPES = new Set([
 ]);
 const MEDIA_PROMPT_EXCLUDED_TYPES = new Set(["end_group", "end_repeat", "calculate", "hidden", "csv-external", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email"]);
 const PARAMETER_TYPES = new Set(["range", "image", "audio", "video", "background-audio", "file", "barcode"]);
+const CALCULATION_TYPES = new Set(["text", "integer", "decimal", "date", "time", "dateTime", "range", "hidden", "calculate"]);
 
 function hasColumnValue(question, ...fields) {
   return fields.some((field) => String(question?.[field] || "").trim());
@@ -955,7 +1036,7 @@ function canDefaultQuestion(question) {
 }
 
 function canUseTrigger(question) {
-  return canDefaultQuestion(question);
+  return canDefaultQuestion(question) || canUseCalculation(question);
 }
 
 function canUseAppearance(question) {
@@ -964,6 +1045,10 @@ function canUseAppearance(question) {
 
 function canUseParameters(question) {
   return PARAMETER_TYPES.has(question.type);
+}
+
+function canUseCalculation(question) {
+  return CALCULATION_TYPES.has(question.type) || hasColumnValue(question, "calculation");
 }
 
 function canUsePromptMedia(question) {
@@ -984,34 +1069,60 @@ function columnInfoText(column) {
     constraint: "Checks whether the answer is allowed. Example: age must be greater than or equal to 0.",
     constraint_message: "The message shown when the answer fails the condition. Example: Age cannot be negative.",
     required_message: "The message shown when a required question is left blank. Example: Please enter the patient ID.",
-    default: "Pre-fills an answer. Example: default today's date for a visit date question.",
+    default: "Pre-fills an answer when the form entry is first created. Example: default today's date for a visit date question.",
     appearance: "Changes how a question looks. Example: autocomplete makes a long select list searchable.",
     parameters: "Extra settings for certain question widgets. Example: range can use start=0 end=100 step=5.",
-    trigger: "Recalculates a dynamic default when another answer changes. Example: update visit date when visit type changes.",
+    trigger: "Recalculates a calculated/default value when another answer changes. Example: update diagnosis age when current age changes.",
     choice_filter: "Filters a select list using an earlier answer. Example: show only facilities from the selected district.",
     repeat_count: "Sets how many repeat groups are created. Example: repeat child details once for each child count.",
-    note: "An internal note column carried in the XLSForm draft. Use only when an imported form already needs it.",
+    note: "Designer note carried in the XLSForm survey sheet. This is useful for local review notes and imported templates.",
     guidance_hint: "Extra guidance for the question. Example: explain how to measure waist circumference.",
     save_to: "Usually leave this blank. It is not the question name. Use it only when an ODK Entity record should copy this answer into one of its fields, such as saving facility_name into the Facility entity field called name.",
     image: "A media file shown with the question label. Example: wound_diagram.png.",
     "big-image": "A larger image shown with the question label. Example: body_map.png.",
     audio: "An audio prompt shown with the question. Example: consent_audio.mp3.",
     video: "A video prompt shown with the question. Example: inhaler_demo.mp4.",
-    calculation: "Computes a value without asking the respondent. Example: copy age or count selected symptoms."
+    calculation: "Computes or prefills a value from earlier answers. For visible questions, combine it with a trigger and optionally mark read-only."
   };
   return info[column] || "This controls the corresponding XLSForm column.";
 }
 
 function settingInfoText(setting) {
   const info = {
-    form_title: "The human-readable form name shown to users. Example: Baseline visit form.",
-    form_id: "The stable technical ID for the form. Keep it short and unique. Example: baseline_visit.",
-    version: "The form version used by ODK to tell one published revision from another. Example: 2026-07-23-1.",
-    instance_name: "The label shown for each submitted entry. We usually set this from the primary identifier plus submission time. Example: ${patient_id} - 2026-07-23 10:30:00.",
-    style: "Optional ODK display style for the whole form. Most forms can leave this blank unless a target ODK renderer expects a specific style.",
-    submission_url: "Optional server endpoint where submissions are sent. Leave blank when this app or ODK Central handles publishing."
+    form_title: {
+      text: "The human-readable form name shown to users. Example: Baseline visit form.",
+      column: "form_title"
+    },
+    form_id: {
+      text: "The stable technical ID for the form. Keep it short and unique. Example: baseline_visit.",
+      column: "form_id",
+      note: "It will be made XLS-safe during export."
+    },
+    version: {
+      text: "The form version used by ODK to tell one published revision from another. Example: 2026-07-23-1.",
+      column: "version"
+    },
+    instance_name: {
+      text: "The label shown for each submitted entry. We usually set this from the primary identifier plus submission time. Example: ${patient_id} - 2026-07-23 10:30:00.",
+      column: "instance_name"
+    },
+    style: {
+      text: "Optional ODK display style for the whole form. Most forms can leave this blank unless a target ODK renderer expects a specific style.",
+      column: "style"
+    },
+    submission_url: {
+      text: "Optional server endpoint where submissions are sent. Leave blank when this app or ODK Central handles publishing.",
+      column: "submission_url"
+    }
   };
-  return info[setting] || "This controls the corresponding XLSForm settings sheet value.";
+  const item = info[setting];
+  if (!item) return "This controls the corresponding XLSForm settings sheet value.";
+  return (
+    <>
+      <span>{item.text}</span>
+      <span>ODK XLS settings sheet: "{item.column}" column.{item.note ? ` ${item.note}` : ""}</span>
+    </>
+  );
 }
 
 const VOCABULARY_OPTIONS = [
@@ -1064,6 +1175,28 @@ function approvedMappingsForEntity(entity = {}) {
     .filter(Boolean);
 }
 
+function candidateMappingsForEntity(entity = {}) {
+  const approvedKeys = new Set(approvedMappingsForEntity(entity).map(approvedMappingKey));
+  const seen = new Set();
+  return (Array.isArray(entity?.candidateMappings) ? entity.candidateMappings : [])
+    .map((mapping) => {
+      const normalized = normalizeApprovedMapping(mapping);
+      return normalized ? {
+        ...normalized,
+        confidence: mapping.confidence || "",
+        matchKind: mapping.matchKind || "",
+        score: mapping.score ?? ""
+      } : null;
+    })
+    .filter((mapping) => {
+      if (!mapping) return false;
+      const key = approvedMappingKey(mapping);
+      if (approvedKeys.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 function entityReviewComplete(entity = {}) {
   return Boolean(
     entity.validationStatus === "unmapped_confirmed" ||
@@ -1091,7 +1224,262 @@ function terminologyPublishIssue(terminology = {}) {
   return "";
 }
 
-function Field({ label, value, onChange, placeholder, helpText, info, multiline = false, type = "text", disabled = false }) {
+function terminologyWords(value) {
+  return [...new Set(String(value || "").toLowerCase().match(/[a-z0-9]+/g) || [])]
+    .filter((word) => word && word !== "s");
+}
+
+function displayFormText(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    if (Array.isArray(value)) return value.map(displayFormText).filter(Boolean).join(" ");
+    for (const key of ["english", "en", "default", "label"]) {
+      if (value[key]) return displayFormText(value[key]);
+    }
+    return Object.values(value).map(displayFormText).filter(Boolean).join(" ");
+  }
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function downloadBlob(blob, fileName) {
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(href), 1000);
+}
+
+function safeDownloadName(value, fallback = "download") {
+  return String(value || fallback)
+    .replace(/[\\/]+/g, "_")
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    || fallback;
+}
+
+function csvValue(value) {
+  if (Array.isArray(value)) return value.map(csvValue).join(" | ");
+  if (value && typeof value === "object") return JSON.stringify(value);
+  return value ?? "";
+}
+
+function csvEscape(value) {
+  const text = String(csvValue(value));
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function entryCsvQuestions(form = {}) {
+  const seen = new Set();
+  return (form.questions || [])
+    .filter((question) => {
+      const name = String(question?.name || "").trim();
+      if (!name || seen.has(name)) return false;
+      if (STRUCTURAL_TYPES.has(question.type)) return false;
+      if (["note", "csv-external", "audit", "background-audio"].includes(question.type)) return false;
+      seen.add(name);
+      return true;
+    });
+}
+
+function entriesToCsv(form, entries) {
+  const questions = entryCsvQuestions(form);
+  const headers = questions.map((question) => String(question.name || "").trim());
+  const rows = [headers.map(csvEscape).join(",")];
+  for (const entry of entries) {
+    const answers = computeCalculatedAnswers(form, entry.answers || {});
+    rows.push(headers.map((header) => csvEscape(answers[header])).join(","));
+  }
+  return rows.join("\n") + "\n";
+}
+
+const CRC32_TABLE = Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) {
+    value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  }
+  return value >>> 0;
+});
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc = CRC32_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateParts(date = new Date()) {
+  const year = Math.max(date.getFullYear(), 1980);
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate()
+  };
+}
+
+function binaryHeader(length, writer) {
+  const buffer = new Uint8Array(length);
+  const view = new DataView(buffer.buffer);
+  writer(view);
+  return buffer;
+}
+
+function concatBytes(parts) {
+  const length = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function zipBlob(files) {
+  const encoder = new TextEncoder();
+  const { time, date } = dosDateParts();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const nameBytes = encoder.encode(safeDownloadName(file.name, "bundle.json"));
+    const dataBytes = encoder.encode(file.text || "");
+    const checksum = crc32(dataBytes);
+    const localHeader = binaryHeader(30, (view) => {
+      view.setUint32(0, 0x04034b50, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 0, true);
+      view.setUint16(8, 0, true);
+      view.setUint16(10, time, true);
+      view.setUint16(12, date, true);
+      view.setUint32(14, checksum, true);
+      view.setUint32(18, dataBytes.length, true);
+      view.setUint32(22, dataBytes.length, true);
+      view.setUint16(26, nameBytes.length, true);
+      view.setUint16(28, 0, true);
+    });
+    localParts.push(localHeader, nameBytes, dataBytes);
+
+    const centralHeader = binaryHeader(46, (view) => {
+      view.setUint32(0, 0x02014b50, true);
+      view.setUint16(4, 20, true);
+      view.setUint16(6, 20, true);
+      view.setUint16(8, 0, true);
+      view.setUint16(10, 0, true);
+      view.setUint16(12, time, true);
+      view.setUint16(14, date, true);
+      view.setUint32(16, checksum, true);
+      view.setUint32(20, dataBytes.length, true);
+      view.setUint32(24, dataBytes.length, true);
+      view.setUint16(28, nameBytes.length, true);
+      view.setUint16(30, 0, true);
+      view.setUint16(32, 0, true);
+      view.setUint16(34, 0, true);
+      view.setUint16(36, 0, true);
+      view.setUint32(38, 0, true);
+      view.setUint32(42, offset, true);
+    });
+    centralParts.push(centralHeader, nameBytes);
+    offset += localHeader.length + nameBytes.length + dataBytes.length;
+  }
+
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const endHeader = binaryHeader(22, (view) => {
+    view.setUint32(0, 0x06054b50, true);
+    view.setUint16(4, 0, true);
+    view.setUint16(6, 0, true);
+    view.setUint16(8, files.length, true);
+    view.setUint16(10, files.length, true);
+    view.setUint32(12, centralSize, true);
+    view.setUint32(16, offset, true);
+    view.setUint16(20, 0, true);
+  });
+
+  return new Blob([concatBytes([...localParts, ...centralParts, endHeader])], { type: "application/zip" });
+}
+
+function formQuestionForTerminologyQuestion(question = {}, form = {}) {
+  const formQuestions = Array.isArray(form.questions) ? form.questions : [];
+  const questionId = String(question.id || "");
+  const questionName = String(question.name || "");
+  return formQuestions.find((item) => {
+    return String(item.id || "") === questionId || String(item.name || "") === questionName;
+  }) || question;
+}
+
+function manualEntityQuestionDetails(question = {}, form = {}) {
+  const source = formQuestionForTerminologyQuestion(question, form);
+  const options = Array.isArray(source.options) ? source.options : [];
+  const choices = options
+    .map((option) => {
+      const label = displayFormText(option.label);
+      const name = displayFormText(option.name);
+      if (label && name && label !== name) return `${label} (${name})`;
+      return label || name;
+    })
+    .filter(Boolean);
+  return [
+    { label: "Question", value: displayFormText(source.label || question.label) },
+    { label: "Hint", value: displayFormText(source.hint || question.hint) },
+    { label: "Guidance Hint", value: displayFormText(source.guidanceHint || source.guidance_hint || question.guidanceHint || question.guidance_hint) },
+    { label: "Question name", value: displayFormText(source.name || question.name) },
+    { label: "Options/Choices", value: choices.join("; ") }
+  ].filter((item) => item.value);
+}
+
+function terminologyQuestionText(question = {}, form = {}) {
+  return manualEntityQuestionDetails(question, form).map((item) => item.value).join(" ");
+}
+
+function unmatchedManualEntityWords(entityText, question = {}, form = {}) {
+  const sourceWords = new Set(terminologyWords(terminologyQuestionText(question, form)));
+  return terminologyWords(entityText).filter((word) => !sourceWords.has(word));
+}
+
+function manualEntityKey(value) {
+  return terminologyWords(value).join(" ");
+}
+
+function entitySourceLabel(entity = {}) {
+  return String(entity.sourceLabel || entity.source_label || entity.raw?.source_label || entity.raw?.source_component || "").trim();
+}
+
+function entitySourceText(entity = {}) {
+  return String(entity.sourceText || entity.source_text || entity.raw?.source_text || "").trim();
+}
+
+const ENTITY_SOURCE_LEGEND = [
+  { key: "label", label: "Question", emoji: "❓" },
+  { key: "hint", label: "Question hint", emoji: "💡" },
+  { key: "guidance_hint", label: "Guidance hint", emoji: "🧭" },
+  { key: "option", label: "Option/choice", emoji: "☑️" },
+  { key: "name", label: "Question name", emoji: "🏷️" },
+  { key: "manual", label: "Manual entry", emoji: "✍️" },
+  { key: "unknown", label: "Source not recorded", emoji: "•" }
+];
+
+function entitySourceComponent(entity = {}) {
+  return String(entity.sourceComponent || entity.source_component || entity.raw?.source_component || "").trim();
+}
+
+function entitySourceLegendItem(entity = {}) {
+  const component = entitySourceComponent(entity);
+  const label = entitySourceLabel(entity);
+  return ENTITY_SOURCE_LEGEND.find((item) => item.key === component)
+    || ENTITY_SOURCE_LEGEND.find((item) => item.label === label)
+    || ENTITY_SOURCE_LEGEND.at(-1);
+}
+
+function Field({ label, value, onChange, placeholder, helpText, info, multiline = false, autoGrow = false, type = "text", disabled = false }) {
+  const textareaRef = useRef(null);
+  useEffect(() => {
+    if (!autoGrow || !textareaRef.current) return;
+    textareaRef.current.style.height = "auto";
+    textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+  }, [autoGrow, value]);
   return (
     <label className="field">
       <span className="field-heading">
@@ -1100,7 +1488,15 @@ function Field({ label, value, onChange, placeholder, helpText, info, multiline 
       </span>
       {helpText ? <small>{helpText}</small> : null}
       {multiline ? (
-        <textarea value={value || ""} placeholder={placeholder} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
+        <textarea
+          ref={textareaRef}
+          className={autoGrow ? "auto-grow" : ""}
+          rows={autoGrow ? 1 : undefined}
+          value={value || ""}
+          placeholder={placeholder}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+        />
       ) : (
         <input type={type} value={value || ""} placeholder={placeholder} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
       )}
@@ -1206,6 +1602,10 @@ function stagePlaceholder(stage, workspace, entries, fhirBundles) {
 
 function App() {
   const path = window.location.pathname;
+  if (path.startsWith("/respondent")) {
+    const initialCode = decodeURIComponent(path.replace(/^\/respondent\/?/, "").split("/")[0] || "");
+    return <RespondentPortal initialCode={initialCode} />;
+  }
   if (path.startsWith("/fill/")) {
     return <FillForm workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])} />;
   }
@@ -1213,16 +1613,244 @@ function App() {
     const parts = path.replace("/entry/", "").split("/");
     return <EntryViewer workspaceId={decodeURIComponent(parts[0] || "")} entryId={decodeURIComponent(parts[1] || "")} />;
   }
-  return <DashboardApp />;
+  return <AdminApp />;
 }
 
-function DashboardApp() {
+function AdminApp() {
+  const [token, setToken] = useState(getAdminToken());
+  const [authMessage, setAuthMessage] = useState("");
+
+  function handleAuthenticated(nextToken) {
+    saveAdminToken(nextToken);
+    setToken(nextToken);
+    setAuthMessage("");
+  }
+
+  function handleLogout(message = "Signed out.") {
+    saveAdminToken("");
+    saveAdminPassword("");
+    setToken("");
+    setAuthMessage(message);
+  }
+
+  if (!token) {
+    return <AccessLanding message={authMessage} onAuthenticated={handleAuthenticated} />;
+  }
+
+  return <DashboardApp onLogout={handleLogout} />;
+}
+
+function AccessLanding({ message = "", onAuthenticated }) {
+  const [activeRole, setActiveRole] = useState("");
+  const [password, setPassword] = useState("");
+  const [respondentCode, setRespondentCode] = useState("");
+  const [status, setStatus] = useState({ kind: message ? "ok" : "idle", message });
+  const canAdminLogin = password.trim().length > 0 && status.kind !== "busy";
+  const canOpenRespondent = respondentCode.length === 5;
+
+  function selectRole(role) {
+    setActiveRole((current) => (current === role ? "" : role));
+    if (status.kind !== "busy") setStatus({ kind: "idle", message: "" });
+  }
+
+  async function submitAdminLogin(event) {
+    event.preventDefault();
+    if (!canAdminLogin) return;
+    setStatus({ kind: "busy", message: "Checking admin password..." });
+    try {
+      const response = await fetch(`${API_BASE}/api/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password })
+      });
+      const data = await response.json();
+      if (!response.ok || data.ok === false) throw new Error(data.error || "Admin login failed.");
+      saveAdminPassword(password);
+      onAuthenticated(data.token);
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  function submitRespondentCode(event) {
+    event.preventDefault();
+    const code = normalizeAccessCodeInput(respondentCode);
+    if (code.length !== 5) {
+      setStatus({ kind: "error", message: "Enter the 5-character respondent form code." });
+      return;
+    }
+    window.location.assign(`/respondent/${encodeURIComponent(code)}`);
+  }
+
+  return (
+    <div className="access-shell">
+      <main className="access-card">
+        <div className="access-head">
+          <img className="access-logo" src={cdpgLogo} alt="CDPG" />
+          <h1>ICPH Forms</h1>
+          <p>Choose how you want to continue.</p>
+        </div>
+
+        <div className="access-role-tabs" aria-label="Choose access type">
+          <button
+            className={`access-role-button ${activeRole === "admin" ? "active" : ""}`}
+            aria-expanded={activeRole === "admin"}
+            type="button"
+            onClick={() => selectRole("admin")}
+          >
+            <span>Admin</span>
+            <ChevronDown size={18} />
+          </button>
+          <button
+            className={`access-role-button ${activeRole === "respondent" ? "active" : ""}`}
+            aria-expanded={activeRole === "respondent"}
+            type="button"
+            onClick={() => selectRole("respondent")}
+          >
+            <span>Respondent</span>
+            <ChevronDown size={18} />
+          </button>
+        </div>
+
+        <div className="access-collapse-area">
+          {activeRole === "admin" ? (
+            <form className="access-panel access-panel-open" onSubmit={submitAdminLogin}>
+              <div>
+                <h2>Admin</h2>
+                <p>Build, publish, review terminology, and generate FHIR bundles.</p>
+              </div>
+              <label className="field">
+                <span>Admin password</span>
+                <input
+                  type="password"
+                  value={password}
+                  autoComplete="current-password"
+                  onChange={(event) => setPassword(event.target.value)}
+                  placeholder="Enter password"
+                  autoFocus
+                />
+              </label>
+              <button className="primary" disabled={!canAdminLogin} type="submit">
+                <Check size={16} /> Open Admin
+              </button>
+            </form>
+          ) : null}
+
+          {activeRole === "respondent" ? (
+            <form className="access-panel access-panel-open respondent-panel" onSubmit={submitRespondentCode}>
+              <div>
+                <h2>Respondent</h2>
+                <p>Enter the 5-character form code shared by the study team.</p>
+              </div>
+              <label className="field">
+                <span>Form code</span>
+                <input
+                  className="access-code-input"
+                  value={respondentCode}
+                  inputMode="text"
+                  autoCapitalize="characters"
+                  autoComplete="off"
+                  maxLength={5}
+                  onChange={(event) => setRespondentCode(normalizeAccessCodeInput(event.target.value))}
+                  placeholder="A1B2C"
+                  autoFocus
+                />
+              </label>
+              <button className="secondary" disabled={!canOpenRespondent} type="submit">
+                <Forward size={16} /> Fill Form
+              </button>
+            </form>
+          ) : null}
+
+          {!activeRole ? (
+            <div className="access-empty-hint">
+              <p>Select Admin or Respondent to continue.</p>
+            </div>
+          ) : null}
+        </div>
+
+        {status.message ? (
+          <div className={`status-line ${status.kind}`}>
+            {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
+            <span>{status.message}</span>
+          </div>
+        ) : null}
+      </main>
+    </div>
+  );
+}
+
+function RespondentPortal({ initialCode = "" }) {
+  const [code, setCode] = useState(normalizeAccessCodeInput(initialCode));
+  const [status, setStatus] = useState({ kind: "idle", message: "" });
+
+  function submitCode(event) {
+    event.preventDefault();
+    const normalized = normalizeAccessCodeInput(code);
+    if (normalized.length !== 5) {
+      setStatus({ kind: "error", message: "Enter the 5-character respondent form code." });
+      return;
+    }
+    setCode(normalized);
+    setStatus({ kind: "idle", message: "" });
+    window.history.replaceState(null, "", `/respondent/${encodeURIComponent(normalized)}`);
+  }
+
+  if (code.length === 5) {
+    return <FillForm accessCode={code} onBackToRespondent={() => {
+      setCode("");
+      setStatus({ kind: "idle", message: "" });
+      window.history.replaceState(null, "", "/respondent");
+    }} />;
+  }
+
+  return (
+    <div className="access-shell respondent-only">
+      <main className="access-card respondent-code-card">
+        <div className="access-head">
+          <img className="access-logo" src={cdpgLogo} alt="CDPG" />
+          <h1>ICPH Form</h1>
+          <p>Enter the form code shared by the study team.</p>
+        </div>
+        <form className="respondent-code-form" onSubmit={submitCode}>
+          <label className="field">
+            <span>Form code</span>
+            <input
+              className="access-code-input"
+              value={code}
+              inputMode="text"
+              autoCapitalize="characters"
+              autoComplete="off"
+              maxLength={5}
+              autoFocus
+              onChange={(event) => setCode(normalizeAccessCodeInput(event.target.value))}
+              placeholder="A1B2C"
+            />
+          </label>
+          <button className="primary" disabled={code.length !== 5} type="submit">
+            <Forward size={16} /> Continue
+          </button>
+        </form>
+        {status.message ? (
+          <div className={`status-line ${status.kind}`}>
+            <AlertCircle size={16} />
+            <span>{status.message}</span>
+          </div>
+        ) : null}
+      </main>
+    </div>
+  );
+}
+
+function DashboardApp({ onLogout }) {
   const [view, setView] = useState("home");
   const [forms, setForms] = useState([]);
   const [schemaDocuments, setSchemaDocuments] = useState([]);
   const [schemaSummary, setSchemaSummary] = useState(null);
   const [pendingXlsxImport, setPendingXlsxImport] = useState(null);
+  const [newFormPromptOpen, setNewFormPromptOpen] = useState(false);
   const [publishIdentifierPrompt, setPublishIdentifierPrompt] = useState(false);
+  const [publishConfirmationAccepted, setPublishConfirmationAccepted] = useState(false);
   const [form, setForm] = useState(defaultForm());
   const [workspace, setWorkspace] = useState(null);
   const [entries, setEntries] = useState([]);
@@ -1315,8 +1943,8 @@ function DashboardApp() {
   }, [workspace?.workspaceId, activeStage, terminology?.status]);
 
   useEffect(() => {
-    refreshForms().catch((error) => setStatus({ kind: "error", message: error.message }));
-    refreshSchemaDocuments().catch((error) => setStatus({ kind: "error", message: error.message }));
+    refreshForms().catch(handleRequestError);
+    refreshSchemaDocuments().catch(handleRequestError);
   }, []);
 
   function focusMissingResources(missing = missingResourceRequirements) {
@@ -1346,6 +1974,10 @@ function DashboardApp() {
 
   function handleRequestError(error) {
     const message = error?.message || String(error);
+    if (error?.status === 401) {
+      setStatus({ kind: "error", message: "Admin request was not authorized. Please log out and sign in again if this keeps happening." });
+      return;
+    }
     if (error?.status === 404 && /workspace not found/i.test(message)) {
       setWorkspace(null);
       setForm(defaultForm());
@@ -1381,14 +2013,19 @@ function DashboardApp() {
     const question = newQuestion(type, form.questions.length);
     setForm((current) => ({ ...current, questions: [...current.questions, question] }));
     setSelectedId(question.id);
+    setStatus({ kind: "ok", message: `Added ${questionTypeLabel(type)} as question ${form.questions.length + 1}!` });
   }
 
   function removeQuestion(id) {
+    const label = questionNumberLabel(form, id);
     setForm((current) => ({ ...current, questions: current.questions.filter((question) => question.id !== id) }));
     setSelectedId((current) => (current === id ? null : current));
+    setStatus({ kind: "ok", message: `Deleted ${label}.` });
   }
 
   function duplicateQuestion(question) {
+    const sourceLabel = questionNumberLabel(form, question.id);
+    const nextNumber = form.questions.length + 1;
     const copy = {
       ...question,
       id: crypto.randomUUID(),
@@ -1397,10 +2034,13 @@ function DashboardApp() {
     };
     setForm((current) => ({ ...current, questions: [...current.questions, copy] }));
     setSelectedId(copy.id);
+    setStatus({ kind: "ok", message: `Duplicated ${sourceLabel} as question ${nextNumber}.` });
   }
 
   function moveQuestion(targetId) {
     if (!draggedId || draggedId === targetId) return;
+    const fromIndex = (form.questions || []).findIndex((question) => question.id === draggedId);
+    const toIndex = (form.questions || []).findIndex((question) => question.id === targetId);
     setForm((current) => {
       const questions = [...current.questions];
       const from = questions.findIndex((question) => question.id === draggedId);
@@ -1410,16 +2050,32 @@ function DashboardApp() {
       questions.splice(to, 0, item);
       return { ...current, questions };
     });
+    if (fromIndex >= 0 && toIndex >= 0) {
+      setStatus({ kind: "ok", message: `Moved question ${fromIndex + 1} to position ${toIndex + 1}.` });
+    }
   }
 
-  async function createWorkspace() {
+  function closeQuestionProperties() {
+    if (!selectedId) return;
+    const label = questionNumberLabel(form, selectedId);
+    setSelectedId(null);
+    setStatus({ kind: "ok", message: `Saved ${label}'s properties.` });
+  }
+
+  async function createWorkspace(linkage = {}) {
     setStatus({ kind: "busy", message: "Creating form workspace..." });
     try {
       const data = await postJson("/api/forms/new", {
         title: "Untitled ICPH Form",
         formId: "icph_form",
-        version: "1"
+        version: "1",
+        linkedMetaFormFileName: linkage.linkedMetaFormFileName,
+        primaryIdentifierVariable: linkage.primaryIdentifierVariable,
+        metaFormFormIndex: linkage.metaFormFormIndex,
+        metaFormFormTitle: linkage.metaFormFormTitle,
+        primaryIdentifierAcknowledged: linkage.primaryIdentifierAcknowledged
       });
+      setNewFormPromptOpen(false);
       setWorkspace(data);
       setForm(normalizeFormDraft(data.draft));
       setEntries([]);
@@ -1430,7 +2086,7 @@ function DashboardApp() {
       setSelectedId(null);
       setView("builder");
       await refreshForms();
-      setStatus({ kind: "ok", message: `Workspace created: ${data.outputDir}` });
+      setStatus({ kind: "ok", message: data.draft?.primaryIdentifierVariable ? `Workspace created with ${data.draft.primaryIdentifierVariable} as the first question.` : `Workspace created: ${data.outputDir}` });
     } catch (error) {
       handleRequestError(error);
     }
@@ -1534,7 +2190,27 @@ function DashboardApp() {
       }));
   }
 
-  async function exportXlsForm(primaryIdentifierVariable = "") {
+  function publishConfirmationMessage() {
+    const lines = [
+      "Move to Publish?",
+      "",
+      "After this point, the terminology review will be locked and vocabulary mappings cannot be edited. The form will move into local collection.",
+      ""
+    ];
+    if (form.previousVersionWorkspaceId) {
+      const summary = copiedVersionChanges.length ? copiedVersionChanges : ["No detected build changes"];
+      lines.push(
+        `Version ${form.versionNumber || form.version || ""} changes:`,
+        ...summary.slice(0, 12).map((item) => `- ${item}`)
+      );
+      if (summary.length > 12) lines.push(`- +${summary.length - 12} more`);
+      lines.push("");
+    }
+    lines.push("Proceed?");
+    return lines.join("\n");
+  }
+
+  async function exportXlsForm(primaryIdentifierVariable = "", options = {}) {
     if (!workspace?.workspaceId) {
       setStatus({ kind: "error", message: "Create a form workspace before export." });
       return;
@@ -1560,18 +2236,31 @@ function DashboardApp() {
 	        return;
 	      }
 	    }
-	    if (!alreadyPublished && isCopiedVersionDraft && !copiedVersionHasChanges) {
+    if (!alreadyPublished && isCopiedVersionDraft && !copiedVersionHasChanges) {
 	      setActiveStage("build");
 	      setStatus({ kind: "error", message: "Edit at least one Build item before publishing this new version." });
 	      return;
 	    }
+    if (!alreadyPublished && !options.publishConfirmed) {
+      const confirmed = window.confirm(publishConfirmationMessage());
+      if (!confirmed) return;
+    }
     const explicitPrimaryIdentifier = typeof primaryIdentifierVariable === "string" ? primaryIdentifierVariable : "";
     const selectedPrimaryIdentifier = String(explicitPrimaryIdentifier || form.primaryIdentifierVariable || "").trim();
+    const linkedToMetaForm = Boolean(form.metaFormLink?.fileName);
     if (!alreadyPublished && !selectedPrimaryIdentifier) {
+      if (linkedToMetaForm) {
+        setStatus({
+          kind: "error",
+          message: "This form is linked to a MetaForm but does not have its shared Primary Identifier Variable saved. Reopen it from Home or recreate the link before publishing."
+        });
+        return;
+      }
       if (!primaryIdentifierCandidates().length) {
         setStatus({ kind: "error", message: "Add at least one named question before moving to Publish." });
         return;
       }
+      setPublishConfirmationAccepted(true);
       setPublishIdentifierPrompt(true);
       return;
     }
@@ -1583,13 +2272,6 @@ function DashboardApp() {
 	          versionChangeSummary: copiedVersionChanges
 	        }
 	      : { ...form, versionChangeSummary: copiedVersionChanges };
-	    if (!alreadyPublished && form.previousVersionWorkspaceId) {
-	      const summary = copiedVersionChanges.length ? copiedVersionChanges : ["No detected build changes"];
-	      const confirmed = window.confirm(
-	        `Publish version ${form.versionNumber || form.version || ""}?\n\nChanges in this version:\n- ${summary.slice(0, 12).join("\n- ")}${summary.length > 12 ? `\n- +${summary.length - 12} more` : ""}\n\nAfter publishing, this version will be locked for collection. Proceed?`
-	      );
-	      if (!confirmed) return;
-	    }
     setStatus({ kind: "busy", message: "Writing XLSForm and converting XML..." });
     try {
       const data = await postJson("/api/forms/export", { workspaceId: workspaceRouteId(workspace.workspaceId), form: formForExport });
@@ -1603,7 +2285,7 @@ function DashboardApp() {
         message: data.ok
           ? alreadyPublished
             ? `Exported XLSForm and XML: ${data.outputDir}`
-            : "Form moved to Publish. It is now locked for collection."
+            : `Form moved to Publish. Respondent code: ${data.respondentAccessCode || "not generated"}`
           : data.stderr || "XML conversion failed."
       });
     } catch (error) {
@@ -1808,6 +2490,92 @@ function DashboardApp() {
     return nextTerminology;
   }
 
+  async function addTerminologyEntity(payload) {
+    const questionId = String(payload?.questionId || "");
+    const entityText = String(payload?.entityText || "").replace(/\s+/g, " ").trim();
+    if (!questionId) throw new Error("Choose a question before adding an entity.");
+    if (!entityText) throw new Error("Enter the entity text to add.");
+
+    const questions = Array.isArray(terminology?.questions) ? terminology.questions : [];
+    let changed = false;
+    let addedEntityIndex = -1;
+    const nextQuestions = questions.map((question) => {
+      const questionKey = String(question.id || question.name);
+      const questionName = String(question.name || "");
+      if (questionKey !== questionId && questionName !== questionId) return question;
+      const entities = Array.isArray(question.entities) ? question.entities : [];
+      const duplicate = entities.some((entity) => manualEntityKey(entity.entity || entity.originalEntity) === manualEntityKey(entityText));
+      if (duplicate) {
+        throw new Error(`"${entityText}" is already listed for this question.`);
+      }
+      addedEntityIndex = entities.length;
+      changed = true;
+      return {
+        ...question,
+        status: question.status || "complete",
+        entities: [
+          ...entities,
+          {
+            entity: entityText,
+            originalEntity: entityText,
+            sourceComponent: "manual",
+            sourceLabel: "Manual entry",
+            sourceText: entityText,
+            sourceQuestion: question.name || question.id || "",
+            decompositionMethod: "ui_manual_entity",
+            terminology: "",
+            code: "",
+            term: "",
+            negated: false,
+            allergy: false,
+            raw: {
+              entity: entityText,
+              original_entity: entityText,
+              matched_via: "ui_manual_entity",
+              confidence: "Manual",
+              source_question: question.name || question.id || "",
+              source_component: "manual",
+              source_label: "Manual entry",
+              source_text: entityText,
+              review_note: "Admin manually added this entity from the Terminology tab."
+            },
+            approvedMappings: [],
+            validated: false,
+            validationStatus: ""
+          }
+        ]
+      };
+    });
+    if (!changed) throw new Error("Could not find the selected terminology question.");
+
+    let nextTerminology = {
+      ...terminology,
+      ok: terminology.ok !== false,
+      status: terminology.status || "complete",
+      questions: nextQuestions,
+      entityCount: nextQuestions.reduce((sum, question) => sum + (question.entities?.length || 0), 0),
+      reviewUpdatedAt: new Date().toISOString()
+    };
+    setTerminology(nextTerminology);
+    if (workspace?.workspaceId) {
+      const saved = await postJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspace.workspaceId))}/terminology/review`, {
+        terminology: nextTerminology
+      });
+      if (saved?.questions) {
+        nextTerminology = saved;
+        setTerminology(saved);
+      }
+    }
+    const savedQuestion = (nextTerminology.questions || []).find((question) => {
+      const questionKey = String(question.id || question.name);
+      const questionName = String(question.name || "");
+      return questionKey === questionId || questionName === questionId;
+    });
+    const savedEntityIndex = (savedQuestion?.entities || []).findIndex((entity) => manualEntityKey(entity.entity || entity.originalEntity) === manualEntityKey(entityText));
+    setStatus({ kind: "ok", message: `Added "${entityText}" as a terminology entity. Review and approve or confirm unmapped before publishing.` });
+    return { terminology: nextTerminology, question: savedQuestion, entityIndex: savedEntityIndex >= 0 ? savedEntityIndex : addedEntityIndex };
+  }
+
   async function importXlsx(event) {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -1841,7 +2609,11 @@ function DashboardApp() {
         filename: pendingXlsxImport.filename,
         dataBase64: pendingXlsxImport.dataBase64,
         linkedMetaFormFileName: linkage.linkedMetaFormFileName,
-        primaryIdentifierVariable: linkage.primaryIdentifierVariable
+        primaryIdentifierVariable: linkage.primaryIdentifierVariable,
+        metaFormFormIndex: linkage.metaFormFormIndex,
+        metaFormFormTitle: linkage.metaFormFormTitle,
+        primaryIdentifierAcknowledged: linkage.primaryIdentifierAcknowledged,
+        addMissingPrimaryIdentifier: linkage.addMissingPrimaryIdentifier
       });
       setPendingXlsxImport(null);
 	      const importedForm = normalizeFormDraft({
@@ -2085,7 +2857,7 @@ function DashboardApp() {
           schemaDocuments={schemaDocuments}
           schemaSummary={schemaSummary}
           status={status}
-          createWorkspace={createWorkspace}
+          createWorkspace={() => setNewFormPromptOpen(true)}
           importXlsx={importXlsx}
           uploadSchemaDocument={uploadSchemaDocument}
           processSchemaDocuments={processSchemaDocuments}
@@ -2093,9 +2865,13 @@ function DashboardApp() {
           openWorkspace={openWorkspace}
           fillForm={fillForm}
           deleteWorkspace={deleteWorkspace}
+          onLogout={onLogout}
           pendingXlsxImport={pendingXlsxImport}
           confirmXlsxImport={confirmXlsxImport}
           cancelXlsxImport={() => setPendingXlsxImport(null)}
+          newFormPromptOpen={newFormPromptOpen}
+          confirmNewForm={createWorkspace}
+          cancelNewForm={() => setNewFormPromptOpen(false)}
         />
       ) : (
         <BuilderPage
@@ -2122,11 +2898,13 @@ function DashboardApp() {
           duplicateQuestion={duplicateQuestion}
           moveQuestion={moveQuestion}
           setSelectedId={setSelectedId}
+          closeQuestionProperties={closeQuestionProperties}
           saveCheckpoint={saveCheckpoint}
           finishBuild={finishBuild}
           exportXlsForm={exportXlsForm}
 	          runTerminologyExtraction={runTerminologyExtraction}
 	          replaceTerminologyMapping={replaceTerminologyMapping}
+	          addTerminologyEntity={addTerminologyEntity}
 	          reviewIssue={reviewIssue}
 	          isCopiedVersionDraft={isCopiedVersionDraft}
 	          copiedVersionHasChanges={copiedVersionHasChanges}
@@ -2140,6 +2918,7 @@ function DashboardApp() {
           deleteWorkspaceAttachment={deleteWorkspaceAttachment}
           viewEntry={viewEntry}
           refreshEntries={refreshCurrentEntries}
+          onLogout={onLogout}
         />
       )}
       {publishIdentifierPrompt ? (
@@ -2147,10 +2926,15 @@ function DashboardApp() {
           form={form}
           status={status}
           candidates={primaryIdentifierCandidates()}
-          onCancel={() => setPublishIdentifierPrompt(false)}
-          onPublish={(primaryIdentifierVariable) => {
+          onCancel={() => {
             setPublishIdentifierPrompt(false);
-            exportXlsForm(primaryIdentifierVariable);
+            setPublishConfirmationAccepted(false);
+          }}
+          onPublish={(primaryIdentifierVariable) => {
+            const publishConfirmed = publishConfirmationAccepted;
+            setPublishIdentifierPrompt(false);
+            setPublishConfirmationAccepted(false);
+            exportXlsForm(primaryIdentifierVariable, { publishConfirmed });
           }}
         />
       ) : null}
@@ -2171,9 +2955,13 @@ function HomePage({
   openWorkspace,
   fillForm,
   deleteWorkspace,
+  onLogout,
   pendingXlsxImport,
   confirmXlsxImport,
-  cancelXlsxImport
+  cancelXlsxImport,
+  newFormPromptOpen,
+  confirmNewForm,
+  cancelNewForm
 	}) {
 	  const homeRef = useRef(null);
 	  const [connectors, setConnectors] = useState([]);
@@ -2254,9 +3042,17 @@ function HomePage({
   return (
     <>
       <header className="topbar home-topbar">
-        <div>
+        <div className="topbar-actions">
+          <button className="secondary topbar-logout" onClick={() => onLogout?.("Signed out.")}>
+            <X size={14} /> Logout
+          </button>
+        </div>
+        <div className="topbar-title">
           <h1>ICPH Forms</h1>
           <p>Connect MetaForms with generated XLSForms for context and tracking.</p>
+        </div>
+        <div className="topbar-brand">
+          <img className="topbar-logo" src={cdpgLogo} alt="CDPG" />
         </div>
       </header>
 
@@ -2285,6 +3081,7 @@ function HomePage({
             <div>
               <h2>XLS Forms</h2>
 	              <p>{versionGroups.length} form families · {forms.length} versions</p>
+              <XlsFormsNote />
             </div>
             <div className="home-column-actions">
               <button className="primary small" onClick={createWorkspace}>
@@ -2295,25 +3092,6 @@ function HomePage({
                 <input type="file" accept=".xlsx" onChange={importXlsx} />
               </label>
             </div>
-          </div>
-          <div className="xls-warning">
-            <AlertCircle size={16} />
-            <span>Browser filling may not fully support these inputs: barcode, background-audio, and audit.</span>
-          </div>
-          <div className="xls-resource-note">
-            <AlertCircle size={16} />
-            <span>
-              XLSForm import reads the workbook sheets such as survey, choices, settings, and entities.
-              Companion files referenced by the form, such as CSV choices, images, audio, video, or GeoJSON,
-              must be uploaded from the Builder before publishing.
-            </span>
-          </div>
-          <div className="xls-resource-note">
-            <AlertCircle size={16} />
-            <span>
-              FHIR bundles are generated only from the XLSForm/form builder definition and submitted answers.
-              MetaForms are kept for context, visual linking, and later cross-form grouping, not for FHIR creation.
-            </span>
           </div>
 	          {forms.length === 0 ? (
             <div className="empty-state tall">
@@ -2380,11 +3158,13 @@ function HomePage({
                       <span>Not linked to a MetaForm</span>
                     </div>
                   )}
+                  {item.respondentAccessCode ? (
+                    <div className="respondent-code-row">
+                      <span>Respondent form code</span>
+                      <strong>{item.respondentAccessCode}</strong>
+                    </div>
+                  ) : null}
                   <p className="mono">{item.outputDir}</p>
-                  <p className="form-resource-note">
-                    If this form references external CSV/media/map files, open Builder and upload them there before publishing.
-                    FHIR creation uses this form and its submitted answers, not the linked MetaForm.
-                  </p>
                   <div className="card-actions">
                     <button className="secondary" onClick={() => openWorkspace(item.workspaceId)}>
                       <FolderOpen size={16} /> Open
@@ -2402,19 +3182,54 @@ function HomePage({
 	              );
 	              })}
 	            </div>
-	          )}
+          )}
         </section>
       </main>
+      <footer className="builder-footer home-footer" aria-label="Page status">
+        <div className={`footer-status ${status.kind}`}>
+          {status.kind === "ok" ? <Check size={16} /> : status.kind === "busy" ? <RefreshCw size={16} /> : <AlertCircle size={16} />}
+          <span>{status.message || "Ready."}</span>
+        </div>
+      </footer>
       {pendingXlsxImport ? (
         <XlsImportLinkModal
           pending={pendingXlsxImport}
           documents={schemaDocuments}
+          forms={forms}
           status={status}
           onCancel={cancelXlsxImport}
           onImport={confirmXlsxImport}
         />
       ) : null}
+      {newFormPromptOpen ? (
+        <NewFormLinkModal
+          documents={schemaDocuments}
+          forms={forms}
+          status={status}
+          onCancel={cancelNewForm}
+          onCreate={confirmNewForm}
+        />
+      ) : null}
     </>
+  );
+}
+
+function XlsFormsNote() {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="xls-note-wrap">
+      <button className="link-button xls-note-link" type="button" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+        Note!
+      </button>
+      {open ? (
+        <span className="xls-note-popover" role="note">
+          <span>Browser filling may not fully support barcode, background-audio, and audit inputs.</span>
+          <span>XLSForm import reads workbook sheets such as survey, choices, settings, and entities. Upload companion files from Builder before publishing.</span>
+          <span>FHIR bundles use the XLSForm/form builder definition and submitted answers. MetaForms are kept for context and later grouping.</span>
+          <span>If a form references external CSV/media/map files, open Builder and upload them there before publishing. FHIR creation uses the form and its submitted answers, not the linked MetaForm.</span>
+        </span>
+      ) : null}
+    </span>
   );
 }
 
@@ -2437,12 +3252,9 @@ function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument
           </button>
         </div>
       </div>
-      <div className="xls-resource-note">
-        <AlertCircle size={16} />
-        <span>
-          MetaForms are retained for protocol context and linking multiple XLS forms together. They are not used during FHIR bundle creation.
-        </span>
-      </div>
+      <p className="schema-context-subtitle">
+        MetaForms are retained for protocol context and linking multiple XLS forms together. They are not used during FHIR bundle creation.
+      </p>
       {needsProcessing ? (
         <p className="schema-warning">One or more documents need processing before they can appear as searchable/linkable MetaForm context.</p>
       ) : null}
@@ -2478,6 +3290,11 @@ function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument
                 <span>{document.chunkCount || 0} chunks</span>
                 <span>{linkedFormsByMetaForm?.get(document.fileName)?.length || 0} XLS links</span>
               </div>
+              {linkedFormsByMetaForm?.get(document.fileName)?.find((item) => item.primaryIdentifierVariable) ? (
+                <p className="schema-primary-hint">
+                  Primary Identifier Variable: <strong>{linkedFormsByMetaForm.get(document.fileName).find((item) => item.primaryIdentifierVariable).primaryIdentifierVariable}</strong>
+                </p>
+              ) : null}
             </article>
           ))}
         </div>
@@ -2487,12 +3304,248 @@ function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument
   );
 }
 
-function XlsImportLinkModal({ pending, documents, status, onCancel, onImport }) {
+function NewFormLinkModal({ documents, forms = [], status, onCancel, onCreate }) {
+  const processedDocuments = documents.filter((document) => document.status === "Processed");
+  const [linkedChoice, setLinkedChoice] = useState("");
+  const [linkedMetaFormFileName, setLinkedMetaFormFileName] = useState("");
+  const [metaFormFormIndex, setMetaFormFormIndex] = useState("");
+  const [primaryIdentifierVariable, setPrimaryIdentifierVariable] = useState("");
+  const [primaryIdentifierAcknowledged, setPrimaryIdentifierAcknowledged] = useState(false);
+  const isLinked = linkedChoice === "yes";
+  const selectedMetaForm = processedDocuments.find((document) => document.fileName === linkedMetaFormFileName) || null;
+  const linkedForms = linkedMetaFormFileName
+    ? forms.filter((item) => item.metaFormLink?.fileName === linkedMetaFormFileName && item.primaryIdentifierVariable)
+    : [];
+  const existingPrimaryIdentifier = linkedForms[0]?.primaryIdentifierVariable || "";
+  const primaryIdentifierLocked = Boolean(isLinked && existingPrimaryIdentifier);
+  const formOptions = selectedMetaForm
+    ? selectedMetaForm.formOptions?.length
+      ? selectedMetaForm.formOptions
+      : Array.from({ length: selectedMetaForm.formCount || 0 }, (_, index) => ({
+          formIndex: index + 1,
+          title: `Form ${index + 1}`,
+          variableCount: 0,
+          variables: []
+        }))
+    : [];
+  const selectedFormOption = formOptions.find((item) => String(item.formIndex) === String(metaFormFormIndex)) || null;
+  const variables = selectedFormOption?.variables || [];
+  const effectivePrimaryIdentifier = primaryIdentifierLocked ? existingPrimaryIdentifier : primaryIdentifierVariable;
+  const primaryOptions = primaryIdentifierLocked
+    ? [{ name: existingPrimaryIdentifier, label: "Primary identifier from linked MetaForm" }, ...variables.filter((item) => item.name !== existingPrimaryIdentifier)]
+    : variables;
+  const canCreate = Boolean(
+    status.kind !== "busy" &&
+    linkedChoice &&
+    (
+      !isLinked ||
+      (
+        linkedMetaFormFileName &&
+        metaFormFormIndex &&
+        effectivePrimaryIdentifier &&
+        primaryIdentifierAcknowledged
+      )
+    )
+  );
+
+  useEffect(() => {
+    if (linkedChoice !== "yes") {
+      setLinkedMetaFormFileName("");
+      setMetaFormFormIndex("");
+      setPrimaryIdentifierVariable("");
+      setPrimaryIdentifierAcknowledged(false);
+    }
+  }, [linkedChoice]);
+
+  useEffect(() => {
+    setMetaFormFormIndex("");
+    setPrimaryIdentifierVariable("");
+    setPrimaryIdentifierAcknowledged(false);
+  }, [linkedMetaFormFileName]);
+
+  useEffect(() => {
+    if (primaryIdentifierLocked) {
+      setPrimaryIdentifierVariable(existingPrimaryIdentifier);
+      return;
+    }
+    setPrimaryIdentifierVariable(variables[0]?.name || "");
+  }, [existingPrimaryIdentifier, primaryIdentifierLocked, metaFormFormIndex]);
+
+  const createLabel = primaryIdentifierLocked
+    ? "Add the Primary Identifier Variable from the MetaForm and Begin Building"
+    : isLinked
+      ? "Proceed"
+      : "Begin Building";
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="link-modal new-form-modal" role="dialog" aria-modal="true" aria-label="Create new form">
+        <div className="modal-head">
+          <div>
+            <h2>Create New Form</h2>
+            <p>Start a blank XLSForm workspace, optionally linked to a MetaForm.</p>
+          </div>
+          <button className="icon-button" onClick={onCancel} aria-label="Close create form dialog">
+            <X size={15} />
+          </button>
+        </div>
+
+        <div className="new-form-question">
+          <span>Is this new form linked to any MetaForm?</span>
+          <div className="choice-buttons">
+            <button
+              className={linkedChoice === "yes" ? "choice-button selected" : "choice-button"}
+              type="button"
+              onClick={() => setLinkedChoice("yes")}
+            >
+              Yes
+            </button>
+            <button
+              className={linkedChoice === "no" ? "choice-button selected" : "choice-button"}
+              type="button"
+              onClick={() => setLinkedChoice("no")}
+            >
+              No
+            </button>
+          </div>
+        </div>
+
+        {isLinked ? (
+          <>
+            <div className="link-form">
+              <label className="field">
+                <span>Linked MetaForm</span>
+                <select value={linkedMetaFormFileName} onChange={(event) => setLinkedMetaFormFileName(event.target.value)}>
+                  <option value="">Choose MetaForm</option>
+                  {processedDocuments.map((document) => (
+                    <option key={document.fileName} value={document.fileName}>
+                      {document.fileName} · {document.formCount || 0} forms · {document.variableCount || 0} variables
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field">
+                <span>Which form is this in the MetaForm?</span>
+                <select value={metaFormFormIndex} disabled={!linkedMetaFormFileName} onChange={(event) => setMetaFormFormIndex(event.target.value)}>
+                  <option value="">Choose MetaForm form</option>
+                  {formOptions.map((item) => (
+                    <option key={item.formIndex} value={item.formIndex}>
+                      {item.title || `Form ${item.formIndex}`}{item.variableCount ? ` · ${item.variableCount} variables` : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            {metaFormFormIndex ? (
+              <div className="link-form link-form-secondary">
+                <label className="field">
+                  <span>Primary Identifier Variable</span>
+                  <select
+                    value={effectivePrimaryIdentifier}
+                    disabled={primaryIdentifierLocked || !variables.length}
+                    onChange={(event) => setPrimaryIdentifierVariable(event.target.value)}
+                  >
+                    {primaryOptions.length ? primaryOptions.map((variable) => (
+                      <option key={variable.name} value={variable.name}>
+                        {variable.name}{variable.label ? ` · ${variable.label}` : ""}
+                      </option>
+                    )) : (
+                      <option value="">No variables found in this MetaForm form</option>
+                    )}
+                  </select>
+                </label>
+
+                <label className="acknowledgement-box">
+                  <input
+                    type="checkbox"
+                    checked={primaryIdentifierAcknowledged}
+                    onChange={(event) => setPrimaryIdentifierAcknowledged(event.target.checked)}
+                  />
+                  <span>
+                    I acknowledge that <strong>{effectivePrimaryIdentifier || "the selected variable"}</strong> is the common Primary Identifier Variable for every form linked to <strong>{linkedMetaFormFileName}</strong>.
+                  </span>
+                </label>
+              </div>
+            ) : null}
+
+            {primaryIdentifierLocked ? (
+              <p className="modal-subtle-note">
+                This MetaForm already uses <strong>{existingPrimaryIdentifier}</strong> as its Primary Identifier Variable, so the new form will start with that question.
+              </p>
+            ) : null}
+          </>
+        ) : null}
+
+        <div className="modal-actions">
+          <button className="secondary" onClick={onCancel}>Cancel</button>
+          <button
+            className="primary"
+            disabled={!canCreate}
+            onClick={() => onCreate({
+              linkedMetaFormFileName: isLinked ? linkedMetaFormFileName : "",
+              primaryIdentifierVariable: isLinked ? effectivePrimaryIdentifier : "",
+              metaFormFormIndex: isLinked ? metaFormFormIndex : "",
+              metaFormFormTitle: selectedFormOption?.title || "",
+              primaryIdentifierAcknowledged: isLinked ? primaryIdentifierAcknowledged : false
+            })}
+          >
+            <Plus size={16} /> {createLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, onImport }) {
   const processedDocuments = documents.filter((document) => document.status === "Processed");
   const variables = pending.variables || [];
   const [linkedMetaFormFileName, setLinkedMetaFormFileName] = useState("");
   const [primaryIdentifierVariable, setPrimaryIdentifierVariable] = useState(variables[0]?.name || "");
-  const canImport = primaryIdentifierVariable && status.kind !== "busy";
+  const [metaFormFormIndex, setMetaFormFormIndex] = useState("");
+  const [primaryIdentifierAcknowledged, setPrimaryIdentifierAcknowledged] = useState(false);
+  const selectedMetaForm = processedDocuments.find((document) => document.fileName === linkedMetaFormFileName) || null;
+  const linkedForms = linkedMetaFormFileName
+    ? forms.filter((item) => item.metaFormLink?.fileName === linkedMetaFormFileName && item.primaryIdentifierVariable)
+    : [];
+  const existingPrimaryIdentifier = linkedForms[0]?.primaryIdentifierVariable || "";
+  const primaryIdentifierLocked = Boolean(linkedMetaFormFileName && existingPrimaryIdentifier);
+  const effectivePrimaryIdentifier = primaryIdentifierLocked ? existingPrimaryIdentifier : primaryIdentifierVariable;
+  const variableNames = new Set(variables.map((variable) => variable.name));
+  const primaryIdentifierMissing = Boolean(primaryIdentifierLocked && effectivePrimaryIdentifier && !variableNames.has(effectivePrimaryIdentifier));
+  const formOptions = selectedMetaForm
+    ? selectedMetaForm.formOptions?.length
+      ? selectedMetaForm.formOptions
+      : Array.from({ length: selectedMetaForm.formCount || 0 }, (_, index) => ({
+          formIndex: index + 1,
+          title: `Form ${index + 1}`,
+          variableCount: 0
+        }))
+    : [];
+  const selectedFormOption = formOptions.find((item) => String(item.formIndex) === String(metaFormFormIndex)) || null;
+  const primaryOptions = primaryIdentifierMissing
+    ? [{ name: effectivePrimaryIdentifier, label: "Primary identifier from linked MetaForm" }, ...variables]
+    : variables;
+  const needsMetaFormDetails = Boolean(linkedMetaFormFileName);
+  const canImport = Boolean(
+    effectivePrimaryIdentifier &&
+    status.kind !== "busy" &&
+    (!needsMetaFormDetails || (metaFormFormIndex && primaryIdentifierAcknowledged)) &&
+    (!primaryIdentifierMissing || primaryIdentifierLocked)
+  );
+
+  useEffect(() => {
+    if (!linkedMetaFormFileName) {
+      setPrimaryIdentifierAcknowledged(false);
+      setMetaFormFormIndex("");
+      return;
+    }
+    if (primaryIdentifierLocked) setPrimaryIdentifierVariable(existingPrimaryIdentifier);
+    setPrimaryIdentifierAcknowledged(false);
+    setMetaFormFormIndex("");
+  }, [existingPrimaryIdentifier, linkedMetaFormFileName, primaryIdentifierLocked]);
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -2522,8 +3575,12 @@ function XlsImportLinkModal({ pending, documents, status, onCancel, onImport }) 
 
           <label className="field">
             <span>Primary Identifier Variable</span>
-            <select value={primaryIdentifierVariable} onChange={(event) => setPrimaryIdentifierVariable(event.target.value)}>
-              {variables.map((variable) => (
+            <select
+              value={effectivePrimaryIdentifier}
+              disabled={primaryIdentifierLocked}
+              onChange={(event) => setPrimaryIdentifierVariable(event.target.value)}
+            >
+              {primaryOptions.map((variable) => (
                 <option key={variable.name} value={variable.name}>
                   {variable.name}{variable.label ? ` · ${variable.label}` : ""}
                 </option>
@@ -2531,6 +3588,39 @@ function XlsImportLinkModal({ pending, documents, status, onCancel, onImport }) 
             </select>
           </label>
         </div>
+
+        {needsMetaFormDetails ? (
+          <div className="link-form link-form-secondary">
+            <label className="field">
+              <span>Which form is this in the MetaForm?</span>
+              <select value={metaFormFormIndex} onChange={(event) => setMetaFormFormIndex(event.target.value)}>
+                <option value="">Choose MetaForm form</option>
+                {formOptions.map((item) => (
+                  <option key={item.formIndex} value={item.formIndex}>
+                    {item.title || `Form ${item.formIndex}`}{item.variableCount ? ` · ${item.variableCount} variables` : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="acknowledgement-box">
+              <input
+                type="checkbox"
+                checked={primaryIdentifierAcknowledged}
+                onChange={(event) => setPrimaryIdentifierAcknowledged(event.target.checked)}
+              />
+              <span>
+                I acknowledge that <strong>{effectivePrimaryIdentifier || "the selected variable"}</strong> is the common Primary Identifier Variable for every form linked to <strong>{linkedMetaFormFileName}</strong>.
+              </span>
+            </label>
+          </div>
+        ) : null}
+
+        {primaryIdentifierLocked ? (
+          <p className="modal-subtle-note">
+            This MetaForm already uses <strong>{existingPrimaryIdentifier}</strong> as its Primary Identifier Variable, so it is locked for this import.
+          </p>
+        ) : null}
 
         <div className="xls-resource-note modal-note">
           <AlertCircle size={16} />
@@ -2549,7 +3639,8 @@ function XlsImportLinkModal({ pending, documents, status, onCancel, onImport }) 
           <div className="variable-list">
             {variables.slice(0, 80).map((variable) => (
               <button
-                className={variable.name === primaryIdentifierVariable ? "variable-row selected" : "variable-row"}
+                className={variable.name === effectivePrimaryIdentifier ? "variable-row selected" : "variable-row"}
+                disabled={primaryIdentifierLocked}
                 key={variable.name}
                 onClick={() => setPrimaryIdentifierVariable(variable.name)}
               >
@@ -2562,8 +3653,19 @@ function XlsImportLinkModal({ pending, documents, status, onCancel, onImport }) 
 
         <div className="modal-actions">
           <button className="secondary" onClick={onCancel}>Cancel</button>
-          <button className="primary" disabled={!canImport} onClick={() => onImport({ linkedMetaFormFileName, primaryIdentifierVariable })}>
-            <Import size={16} /> Import XLS
+          <button
+            className="primary"
+            disabled={!canImport}
+            onClick={() => onImport({
+              linkedMetaFormFileName,
+              primaryIdentifierVariable: effectivePrimaryIdentifier,
+              metaFormFormIndex,
+              metaFormFormTitle: selectedFormOption?.title || "",
+              primaryIdentifierAcknowledged,
+              addMissingPrimaryIdentifier: primaryIdentifierMissing
+            })}
+          >
+            <Import size={16} /> {primaryIdentifierMissing ? "Add the Primary Identifier Variable from the MetaForm and Import XLS" : "Import XLS"}
           </button>
         </div>
       </div>
@@ -2653,11 +3755,13 @@ function BuilderPage(props) {
     moveQuestion,
     setDraggedId,
     setSelectedId,
+    closeQuestionProperties,
     saveCheckpoint,
     finishBuild,
     exportXlsForm,
 	    runTerminologyExtraction,
 	    replaceTerminologyMapping,
+	    addTerminologyEntity,
 	    reviewIssue,
 	    isCopiedVersionDraft,
 	    copiedVersionHasChanges,
@@ -2670,7 +3774,8 @@ function BuilderPage(props) {
     uploadQuestionMedia,
     deleteWorkspaceAttachment,
     viewEntry,
-    refreshEntries
+    refreshEntries,
+    onLogout
   } = props;
 	  const locked = isWorkspaceLocked(workspace, form);
 	  const published = hasPublishedForm(workspace);
@@ -2688,14 +3793,23 @@ function BuilderPage(props) {
   ];
   const fhirPlaceholder = stagePlaceholder("fhir", workspace, entries, fhirBundles);
   const terminologyPlaceholder = stagePlaceholder("terminology", workspace, entries, fhirBundles);
+  const [questionTypeToAdd, setQuestionTypeToAdd] = useState(QUESTION_TYPES[0]?.type || "text");
 
   return (
     <>
       <header className="topbar form-topbar">
-        <button className="secondary topbar-home" onClick={backHome}><Home size={18} /> Home</button>
+        <div className="topbar-actions">
+          <button className="secondary topbar-home" onClick={backHome}><Home size={18} /> Home</button>
+          <button className="secondary topbar-logout" onClick={() => onLogout?.("Signed out.")}>
+            <X size={14} /> Logout
+          </button>
+        </div>
         <div className="topbar-title">
           <h1>{form.title || "ICPH Form Builder"}</h1>
           <p>Build, checkpoint, export, and collect locally in one form workspace.</p>
+        </div>
+        <div className="topbar-brand">
+          <img className="topbar-logo" src={cdpgLogo} alt="CDPG" />
         </div>
         <nav className="stage-tabs" aria-label="Form stages">
           {stages.map((stage) => (
@@ -2719,7 +3833,7 @@ function BuilderPage(props) {
                 <h2>FHIR</h2>
                 <p>FHIR bundles generated from submitted entries are available below.</p>
               </div>
-              <FhirPanel fhirBundles={fhirBundles} />
+              <FhirPanel fhirBundles={fhirBundles} form={form} />
             </section>
           ) : (
             <section className="panel stage-placeholder">
@@ -2741,12 +3855,15 @@ function BuilderPage(props) {
       ) : activeStage === "terminology" ? (
         <main className="publish-layout">
           <TerminologyPanel
+            form={form}
             workspace={workspace}
             terminology={terminology}
 	            status={status}
 	            runTerminologyExtraction={runTerminologyExtraction}
 	            replaceTerminologyMapping={replaceTerminologyMapping}
+	            addTerminologyEntity={addTerminologyEntity}
 	            reviewIssue={reviewIssue}
+            locked={published}
 	          />
         </main>
       ) : activeStage === "publish" ? (
@@ -2756,8 +3873,15 @@ function BuilderPage(props) {
               <StageBadge stage={currentStage} />
               <h2>Publish</h2>
               <p>{published ? "This form is published locally. Fill it in the browser, inspect submitted entries, then generate FHIR bundles." : "Move the form to Publish after vocabulary review is complete."}</p>
+              {published && workspace?.respondentAccessCode ? (
+                <div className="respondent-code-callout">
+                  <span>Respondent form code</span>
+                  <strong>{workspace.respondentAccessCode}</strong>
+                  <p>Share this 5-character code with respondents. They can enter it from the respondent page without an admin password.</p>
+                </div>
+              ) : null}
             </div>
-            <EntriesPanel entries={entries} workspaceId={workspace?.workspaceId} viewEntry={viewEntry} refreshEntries={refreshEntries} status={status} />
+            <EntriesPanel form={form} entries={entries} workspaceId={workspace?.workspaceId} viewEntry={viewEntry} refreshEntries={refreshEntries} status={status} />
           </section>
         </main>
       ) : (
@@ -2765,16 +3889,72 @@ function BuilderPage(props) {
         {!locked ? (
           <aside className="panel palette">
             <h2>Question Types</h2>
-            <div className="palette-grid">
-              {QUESTION_TYPES.map((item) => {
-                const Icon = item.icon;
-                return (
-                  <button key={item.type} onClick={() => addQuestion(item.type)} title={`Add ${item.label}`}>
-                    <Icon size={18} />
-                    <span>{item.label}</span>
-                  </button>
-                );
-              })}
+            <div className="question-type-picker">
+              <select value={questionTypeToAdd} onChange={(event) => setQuestionTypeToAdd(event.target.value)}>
+                {QUESTION_TYPES.map((item) => (
+                  <option key={item.type} value={item.type}>{item.label}</option>
+                ))}
+              </select>
+              <button className="primary" onClick={() => addQuestion(questionTypeToAdd)}>
+                <Plus size={16} /> Add Question
+              </button>
+            </div>
+
+            <div className="side-form-meta">
+              <Field
+                label="Form Title"
+                value={form.title}
+                disabled={locked}
+                info={settingInfoText("form_title")}
+                multiline
+                autoGrow
+                onChange={(value) => updateForm({ title: value })}
+              />
+              <Field
+                label="Form ID"
+                value={form.formId}
+                disabled={locked}
+                info={settingInfoText("form_id")}
+                multiline
+                autoGrow
+                onChange={(value) => updateForm({ formId: value })}
+              />
+              <Field
+                label="Version"
+                value={form.version}
+                disabled={locked}
+                info={settingInfoText("version")}
+                multiline
+                autoGrow
+                onChange={(value) => updateForm({ version: value })}
+              />
+              <Field
+                label="Instance Name"
+                value={form.instanceName}
+                disabled={locked}
+                info={settingInfoText("instance_name")}
+                multiline
+                autoGrow
+                onChange={(value) => updateForm({ instanceName: value })}
+              />
+              <Field
+                label="Style"
+                value={form.style}
+                disabled={locked}
+                info={settingInfoText("style")}
+                multiline
+                autoGrow
+                onChange={(value) => updateForm({ style: value })}
+              />
+              <Field
+                label="Submission URL"
+                value={form.submissionUrl}
+                disabled={locked}
+                info={settingInfoText("submission_url")}
+                multiline
+                autoGrow
+                onChange={(value) => updateForm({ submissionUrl: value })}
+              />
             </div>
 
             <div className="status-card">
@@ -2790,62 +3970,10 @@ function BuilderPage(props) {
               </div>
             </div>
 
-            <div className={`status-line ${status.kind}`}>
-              {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
-              <span>{status.message || "Ready"}</span>
-            </div>
           </aside>
         ) : null}
 
         <section className="builder">
-          <div className="form-meta">
-            <Field
-              label="Form Title"
-              value={form.title}
-              disabled={locked}
-              info={settingInfoText("form_title")}
-              onChange={(value) => updateForm({ title: value })}
-            />
-            <Field
-              label="Form ID"
-              value={form.formId}
-              disabled={locked}
-              helpText="ODK XLS settings sheet: form_id column. It will be made XLS-safe during export."
-              info={settingInfoText("form_id")}
-              onChange={(value) => updateForm({ formId: value })}
-            />
-            <Field
-              label="Version"
-              value={form.version}
-              disabled={locked}
-              info={settingInfoText("version")}
-              onChange={(value) => updateForm({ version: value })}
-            />
-            <Field
-              label="Instance Name"
-              value={form.instanceName}
-              disabled={locked}
-              info={settingInfoText("instance_name")}
-              onChange={(value) => updateForm({ instanceName: value })}
-            />
-            <Field
-              label="Style"
-              value={form.style}
-              disabled={locked}
-              helpText="ODK XLS settings sheet: style column."
-              info={settingInfoText("style")}
-              onChange={(value) => updateForm({ style: value })}
-            />
-            <Field
-              label="Submission URL"
-              value={form.submissionUrl}
-              disabled={locked}
-              helpText="ODK XLS settings sheet: submission_url column."
-              info={settingInfoText("submission_url")}
-              onChange={(value) => updateForm({ submissionUrl: value })}
-            />
-          </div>
-
           {locked ? (
             <div className="locked-workspace">
               <div className="status-title">
@@ -2857,10 +3985,6 @@ function BuilderPage(props) {
                 <span>{entries.length} entries</span>
                 <span>{fhirBundles.length} FHIR bundles</span>
                 <span>{currentStage}</span>
-              </div>
-              <div className={`status-line ${status.kind}`}>
-                {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
-                <span>{status.message || "Ready"}</span>
               </div>
             </div>
           ) : null}
@@ -2895,20 +4019,31 @@ function BuilderPage(props) {
 	          </div>
         </section>
 
-        <aside className="panel editor">
-          <h2>Properties</h2>
-          {selectedQuestion ? (
-            <>
+        {selectedQuestion ? (
+          <aside className="panel editor editor-drawer" aria-label="Selected question properties">
+            <button className="drawer-collapse" onClick={closeQuestionProperties} aria-label="Collapse properties panel">
+              <ChevronRight size={20} />
+            </button>
+            <div className="drawer-scroll">
+              <div className="drawer-head">
+                <div>
+                  <h2>Properties</h2>
+                  <p>{selectedQuestion.label || selectedQuestion.name}</p>
+                </div>
+                <button className="icon-button" onClick={closeQuestionProperties} aria-label="Close properties">
+                  <X size={18} />
+                </button>
+              </div>
               {selectedResourceRequirements.length ? (
-	                <QuestionResourcesBox
-	                  workspace={workspace}
-	                  requirements={selectedResourceRequirements}
-	                  status={status}
-	                  locked={locked}
-	                  uploadWorkspaceAttachments={uploadWorkspaceAttachments}
-	                  uploadWorkspaceResource={uploadWorkspaceResource}
-	                  deleteWorkspaceAttachment={deleteWorkspaceAttachment}
-	                />
+	              <QuestionResourcesBox
+	                workspace={workspace}
+	                requirements={selectedResourceRequirements}
+	                status={status}
+	                locked={locked}
+	                uploadWorkspaceAttachments={uploadWorkspaceAttachments}
+	                uploadWorkspaceResource={uploadWorkspaceResource}
+	                deleteWorkspaceAttachment={deleteWorkspaceAttachment}
+	              />
               ) : null}
               <QuestionEditor
                 form={form}
@@ -2917,11 +4052,9 @@ function BuilderPage(props) {
                 uploadQuestionMedia={uploadQuestionMedia}
                 readOnly={locked}
               />
-            </>
-          ) : (
-            <p>{locked ? "Select a question to view its XLSForm properties." : "Select a question to edit its XLSForm properties."}</p>
-          )}
-        </aside>
+            </div>
+          </aside>
+        ) : null}
       </main>
       )}
       <BuilderFooter
@@ -2940,6 +4073,7 @@ function BuilderPage(props) {
 	        fillForm={fillForm}
 	        refreshEntries={refreshEntries}
 	        passToMapper={passToMapper}
+	        goToPublish={() => setActiveStage("publish")}
 	        reviewIssue={reviewIssue}
 	        isCopiedVersionDraft={isCopiedVersionDraft}
 	        copiedVersionHasChanges={copiedVersionHasChanges}
@@ -2965,6 +4099,7 @@ function BuilderFooter({
 	  fillForm,
 	  refreshEntries,
 	  passToMapper,
+	  goToPublish,
 	  reviewIssue,
 	  isCopiedVersionDraft,
 	  copiedVersionHasChanges,
@@ -3001,10 +4136,10 @@ function BuilderFooter({
 	          <>
 	            <button
 	              className="primary"
-	              disabled={busy || !buildFinished || issues.length > 0 || Boolean(reviewIssue) || (isCopiedVersionDraft && !copiedVersionHasChanges)}
-	              onClick={() => exportXlsForm()}
+	              disabled={published ? busy : busy || !buildFinished || issues.length > 0 || Boolean(reviewIssue) || (isCopiedVersionDraft && !copiedVersionHasChanges)}
+	              onClick={() => (published ? goToPublish?.() : exportXlsForm())}
 	            >
-	              <Forward size={16} /> Move to Publish
+	              <Forward size={16} /> {published ? "Publish -->" : "Move to Publish"}
 	            </button>
 	          </>
         ) : null}
@@ -3160,13 +4295,51 @@ function QuestionResourcesBox({ workspace, requirements, status, locked = false,
   );
 }
 
-function EntriesPanel({ entries, workspaceId, viewEntry, refreshEntries, status }) {
+function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, status }) {
+  const entryIds = useMemo(() => entries.map((entry) => String(entry.id || "")).filter(Boolean), [entries]);
+  const entryIdKey = entryIds.join("|");
+  const [selectedEntryIds, setSelectedEntryIds] = useState([]);
+  const selectedEntrySet = useMemo(() => new Set(selectedEntryIds), [selectedEntryIds]);
+  const selectedEntries = entries.filter((entry) => selectedEntrySet.has(String(entry.id || "")));
+  const allSelected = entryIds.length > 0 && selectedEntryIds.length === entryIds.length;
+  const csvHeaders = useMemo(() => entryCsvQuestions(form).map((question) => question.name), [form]);
+
+  useEffect(() => {
+    setSelectedEntryIds(entryIds);
+  }, [entryIdKey]);
+
+  function toggleEntry(entryId, checked) {
+    setSelectedEntryIds((current) => checked
+      ? [...new Set([...current, entryId])]
+      : current.filter((id) => id !== entryId));
+  }
+
+  function downloadSelectedEntries() {
+    if (!selectedEntries.length || !csvHeaders.length) return;
+    const csv = entriesToCsv(form, selectedEntries);
+    const fileName = safeDownloadName(`${form?.formId || form?.title || "icph_form"}_entries.csv`, "icph_entries.csv");
+    downloadBlob(new Blob([`\ufeff${csv}`], { type: "text/csv;charset=utf-8" }), fileName);
+  }
+
   return (
     <div className="panel entries-panel">
       <div className="section-head">
         <h2>Entries</h2>
         <div className="section-actions">
           <span>{entries.length} submissions</span>
+          {entries.length ? (
+            <>
+              <button className="secondary small" onClick={() => setSelectedEntryIds(entryIds)}>
+                Select all
+              </button>
+              <button className="secondary small" onClick={() => setSelectedEntryIds([])}>
+                Deselect all
+              </button>
+              <button className="primary small" disabled={!selectedEntries.length || !csvHeaders.length} onClick={downloadSelectedEntries}>
+                <Download size={14} /> Download CSV
+              </button>
+            </>
+          ) : null}
           <button className="secondary small" disabled={!workspaceId || status?.kind === "busy"} onClick={refreshEntries}>
             <RefreshCw size={14} /> Refresh
           </button>
@@ -3176,8 +4349,26 @@ function EntriesPanel({ entries, workspaceId, viewEntry, refreshEntries, status 
         <p className="muted">No local submissions yet.</p>
       ) : (
         <div className="entries-table">
-          {entries.slice(-5).reverse().map((entry) => (
+          <label className="bulk-check-row">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={(event) => setSelectedEntryIds(event.target.checked ? entryIds : [])}
+            />
+            <span>{selectedEntries.length}/{entries.length} selected</span>
+          </label>
+          {entries.slice().reverse().map((entry) => {
+            const entryId = String(entry.id || "");
+            return (
             <div className="entry-row" key={entry.id}>
+              <label className="row-check">
+                <input
+                  type="checkbox"
+                  checked={selectedEntrySet.has(entryId)}
+                  onChange={(event) => toggleEntry(entryId, event.target.checked)}
+                />
+                <span className="sr-only">Select entry {entry.instanceName || entry.displayName || entry.id}</span>
+              </label>
               <div>
                 <span>{entry.instanceName || entry.displayName || entry.id}</span>
                 <small>
@@ -3189,20 +4380,21 @@ function EntriesPanel({ entries, workspaceId, viewEntry, refreshEntries, status 
                 <ExternalLink size={14} /> View
               </button>
             </div>
-          ))}
+          );})}
         </div>
       )}
     </div>
   );
 }
 
-function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyExtraction, replaceTerminologyMapping, reviewIssue }) {
+function TerminologyPanel({ form, workspace, terminology = {}, status, runTerminologyExtraction, replaceTerminologyMapping, addTerminologyEntity, reviewIssue, locked = false }) {
   const questions = Array.isArray(terminology.questions) ? terminology.questions : [];
   const questionsWithEntities = questions.filter((question) => Array.isArray(question.entities) && question.entities.length > 0);
-  const hiddenQuestionCount = Math.max(0, questions.length - questionsWithEntities.length);
+  const questionsWithoutEntities = questions.filter((question) => !Array.isArray(question.entities) || question.entities.length === 0);
   const entityCount = terminology.entityCount ?? questions.reduce((sum, question) => sum + (question.entities?.length || 0), 0);
   const running = terminology.status === "running";
   const complete = terminology.status === "complete";
+  const reviewLocked = locked || hasPublishedForm(workspace);
   const progress = terminology.questionCount
     ? `${terminology.processedQuestionCount || 0}/${terminology.questionCount} questions`
     : `${questions.length} questions`;
@@ -3212,14 +4404,27 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
   const [snomedResults, setSnomedResults] = useState([]);
   const [snomedStatus, setSnomedStatus] = useState({ kind: "idle", message: "" });
   const [selectedTerminologyQuestionIds, setSelectedTerminologyQuestionIds] = useState([]);
+  const [manualEntityQuestionId, setManualEntityQuestionId] = useState("");
+  const [manualEntityText, setManualEntityText] = useState("");
+  const [manualEntityStatus, setManualEntityStatus] = useState({ kind: "idle", message: "" });
   const selectableQuestionIds = useMemo(
-    () => questionsWithEntities.map((question) => String(question.id || question.name)).filter(Boolean),
-    [questionsWithEntities]
+    () => questions.map((question) => String(question.id || question.name)).filter(Boolean),
+    [questions]
+  );
+  const manualEntityQuestion = useMemo(
+    () => questions.find((question) => String(question.id || question.name) === manualEntityQuestionId || String(question.name || "") === manualEntityQuestionId) || null,
+    [questions, manualEntityQuestionId]
+  );
+  const manualEntityUnmatchedWords = useMemo(
+    () => manualEntityQuestion ? unmatchedManualEntityWords(manualEntityText, manualEntityQuestion, form) : [],
+    [manualEntityText, manualEntityQuestion, form]
   );
   const activeQuestion = activeSelection
-    ? questionsWithEntities.find((question) => String(question.id || question.name) === activeSelection.questionId)
+    ? questions.find((question) => String(question.id || question.name) === activeSelection.questionId)
     : null;
   const activeEntity = activeQuestion?.entities?.[activeSelection?.entityIndex] || null;
+  const activeEntitySourceLabel = activeEntity ? entitySourceLabel(activeEntity) : "";
+  const activeEntitySourceText = activeEntity ? entitySourceText(activeEntity) : "";
 
   useEffect(() => {
     setSelectedTerminologyQuestionIds((current) => {
@@ -3283,6 +4488,7 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
   }
 
   async function approveVocabularyResult(result) {
+    if (reviewLocked) return;
     if (!activeSelection || !activeEntity) return;
     setSnomedStatus({ kind: "busy", message: "Saving approved vocabulary match..." });
     try {
@@ -3298,6 +4504,7 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
   }
 
   async function removeVocabularyApproval(mapping) {
+    if (reviewLocked) return;
     if (!activeSelection || !activeEntity) return;
     setSnomedStatus({ kind: "busy", message: "Removing approved match..." });
     try {
@@ -3313,6 +4520,7 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
   }
 
   async function approveUnmapped() {
+    if (reviewLocked) return;
     if (!activeSelection || !activeEntity) return;
     setSnomedStatus({ kind: "busy", message: "Confirming unmapped review..." });
     try {
@@ -3327,11 +4535,57 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
     }
   }
 
+  function openManualEntityDialog(question) {
+    if (reviewLocked) return;
+    setManualEntityQuestionId(String(question.id || question.name));
+    setManualEntityText("");
+    setManualEntityStatus({ kind: "idle", message: "" });
+  }
+
+  function closeManualEntityDialog() {
+    setManualEntityQuestionId("");
+    setManualEntityText("");
+    setManualEntityStatus({ kind: "idle", message: "" });
+  }
+
+  async function confirmManualEntity() {
+    if (reviewLocked) return;
+    if (!manualEntityQuestion) return;
+    const entityText = manualEntityText.replace(/\s+/g, " ").trim();
+    if (!entityText) {
+      setManualEntityStatus({ kind: "error", message: "Enter the entity text to add." });
+      return;
+    }
+    setManualEntityStatus({ kind: "busy", message: "Adding entity..." });
+    try {
+      const result = await addTerminologyEntity({
+        questionId: String(manualEntityQuestion.id || manualEntityQuestion.name),
+        entityText
+      });
+      const savedQuestion = result?.question || manualEntityQuestion;
+      const entityIndex = Number.isFinite(result?.entityIndex) ? result.entityIndex : Math.max(0, (savedQuestion.entities || []).length - 1);
+      const savedEntity = savedQuestion.entities?.[entityIndex];
+      closeManualEntityDialog();
+      if (savedEntity) {
+        openEntityReview(savedQuestion, savedEntity, entityIndex, "snomed");
+        setSnomedQuery(entityText);
+      }
+    } catch (error) {
+      setManualEntityStatus({ kind: "error", message: error.message || "Could not add this entity." });
+    }
+  }
+
 	  const reviewStats = terminologyReviewStats(terminology);
 	  const activeVocabularyOption = vocabularyOption(activeVocabulary);
 	  const activeApprovedMappings = approvedMappingsForEntity(activeEntity);
+	  const activeCandidateMappings = candidateMappingsForEntity(activeEntity);
 	  const allSelected = selectableQuestionIds.length > 0 && selectedTerminologyQuestionIds.length === selectableQuestionIds.length;
 	  const selectedCount = selectedTerminologyQuestionIds.length;
+	  const rerunLabel = running
+	    ? "Running"
+	    : complete
+	      ? selectedCount === selectableQuestionIds.length ? "Run Again for All" : selectedCount ? "Run Again for Selected" : "Select Questions to Rerun"
+	      : "Run Terminology";
 
   return (
     <section className="publish-stack terminology-stack">
@@ -3339,23 +4593,24 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
         <StageBadge stage={workspace?.pipelineStage || (hasPublishedForm(workspace) ? "Publishing" : "Building")} />
         <h2>Terminology</h2>
         <p>
-          Question text is processed for form-definition entities before publishing.
-          Review every mapped or unmapped vocabulary item to unlock publishing.
+          {reviewLocked
+            ? "Terminology review is locked because this form has moved to Publish."
+            : "Question text is processed for form-definition entities before publishing. Review every mapped or unmapped vocabulary item to unlock publishing."}
         </p>
         <div className="mini-metrics">
           <span>{terminology.status || "not_started"}</span>
           <span>{progress}</span>
           <span>{entityCount} entities</span>
           <span>{reviewStats.reviewed}/{reviewStats.total} reviewed</span>
-          {hiddenQuestionCount ? <span>{hiddenQuestionCount} without entities hidden</span> : null}
+          {questionsWithoutEntities.length ? <span>{questionsWithoutEntities.length} with no extracted entities</span> : null}
         </div>
 	        <div className="stage-actions">
 	          <button
 	            className="secondary"
-	            disabled={status.kind === "busy" || running || (complete && selectedCount === 0)}
+	            disabled={reviewLocked || status.kind === "busy" || running || (complete && !selectedCount)}
 	            onClick={() => runTerminologyExtraction(selectedTerminologyQuestionIds)}
 	          >
-	            <Forward size={18} /> {running ? "Running" : complete ? "Run Again for Selected" : "Run Terminology"}
+	            <Forward size={18} /> {rerunLabel}
 	          </button>
 	        </div>
 	        {terminology.error ? <p className="terminology-error">{terminology.error}</p> : null}
@@ -3367,12 +4622,17 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	          <div>
 	            <h2>Question Entities</h2>
 	            <p>{selectedCount}/{selectableQuestionIds.length} selected for rerun</p>
+              <div className="entity-source-legend" aria-label="Entity source legend">
+                {ENTITY_SOURCE_LEGEND.filter((item) => item.key !== "unknown").map((item) => (
+                  <span key={item.key}><b aria-hidden="true">{item.emoji}</b> {item.label}</span>
+                ))}
+              </div>
 	          </div>
 	          <div className="section-actions">
-	            <button className="secondary small" type="button" disabled={allSelected || !selectableQuestionIds.length} onClick={() => setSelectedTerminologyQuestionIds(selectableQuestionIds)}>
+	            <button className="secondary small" type="button" disabled={reviewLocked || allSelected || !selectableQuestionIds.length} onClick={() => setSelectedTerminologyQuestionIds(selectableQuestionIds)}>
 	              Select All
 	            </button>
-	            <button className="secondary small" type="button" disabled={!selectedCount} onClick={() => setSelectedTerminologyQuestionIds([])}>
+	            <button className="secondary small" type="button" disabled={reviewLocked || !selectedCount} onClick={() => setSelectedTerminologyQuestionIds([])}>
 	              Deselect All
 	            </button>
 	            <span>{entityCount} entities</span>
@@ -3383,11 +4643,6 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
             <FileText size={32} />
             <p>{running ? "Terminology extraction is starting..." : "No terminology extraction output yet."}</p>
           </div>
-        ) : questionsWithEntities.length === 0 ? (
-          <div className="empty-state">
-            <FileText size={32} />
-            <p>{running ? "No entities found yet." : "No entities were extracted from this form."}</p>
-          </div>
         ) : (
           <div className="terminology-workbench">
             <div className="terminology-list">
@@ -3397,6 +4652,7 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	                    <label className="terminology-question-check">
 	                      <input
 	                        type="checkbox"
+                          disabled={reviewLocked}
 	                        checked={selectedTerminologyQuestionIds.includes(String(question.id || question.name))}
 	                        onChange={(event) => {
 	                          const id = String(question.id || question.name);
@@ -3416,6 +4672,14 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
                       <span>{question.entities?.length || 0} entities</span>
                     </div>
                   </div>
+                  <button
+                    className="link-button terminology-add-entity"
+                    type="button"
+                    disabled={reviewLocked}
+                    onClick={() => openManualEntityDialog(question)}
+                  >
+                    add another entity
+                  </button>
 	                  {question.entities?.length ? (
 	                    <div className="entity-list">
 		                      {question.entities.map((entity, index) => {
@@ -3424,12 +4688,17 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 		                        const selectedVocabulary = active ? activeVocabulary : vocabularyKey(entity.terminology);
 		                        const currentVocabulary = entity.code ? vocabularyOption(entity.terminology) : null;
 		                        const approvedMappings = approvedMappingsForEntity(entity);
+		                        const candidateMappings = candidateMappingsForEntity(entity);
 		                        const reviewed = entityReviewComplete(entity);
+                            const sourceLegend = entitySourceLegendItem(entity);
 		                        return (
 		                          <div
 		                            className={`entity-card ${active ? "active" : ""} ${reviewed ? "validated" : ""}`}
 		                            key={`${question.id || question.name}_${index}`}
 		                          >
+                                <span className="entity-source-emoji" title={sourceLegend.label} aria-label={sourceLegend.label}>
+                                  {sourceLegend.emoji}
+                                </span>
 		                            <button
 		                              type="button"
 	                              className="entity-card-main"
@@ -3447,11 +4716,20 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 		                                {approvedMappings.length > 3 ? <span>+{approvedMappings.length - 3} more</span> : null}
 		                              </div>
 		                            ) : null}
+		                            {candidateMappings.length ? (
+		                              <div className="entity-candidate-badges" aria-label="Brute search vocabulary candidates">
+		                                <span>{candidateMappings.length} brute candidate{candidateMappings.length === 1 ? "" : "s"}</span>
+		                                {[...new Set(candidateMappings.map((mapping) => mapping.vocabularyLabel).filter(Boolean))].slice(0, 4).map((label) => (
+		                                  <span key={label}>{label}</span>
+		                                ))}
+		                              </div>
+		                            ) : null}
 		                            <div className="entity-vocabulary-row">
 		                              <label>
 		                                <span>Review vocabulary</span>
 	                                <select
 	                                  value={selectedVocabulary}
+                                    disabled={reviewLocked}
 	                                  onChange={(event) => openEntityReview(question, entity, index, event.target.value)}
 	                                >
 	                                  {VOCABULARY_OPTIONS.map((option) => {
@@ -3470,7 +4748,11 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	                        );
 	                      })}
 	                    </div>
-	                  ) : null}
+	                  ) : (
+                    <div className="empty-entity-list">
+                      <p>No entities listed for this question.</p>
+                    </div>
+                  )}
                   {question.warnings?.length ? (
                     <details className="terminology-warnings">
                       <summary>{question.warnings.length} warning{question.warnings.length === 1 ? "" : "s"}</summary>
@@ -3479,6 +4761,61 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
                   ) : null}
                 </article>
               ))}
+              {questionsWithoutEntities.length ? (
+                <details className="terminology-zero-section">
+                  <summary>
+                    <span>Questions with no extracted entities</span>
+                    <em>{questionsWithoutEntities.length} question{questionsWithoutEntities.length === 1 ? "" : "s"}</em>
+                  </summary>
+                  <div className="terminology-zero-list">
+                    {questionsWithoutEntities.map((question) => {
+                      const questionId = String(question.id || question.name);
+                      return (
+                        <article className={`terminology-row zero-entity ${question.status || ""}`} key={question.id || question.name}>
+                          <div className="terminology-question">
+                            <label className="terminology-question-check">
+                              <input
+                                type="checkbox"
+                                disabled={reviewLocked}
+                                checked={selectedTerminologyQuestionIds.includes(questionId)}
+                                onChange={(event) => {
+                                  setSelectedTerminologyQuestionIds((current) => event.target.checked
+                                    ? [...new Set([...current, questionId])]
+                                    : current.filter((item) => item !== questionId));
+                                }}
+                              />
+                              <span>
+                                <h3>{question.label || question.name}</h3>
+                                <p className="mono">{question.name || question.id}</p>
+                              </span>
+                            </label>
+                            <div className="card-metrics">
+                              <span>{question.type}</span>
+                              <span>{question.status || "complete"}</span>
+                              <span>0 entities</span>
+                            </div>
+                          </div>
+                          <p className="zero-entity-note">No terminology entities were found automatically for this question.</p>
+                          <button
+                            className="link-button terminology-add-entity"
+                            type="button"
+                            disabled={reviewLocked}
+                            onClick={() => openManualEntityDialog(question)}
+                          >
+                            add another entity
+                          </button>
+                          {question.warnings?.length ? (
+                            <details className="terminology-warnings">
+                              <summary>{question.warnings.length} warning{question.warnings.length === 1 ? "" : "s"}</summary>
+                              <pre>{JSON.stringify(question.warnings, null, 2)}</pre>
+                            </details>
+                          ) : null}
+                        </article>
+                      );
+                    })}
+                  </div>
+                </details>
+              ) : null}
             </div>
             <aside className="terminology-review-panel">
               {activeEntity ? (
@@ -3493,21 +4830,14 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
                       <X size={18} />
                     </button>
                   </div>
+                  <div className="entity-source-box">
+                    <span>Decomposed from</span>
+                    <strong>{activeEntitySourceLabel || "Source not recorded"}</strong>
+                    <p>{activeEntitySourceText || "Rerun terminology extraction to populate source provenance for older results."}</p>
+                  </div>
 	                  <div className="current-snomed">
 	                    <div className="current-selection-head">
 	                      <span>Mapper suggestion</span>
-	                      {!activeEntity.code ? (
-	                        <button
-	                          className="icon-button"
-	                          type="button"
-	                          disabled={snomedStatus.kind === "busy" || entityReviewComplete(activeEntity) || activeApprovedMappings.length > 0}
-	                          onClick={approveUnmapped}
-	                          aria-label="Confirm unmapped"
-	                          title={entityReviewComplete(activeEntity) ? "Review already completed" : "Confirm unmapped"}
-	                        >
-	                          <Check size={18} />
-	                        </button>
-	                      ) : null}
 	                    </div>
 	                    {activeEntity.code ? (
 	                      <>
@@ -3517,6 +4847,22 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	                    ) : (
 	                      <p>{activeEntity.validationStatus === "unmapped_confirmed" ? "Unmapped confirmed" : "No mapper suggestion"}</p>
 	                    )}
+                      <div className={`unmapped-review-action ${activeEntity.validationStatus === "unmapped_confirmed" ? "confirmed" : ""}`}>
+                        <button
+                          className="secondary small"
+                          type="button"
+                          disabled={reviewLocked || snomedStatus.kind === "busy" || activeEntity.validationStatus === "unmapped_confirmed"}
+                          onClick={approveUnmapped}
+                        >
+                          {activeEntity.validationStatus === "unmapped_confirmed" ? <Check size={14} /> : <X size={14} />}
+                          {activeEntity.validationStatus === "unmapped_confirmed" ? "Marked unmapped" : "Leave unmapped"}
+                        </button>
+                        {activeEntity.validationStatus === "unmapped_confirmed" ? (
+                          <p>This entity will not add vocabulary coding to FHIR.</p>
+                        ) : (
+                          <p>Use this when the mapper suggestion is wrong or no vocabulary code applies.</p>
+                        )}
+                      </div>
 	                  </div>
 	                  <div className="approved-mappings-box">
 	                    <div className="current-selection-head">
@@ -3534,7 +4880,7 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	                            <button
 	                              className="icon-button"
 	                              type="button"
-	                              disabled={snomedStatus.kind === "busy"}
+                                disabled={reviewLocked || snomedStatus.kind === "busy"}
 	                              onClick={() => removeVocabularyApproval(mapping)}
 	                              aria-label={`Remove ${mapping.vocabularyLabel} ${mapping.code}`}
 	                              title="Remove approved match"
@@ -3550,18 +4896,52 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	                      <p>Approve one or more matches below, or confirm unmapped when no code applies.</p>
 	                    )}
 	                  </div>
-                  <label className="snomed-search-box">
-                    <span>Search Vocabulary</span>
-                    <select value={activeVocabulary} onChange={(event) => setActiveVocabulary(event.target.value)}>
-                      {VOCABULARY_OPTIONS.map((option) => (
-                        <option key={option.id} value={option.id}>{option.label}</option>
-                      ))}
-                    </select>
-                    <div>
-                      <Search size={17} />
-                      <input value={snomedQuery} onChange={(event) => setSnomedQuery(event.target.value)} />
+                  {activeCandidateMappings.length ? (
+                    <div className="brute-candidates-box">
+                      <div className="current-selection-head">
+                        <span>Brute search candidates</span>
+                        <strong>{activeCandidateMappings.length}</strong>
+                      </div>
+                      <div className="brute-candidate-list">
+                        {activeCandidateMappings.slice(0, 10).map((mapping) => (
+                          <div className="brute-candidate" key={approvedMappingKey(mapping)}>
+                            <div>
+                              <strong>{mapping.display || mapping.term}</strong>
+                              <p>{mapping.vocabularyLabel}: {mapping.code}</p>
+                              {mapping.confidence || mapping.matchKind || mapping.score ? (
+                                <span>{[mapping.confidence, mapping.matchKind, mapping.score ? `score ${mapping.score}` : ""].filter(Boolean).join(" · ")}</span>
+                              ) : null}
+                            </div>
+                            <button
+                              className="icon-button"
+                              type="button"
+                              disabled={reviewLocked || snomedStatus.kind === "busy"}
+                              onClick={() => approveVocabularyResult(mapping)}
+                              aria-label={`Approve ${mapping.vocabularyLabel} ${mapping.code}`}
+                              title="Approve this brute-search candidate"
+                            >
+                              <span className="result-empty-box" aria-hidden="true" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  </label>
+                  ) : null}
+                  <div className="search-vocabulary-section">
+                    <h2>Search Vocabulary</h2>
+                    <label className="snomed-search-box">
+                      <span>Vocabulary</span>
+                      <select value={activeVocabulary} disabled={reviewLocked} onChange={(event) => setActiveVocabulary(event.target.value)}>
+                        {VOCABULARY_OPTIONS.map((option) => (
+                          <option key={option.id} value={option.id}>{option.label}</option>
+                        ))}
+                      </select>
+                      <div>
+                        <Search size={17} />
+                        <input value={snomedQuery} disabled={reviewLocked} onChange={(event) => setSnomedQuery(event.target.value)} />
+                      </div>
+                    </label>
+                  </div>
                   {snomedStatus.message ? (
                     <p className={`snomed-status ${snomedStatus.kind}`}>{snomedStatus.message}</p>
                   ) : null}
@@ -3574,9 +4954,8 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	                        vocabularyLabel: resultVocabulary
 	                      });
 	                      const approved = resultMapping && activeApprovedMappings.some((mapping) => approvedMappingKey(mapping) === approvedMappingKey(resultMapping));
-	                      const selected = approved || (activeEntity.code && result.code === activeEntity.code && vocabularyKey(activeEntity.terminology) === activeVocabulary);
 	                      return (
-	                        <div className={`snomed-result ${selected ? "selected" : ""}`} key={`${activeVocabulary}_${result.code}`}>
+	                        <div className={`snomed-result ${approved ? "selected" : ""}`} key={`${activeVocabulary}_${result.code}`}>
 	                          <div>
 	                            <strong>{result.display}</strong>
 	                            <p>{result.fsn}</p>
@@ -3585,12 +4964,12 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
 	                          <button
 	                            className="icon-button"
 	                            type="button"
-	                            disabled={snomedStatus.kind === "busy"}
+                              disabled={reviewLocked || snomedStatus.kind === "busy"}
 	                            onClick={() => approveVocabularyResult({ ...result, vocabulary: activeVocabulary, vocabularyLabel: resultVocabulary })}
 	                            aria-label={`Use ${result.display}`}
 	                            title={approved ? "Already approved" : "Approve this vocabulary match"}
 	                          >
-	                            <Check size={18} />
+	                            {approved ? <Check size={18} /> : <span className="result-empty-box" aria-hidden="true" />}
 	                          </button>
                         </div>
                       );
@@ -3612,7 +4991,89 @@ function TerminologyPanel({ workspace, terminology = {}, status, runTerminologyE
           </div>
         )}
       </div>
+      {manualEntityQuestion ? (
+        <ManualEntityModal
+          question={manualEntityQuestion}
+          form={form}
+          value={manualEntityText}
+          unmatchedWords={manualEntityUnmatchedWords}
+          status={manualEntityStatus}
+          onChange={setManualEntityText}
+          onCancel={closeManualEntityDialog}
+          onConfirm={confirmManualEntity}
+        />
+      ) : null}
     </section>
+  );
+}
+
+function ManualEntityModal({ question, form, value, unmatchedWords = [], status, onChange, onCancel, onConfirm }) {
+  const busy = status?.kind === "busy";
+  const details = manualEntityQuestionDetails(question, form);
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="link-modal manual-entity-modal" role="dialog" aria-modal="true" aria-label="Add terminology entity">
+        <div className="modal-head">
+          <div>
+            <h2>Add another entity</h2>
+            <p>{question.label || question.name || "Question"}</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onCancel} aria-label="Close add entity dialog">
+            <X size={18} />
+          </button>
+        </div>
+
+        <label className="manual-entity-input">
+          <span>Entity words to map</span>
+          <input
+            value={value}
+            disabled={busy}
+            autoFocus
+            onChange={(event) => onChange(event.target.value)}
+            placeholder="Example: pregnancy"
+          />
+        </label>
+
+        {unmatchedWords.length ? (
+          <div className="manual-entity-warning">
+            <AlertCircle size={18} />
+            <p>
+              <strong>{unmatchedWords.join(", ")}</strong> {unmatchedWords.length === 1 ? "was" : "were"} not found in the question or question options. Are you sure you want to proceed extracting this entity?
+            </p>
+          </div>
+        ) : value.trim() ? (
+          <div className="manual-entity-ok">
+            <Check size={18} />
+            <p>All words were found in the question text or options.</p>
+          </div>
+        ) : null}
+
+        {status?.message ? <p className={`snomed-status ${status.kind}`}>{status.message}</p> : null}
+
+        <div className="manual-entity-source">
+          <span>Question details</span>
+          {details.length ? (
+            <dl>
+              {details.map((item) => (
+                <div key={item.label}>
+                  <dt>{item.label}</dt>
+                  <dd>{item.value}</dd>
+                </div>
+              ))}
+            </dl>
+          ) : (
+            <p>No question details available.</p>
+          )}
+        </div>
+
+        <div className="modal-actions">
+          <button className="secondary" type="button" disabled={busy} onClick={onCancel}>Cancel</button>
+          <button className="primary" type="button" disabled={busy || !value.trim()} onClick={onConfirm}>
+            <Plus size={16} /> Confirm
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3658,6 +5119,9 @@ function QuestionList({ form, resourceRequirements = [], locked, selectedId, set
                 <span>{question.name}</span>
                 {question.required ? <span>required</span> : null}
                 {!question.required && question.requiredExpression ? <span>conditional required</span> : null}
+                {question.readOnly || question.type === "calculate" ? <span className="state-chip readonly">read only</span> : null}
+                {!question.readOnly && question.type !== "calculate" && question.readOnlyExpression ? <span className="state-chip readonly">conditional read only</span> : null}
+                {question.calculation ? <span className="state-chip calculation">calculation</span> : null}
                 {resources?.missing ? <span className="resource-chip missing">{resources.missing} files needed</span> : resources?.total ? <span className="resource-chip uploaded">files ready</span> : null}
               </div>
             </div>
@@ -3689,18 +5153,99 @@ function ValidationPanel({ issues }) {
   );
 }
 
-function FhirPanel({ fhirBundles }) {
+function fhirBundleKey(item, index) {
+  return String(item?.bundlePath || item?.fileName || item?.patientId || `bundle_${index}`);
+}
+
+function FhirPanel({ fhirBundles, form }) {
+  const selectableBundles = fhirBundles
+    .map((item, index) => ({ item, key: fhirBundleKey(item, index) }))
+    .filter(({ item }) => item?.bundle && !item?.error);
+  const selectableKeys = selectableBundles.map(({ key }) => key);
+  const selectableKeyText = selectableKeys.join("|");
+  const [selectedBundleKeys, setSelectedBundleKeys] = useState([]);
+  const selectedKeySet = useMemo(() => new Set(selectedBundleKeys), [selectedBundleKeys]);
+  const selectedBundles = selectableBundles.filter(({ key }) => selectedKeySet.has(key));
+  const allSelected = selectableKeys.length > 0 && selectedBundleKeys.length === selectableKeys.length;
+
+  useEffect(() => {
+    setSelectedBundleKeys(selectableKeys);
+  }, [selectableKeyText]);
+
+  function toggleBundle(bundleKey, checked) {
+    setSelectedBundleKeys((current) => checked
+      ? [...new Set([...current, bundleKey])]
+      : current.filter((key) => key !== bundleKey));
+  }
+
+  function bundleDownloadName(item, index = 0) {
+    return safeDownloadName(
+      item.fileName || `${item.patientId || `patient_${index + 1}`}_fhir_bundle.json`,
+      `patient_${index + 1}_fhir_bundle.json`
+    );
+  }
+
+  function downloadSelectedBundles() {
+    if (!selectedBundles.length) return;
+    const files = selectedBundles.map(({ item }, index) => ({
+      name: bundleDownloadName(item, index),
+      text: JSON.stringify(item.bundle || {}, null, 2) + "\n"
+    }));
+    if (files.length === 1) {
+      downloadBlob(new Blob([files[0].text], { type: "application/fhir+json;charset=utf-8" }), files[0].name);
+      return;
+    }
+    const zipName = safeDownloadName(`${form?.formId || form?.title || "icph_form"}_fhir_bundles.zip`, "icph_fhir_bundles.zip");
+    downloadBlob(zipBlob(files), zipName);
+  }
+
   if (!fhirBundles.length) return null;
   return (
     <div className="panel fhir-panel">
       <div className="section-head">
         <h2>FHIR Bundles</h2>
-        <span>{fhirBundles.length} patients</span>
+        <div className="section-actions">
+          <span>{fhirBundles.length} patients</span>
+          {selectableKeys.length ? (
+            <>
+              <button className="secondary small" onClick={() => setSelectedBundleKeys(selectableKeys)}>
+                Select all
+              </button>
+              <button className="secondary small" onClick={() => setSelectedBundleKeys([])}>
+                Deselect all
+              </button>
+              <button className="primary small" disabled={!selectedBundles.length} onClick={downloadSelectedBundles}>
+                <Download size={14} /> Download JSON
+              </button>
+            </>
+          ) : null}
+        </div>
       </div>
       <div className="fhir-list">
-        {fhirBundles.map((item) => (
-          <details className="fhir-bundle" key={item.bundlePath || item.fileName}>
+        {selectableKeys.length ? (
+          <label className="bulk-check-row">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              onChange={(event) => setSelectedBundleKeys(event.target.checked ? selectableKeys : [])}
+            />
+            <span>{selectedBundles.length}/{selectableKeys.length} selected</span>
+          </label>
+        ) : null}
+        {fhirBundles.map((item, index) => {
+          const bundleKey = fhirBundleKey(item, index);
+          const selectable = Boolean(item.bundle && !item.error);
+          return (
+          <details className="fhir-bundle" key={bundleKey}>
             <summary>
+              <input
+                type="checkbox"
+                disabled={!selectable}
+                checked={selectable && selectedKeySet.has(bundleKey)}
+                onClick={(event) => event.stopPropagation()}
+                onChange={(event) => toggleBundle(bundleKey, event.target.checked)}
+                aria-label={`Select FHIR bundle for ${item.patientId || item.fileName}`}
+              />
               <FileJson size={18} />
               <span>{item.patientId}</span>
               <em>{item.entryCount} resources</em>
@@ -3712,7 +5257,7 @@ function FhirPanel({ fhirBundles }) {
               <pre>{JSON.stringify(item.bundle || {}, null, 2)}</pre>
             )}
           </details>
-        ))}
+        );})}
       </div>
     </div>
   );
@@ -3845,10 +5390,11 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
   );
 }
 
-function OdkWebFormIsland({ formXml, workspaceId, onSubmitted, onError }) {
+function OdkWebFormIsland({ formXml, workspaceId, formApiBase, onSubmitted, onError }) {
   const mountRef = useRef(null);
   const submittedRef = useRef(onSubmitted);
   const errorRef = useRef(onError);
+  const apiBase = formApiBase || `/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}`;
 
   useEffect(() => {
     submittedRef.current = onSubmitted;
@@ -3870,7 +5416,7 @@ function OdkWebFormIsland({ formXml, workspaceId, onSubmitted, onError }) {
         }
       }
       if (!instanceXml) throw new Error("ODK Web Forms did not provide xml_submission_file.");
-      await postJson(`/api/forms/${encodeURIComponent(workspaceId)}/odk-submissions`, {
+      await postJson(`${apiBase}/odk-submissions`, {
         instanceXml,
         payloadType: payload?.payloadType || "monolithic",
         submissionMeta: payload?.submissionMeta || null
@@ -3883,7 +5429,8 @@ function OdkWebFormIsland({ formXml, workspaceId, onSubmitted, onError }) {
           formXml,
           trackDevice: true,
           fetchFormAttachment: async (resource) => {
-            return fetch(attachmentUrl(workspaceId, resource?.href || resource));
+            const fileName = String(resource?.href || resource || "").split(/[\\/]/).filter(Boolean).pop() || "";
+            return fetch(`${API_BASE}${apiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: adminAuthHeaders() });
           },
           onSubmit: (payload, done) => {
             const completion = submitOdkPayload(payload)
@@ -3904,7 +5451,7 @@ function OdkWebFormIsland({ formXml, workspaceId, onSubmitted, onError }) {
     app.mount(mountPoint);
 
     return () => app.unmount();
-  }, [formXml, workspaceId]);
+  }, [apiBase, formXml, workspaceId]);
 
   return <div className="odk-web-form-host" ref={mountRef} />;
 }
@@ -4546,7 +6093,7 @@ function LogicExpressionCard({
             <h3>{title}</h3>
             {info ? <InfoButton label={title}>{info}</InfoButton> : null}
           </span>
-          <small>ODK XLS format: {column} column.</small>
+          <small>ODK XLS format: "{column}" column.</small>
         </div>
         <Toggle label={toggleLabel} checked={open} disabled={readOnly} onChange={enableCondition} />
       </div>
@@ -4680,28 +6227,257 @@ function calculationSources(form, question) {
 function buildCalculationExpression(config) {
   const refA = config.fieldA ? fieldReference(config.fieldA) : "";
   const refB = config.fieldB ? fieldReference(config.fieldB) : "";
+  const numericValue = Number(config.numberValue || 0);
   if (config.preset === "today") return "today()";
   if (config.preset === "now") return "now()";
+  if (config.preset === "empty") return "''";
   if (config.preset === "copy") return refA;
   if (config.preset === "count_selected") return refA ? `count-selected(${refA})` : "";
   if (config.preset === "sum") return refA && refB ? `${refA} + ${refB}` : "";
   if (config.preset === "difference") return refA && refB ? `${refA} - ${refB}` : "";
+  if (config.preset === "multiply") return refA && refB ? `${refA} * ${refB}` : "";
+  if (config.preset === "divide") return refA && refB ? `if(${refB} != 0, ${refA} div ${refB}, '')` : "";
+  if (config.preset === "add_number") return refA ? `${refA} + ${numericValue}` : "";
+  if (config.preset === "subtract_number") return refA ? `${refA} - ${numericValue}` : "";
   if (config.preset === "concat") return refA && refB ? `concat(${refA}, '${expressionLiteral(config.separator || " ")}', ${refB})` : "";
   if (config.preset === "age_years") return refA ? `int((decimal-date-time(today()) - decimal-date-time(${refA})) div 365.25)` : "";
+  if (config.preset === "days_between") return refA && refB ? `int(decimal-date-time(${refB}) - decimal-date-time(${refA}))` : "";
   return "";
 }
 
 function initialCalculationState(value, sources) {
   const text = String(value || "").trim();
   const firstSource = sources[0]?.name || "";
-  if (!text) return { mode: "preset", preset: "today", fieldA: firstSource, fieldB: sources[1]?.name || firstSource, separator: " " };
-  if (text === "today()") return { mode: "preset", preset: "today", fieldA: firstSource, fieldB: sources[1]?.name || firstSource, separator: " " };
-  if (text === "now()") return { mode: "preset", preset: "now", fieldA: firstSource, fieldB: sources[1]?.name || firstSource, separator: " " };
+  const secondSource = sources[1]?.name || firstSource;
+  const base = { mode: "preset", preset: "today", fieldA: firstSource, fieldB: secondSource, separator: " ", numberValue: "0" };
+  if (!text) return base;
+  if (text === "today()") return { ...base, preset: "today" };
+  if (text === "now()") return { ...base, preset: "now" };
+  if (text === "''") return { ...base, preset: "empty" };
   const copyMatch = text.match(/^\$\{([^}]+)\}$/);
-  if (copyMatch) return { mode: "preset", preset: "copy", fieldA: copyMatch[1], fieldB: sources[1]?.name || firstSource, separator: " " };
+  if (copyMatch) return { ...base, preset: "copy", fieldA: copyMatch[1] };
   const countMatch = text.match(/^count-selected\(\$\{([^}]+)\}\)$/);
-  if (countMatch) return { mode: "preset", preset: "count_selected", fieldA: countMatch[1], fieldB: sources[1]?.name || firstSource, separator: " " };
-  return { mode: "raw", preset: "today", fieldA: firstSource, fieldB: sources[1]?.name || firstSource, separator: " " };
+  if (countMatch) return { ...base, preset: "count_selected", fieldA: countMatch[1] };
+  let match = text.match(/^\$\{([^}]+)\}\s*\+\s*\$\{([^}]+)\}$/);
+  if (match) return { ...base, preset: "sum", fieldA: match[1], fieldB: match[2] };
+  match = text.match(/^\$\{([^}]+)\}\s*-\s*\$\{([^}]+)\}$/);
+  if (match) return { ...base, preset: "difference", fieldA: match[1], fieldB: match[2] };
+  match = text.match(/^\$\{([^}]+)\}\s*\*\s*\$\{([^}]+)\}$/);
+  if (match) return { ...base, preset: "multiply", fieldA: match[1], fieldB: match[2] };
+  match = text.match(/^\$\{([^}]+)\}\s*(?:div|\/)\s*\$\{([^}]+)\}$/);
+  if (match) return { ...base, preset: "divide", fieldA: match[1], fieldB: match[2] };
+  match = text.match(/^int\(\(decimal-date-time\(today\(\)\)\s*-\s*decimal-date-time\(\$\{([^}]+)\}\)\)\s*div\s*365\.25\)$/);
+  if (match) return { ...base, preset: "age_years", fieldA: match[1] };
+  match = text.match(/^int\(decimal-date-time\(\$\{([^}]+)\}\)\s*-\s*decimal-date-time\(\$\{([^}]+)\}\)\)$/);
+  if (match) return { ...base, preset: "days_between", fieldA: match[2], fieldB: match[1] };
+  match = text.match(/^\$\{([^}]+)\}\s*\+\s*(-?\d+(?:\.\d+)?)$/);
+  if (match) return { ...base, preset: "add_number", fieldA: match[1], numberValue: match[2] };
+  match = text.match(/^\$\{([^}]+)\}\s*-\s*(-?\d+(?:\.\d+)?)$/);
+  if (match) return { ...base, preset: "subtract_number", fieldA: match[1], numberValue: match[2] };
+  return { ...base, mode: "raw" };
+}
+
+function calculationPresetOptions(question) {
+  const type = question?.type || "text";
+  const options = [
+    { value: "copy", label: "Copy another answer" },
+    { value: "today", label: "Today" },
+    { value: "now", label: "Current date-time" },
+    { value: "empty", label: "Clear value" }
+  ];
+  if (["integer", "decimal", "range", "calculate"].includes(type)) {
+    options.push(
+      { value: "sum", label: "Add two answers" },
+      { value: "difference", label: "Subtract two answers" },
+      { value: "multiply", label: "Multiply two answers" },
+      { value: "divide", label: "Divide two answers" },
+      { value: "add_number", label: "Add a fixed number" },
+      { value: "subtract_number", label: "Subtract a fixed number" },
+      { value: "age_years", label: "Age in years from date" },
+      { value: "days_between", label: "Days between two dates" },
+      { value: "count_selected", label: "Count selected choices" }
+    );
+  }
+  if (["text", "hidden", "calculate"].includes(type)) {
+    options.push({ value: "concat", label: "Join two answers" });
+  }
+  return options;
+}
+
+function calculationNeedsFieldA(preset) {
+  return !["today", "now", "empty"].includes(preset);
+}
+
+function calculationNeedsFieldB(preset) {
+  return ["sum", "difference", "multiply", "divide", "concat", "days_between"].includes(preset);
+}
+
+function calculationNeedsNumber(preset) {
+  return ["add_number", "subtract_number"].includes(preset);
+}
+
+function isExpressionLike(value) {
+  return /\$\{|today\(\)|now\(\)|count-selected\(|decimal-date-time\(|concat\(|if\(/.test(String(value || ""));
+}
+
+function initialDefaultState(value, question, sources) {
+  const text = String(value || "").trim();
+  if (!text) return {
+    mode: "static",
+    staticValue: "",
+    dynamic: initialCalculationState("", sources),
+    rawValue: ""
+  };
+  return {
+    mode: isExpressionLike(text) ? "builder" : "static",
+    staticValue: isExpressionLike(text) ? "" : text,
+    dynamic: initialCalculationState(text, sources),
+    rawValue: text
+  };
+}
+
+function defaultInputType(question) {
+  if (question?.type === "integer" || question?.type === "decimal" || question?.type === "range") return "number";
+  if (question?.type === "date") return "date";
+  if (question?.type === "time") return "time";
+  if (question?.type === "dateTime") return "datetime-local";
+  return "text";
+}
+
+function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = false }) {
+  const sources = useMemo(() => calculationSources(form, question), [form, question]);
+  const sourceKey = sources.map((source) => source.name).join("|");
+  const stateKey = `${question.id}:default`;
+  const [state, setState] = useState(() => initialDefaultState(value, question, sources));
+  useEffect(() => {
+    setState(initialDefaultState(value, question, sources));
+  }, [stateKey, sourceKey]);
+  const dynamicPresetOptions = calculationPresetOptions(question).filter((item) => item.value !== "empty");
+  const dynamicPreset = dynamicPresetOptions.some((item) => item.value === state.dynamic.preset)
+    ? state.dynamic.preset
+    : dynamicPresetOptions[0]?.value || "copy";
+  const effectiveDynamic = { ...state.dynamic, preset: dynamicPreset };
+  const generatedValue = state.mode === "static"
+    ? state.staticValue
+    : state.mode === "builder"
+      ? buildCalculationExpression(effectiveDynamic)
+      : state.rawValue;
+  const options = conditionValueOptions(question);
+
+  function commit(nextState) {
+    setState(nextState);
+    const nextDynamicPreset = dynamicPresetOptions.some((item) => item.value === nextState.dynamic.preset)
+      ? nextState.dynamic.preset
+      : dynamicPresetOptions[0]?.value || "copy";
+    const nextDynamic = { ...nextState.dynamic, preset: nextDynamicPreset };
+    const nextValue = nextState.mode === "static"
+      ? nextState.staticValue
+      : nextState.mode === "builder"
+        ? buildCalculationExpression(nextDynamic)
+        : nextState.rawValue;
+    onChange(nextValue, {
+      mode: nextState.mode,
+      dynamic: nextDynamic
+    });
+  }
+
+  function commitDynamic(patch) {
+    commit({ ...state, mode: "builder", dynamic: { ...state.dynamic, ...patch } });
+  }
+
+  return (
+    <div className="logic-card">
+      <div className="logic-card-head">
+        <div>
+          <span className="logic-title-row">
+            <h3>Default answer</h3>
+            <InfoButton label="Default answer">{columnInfoText("default")}</InfoButton>
+          </span>
+          <small>ODK XLS format: "default" column.</small>
+        </div>
+      </div>
+      <div className="logic-tabs">
+        <button className={state.mode === "static" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "static" })}>Fixed</button>
+        <button className={state.mode === "builder" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "builder" })}>Builder</button>
+        <button className={state.mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "raw", rawValue: value || "" })}>Raw</button>
+      </div>
+      {state.mode === "static" ? (
+        <label className="logic-inline-field">
+          <span>Fixed answer</span>
+          {options.length ? (
+            <select value={state.staticValue || ""} disabled={readOnly} onChange={(event) => commit({ ...state, staticValue: event.target.value })}>
+              <option value="">No default</option>
+              {options.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type={defaultInputType(question)}
+              value={state.staticValue || ""}
+              disabled={readOnly}
+              onChange={(event) => commit({ ...state, staticValue: event.target.value })}
+            />
+          )}
+        </label>
+      ) : state.mode === "builder" ? (
+        <div className="logic-builder compact">
+          <label className="logic-inline-field">
+            <span>Preset</span>
+            <select value={dynamicPreset} disabled={readOnly} onChange={(event) => commitDynamic({ preset: event.target.value })}>
+              {dynamicPresetOptions.map((preset) => (
+                <option key={preset.value} value={preset.value}>{preset.label}</option>
+              ))}
+            </select>
+          </label>
+          {calculationNeedsFieldA(dynamicPreset) ? (
+            <label className="logic-inline-field">
+              <span>Answer</span>
+              <select value={state.dynamic.fieldA || ""} disabled={readOnly || !sources.length} onChange={(event) => commitDynamic({ fieldA: event.target.value })}>
+                {sources.length ? sources.map((source) => (
+                  <option key={source.id || source.name} value={source.name}>{sourceDisplayLabel(source)}</option>
+                )) : <option value="">No earlier question</option>}
+              </select>
+            </label>
+          ) : null}
+          {calculationNeedsFieldB(dynamicPreset) ? (
+            <label className="logic-inline-field">
+              <span>Second answer</span>
+              <select value={state.dynamic.fieldB || ""} disabled={readOnly || !sources.length} onChange={(event) => commitDynamic({ fieldB: event.target.value })}>
+                {sources.length ? sources.map((source) => (
+                  <option key={source.id || source.name} value={source.name}>{sourceDisplayLabel(source)}</option>
+                )) : <option value="">No earlier question</option>}
+              </select>
+            </label>
+          ) : null}
+          {calculationNeedsNumber(dynamicPreset) ? (
+            <label className="logic-inline-field">
+              <span>Fixed number</span>
+              <input type="number" value={state.dynamic.numberValue || "0"} disabled={readOnly} onChange={(event) => commitDynamic({ numberValue: event.target.value })} />
+            </label>
+          ) : null}
+          {dynamicPreset === "concat" ? (
+            <label className="logic-inline-field">
+              <span>Separator</span>
+              <input value={state.dynamic.separator || ""} disabled={readOnly} onChange={(event) => commitDynamic({ separator: event.target.value })} />
+            </label>
+          ) : null}
+        </div>
+      ) : (
+        <textarea
+          className="logic-raw"
+          value={state.rawValue || ""}
+          disabled={readOnly}
+          placeholder="today()"
+          onChange={(event) => commit({ ...state, rawValue: event.target.value })}
+        />
+      )}
+      <div className="expression-preview">
+        <span>Saved XLSForm value</span>
+        <code>{generatedValue || "No default"}</code>
+      </div>
+    </div>
+  );
 }
 
 function CalculationBuilderCard({ form, question, value, onChange, readOnly = false }) {
@@ -4712,28 +6488,35 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
   useEffect(() => {
     setState(initialCalculationState(value, sources));
   }, [stateKey, sourceKey]);
-  const generatedExpression = state.mode === "preset" ? buildCalculationExpression(state) : String(value || "");
+  const presetOptions = calculationPresetOptions(question);
+  const currentPreset = presetOptions.some((item) => item.value === state.preset) ? state.preset : presetOptions[0]?.value || "copy";
+  const effectiveState = { ...state, preset: currentPreset };
+  const generatedExpression = state.mode === "preset" ? buildCalculationExpression(effectiveState) : String(value || "");
 
   function commit(nextState) {
-    setState(nextState);
-    onChange(nextState.mode === "preset" ? buildCalculationExpression(nextState) : String(value || ""), {
-      mode: nextState.mode,
-      preset: nextState.preset,
-      fieldA: nextState.fieldA,
-      fieldB: nextState.fieldB,
-      separator: nextState.separator
+    const nextPreset = presetOptions.some((item) => item.value === nextState.preset)
+      ? nextState.preset
+      : presetOptions[0]?.value || "copy";
+    const normalized = { ...nextState, preset: nextPreset };
+    setState(normalized);
+    onChange(normalized.mode === "preset" ? buildCalculationExpression(normalized) : String(value || ""), {
+      mode: normalized.mode,
+      preset: normalized.preset,
+      fieldA: normalized.fieldA,
+      fieldB: normalized.fieldB,
+      separator: normalized.separator,
+      numberValue: normalized.numberValue
     });
   }
-
   return (
     <div className="logic-card">
       <div className="logic-card-head">
         <div>
           <span className="logic-title-row">
-            <h3>Calculation</h3>
+            <h3>Calculated value</h3>
             <InfoButton label="Calculation">{columnInfoText("calculation")}</InfoButton>
           </span>
-          <small>ODK XLS format: calculation column.</small>
+          <small>ODK XLS format: "calculation" column.</small>
         </div>
       </div>
       <div className="logic-tabs">
@@ -4752,18 +6535,13 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
         <div className="logic-builder compact">
           <label className="logic-inline-field">
             <span>Preset</span>
-            <select value={state.preset} disabled={readOnly} onChange={(event) => commit({ ...state, preset: event.target.value })}>
-              <option value="today">Today</option>
-              <option value="now">Current date-time</option>
-              <option value="copy">Copy another answer</option>
-              <option value="count_selected">Count selected choices</option>
-              <option value="sum">Add two answers</option>
-              <option value="difference">Subtract two answers</option>
-              <option value="concat">Join two answers</option>
-              <option value="age_years">Age in years from date</option>
+            <select value={currentPreset} disabled={readOnly} onChange={(event) => commit({ ...state, preset: event.target.value })}>
+              {presetOptions.map((preset) => (
+                <option key={preset.value} value={preset.value}>{preset.label}</option>
+              ))}
             </select>
           </label>
-          {!["today", "now"].includes(state.preset) ? (
+          {calculationNeedsFieldA(currentPreset) ? (
             <label className="logic-inline-field">
               <span>Answer</span>
               <select value={state.fieldA || ""} disabled={readOnly || !sources.length} onChange={(event) => commit({ ...state, fieldA: event.target.value })}>
@@ -4773,7 +6551,7 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
               </select>
             </label>
           ) : null}
-          {["sum", "difference", "concat"].includes(state.preset) ? (
+          {calculationNeedsFieldB(currentPreset) ? (
             <label className="logic-inline-field">
               <span>Second answer</span>
               <select value={state.fieldB || ""} disabled={readOnly || !sources.length} onChange={(event) => commit({ ...state, fieldB: event.target.value })}>
@@ -4783,7 +6561,13 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
               </select>
             </label>
           ) : null}
-          {state.preset === "concat" ? (
+          {calculationNeedsNumber(currentPreset) ? (
+            <label className="logic-inline-field">
+              <span>Fixed number</span>
+              <input type="number" value={state.numberValue || "0"} disabled={readOnly} onChange={(event) => commit({ ...state, numberValue: event.target.value })} />
+            </label>
+          ) : null}
+          {currentPreset === "concat" ? (
             <label className="logic-inline-field">
               <span>Separator</span>
               <input value={state.separator || ""} disabled={readOnly} onChange={(event) => commit({ ...state, separator: event.target.value })} />
@@ -4890,7 +6674,7 @@ function ChoiceFilterBuilderCard({ form, question, value, onChange, readOnly = f
             <h3>Choice Filter</h3>
             <InfoButton label="Choice Filter">{columnInfoText("choice_filter")}</InfoButton>
           </span>
-          <small>ODK XLS format: choice_filter column.</small>
+          <small>ODK XLS format: "choice_filter" column.</small>
         </div>
         <Toggle label="Filter choices" checked={open} disabled={readOnly} onChange={enableFilter} />
       </div>
@@ -4988,7 +6772,7 @@ function RepeatCountBuilderCard({ form, question, value, onChange, readOnly = fa
             <h3>Repeat Count</h3>
             <InfoButton label="Repeat Count">{columnInfoText("repeat_count")}</InfoButton>
           </span>
-          <small>ODK XLS format: repeat_count column.</small>
+          <small>ODK XLS format: "repeat_count" column.</small>
         </div>
       </div>
       <div className="logic-tabs">
@@ -5085,7 +6869,7 @@ function ParametersBuilderCard({ question, value, onChange, readOnly = false }) 
             <h3>Parameters</h3>
             <InfoButton label="Parameters">{columnInfoText("parameters")}</InfoButton>
           </span>
-          <small>ODK XLS format: parameters column.</small>
+          <small>ODK XLS format: "parameters" column.</small>
         </div>
       </div>
       <div className="logic-tabs">
@@ -5173,7 +6957,7 @@ function TriggerBuilderCard({ form, question, value, onChange, readOnly = false 
             <h3>Dynamic Default Trigger</h3>
             <InfoButton label="Dynamic Default Trigger">{columnInfoText("trigger")}</InfoButton>
           </span>
-          <small>ODK XLS format: trigger column.</small>
+          <small>ODK XLS format: "trigger" column.</small>
         </div>
         <Toggle label="Use trigger" checked={open} disabled={readOnly} onChange={enableTrigger} />
       </div>
@@ -5235,6 +7019,26 @@ const APPEARANCE_PRESETS = {
   text: ["", "numbers", "multiline", "printer", "url"]
 };
 
+function QuestionTypeField({ question, readOnly, onChange }) {
+  return (
+    <label className="field">
+      <span className="field-heading">
+        <span>Question type</span>
+        <InfoButton label="Question type">ODK XLS format: "type" column.</InfoButton>
+      </span>
+      <select
+        value={question.type || "text"}
+        disabled={readOnly}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {QUESTION_TYPES.map((item) => (
+          <option key={item.type} value={item.type}>{item.label}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function AppearanceField({ question, readOnly, onChange }) {
   const presets = APPEARANCE_PRESETS[question.type] || [""];
   return (
@@ -5243,7 +7047,7 @@ function AppearanceField({ question, readOnly, onChange }) {
         <span>Appearance</span>
         <InfoButton label="Appearance">{columnInfoText("appearance")}</InfoButton>
       </span>
-      <small>ODK XLS format: appearance column.</small>
+      <small>ODK XLS format: "appearance" column.</small>
       <div className="appearance-row">
         <select value={presets.includes(question.appearance || "") ? question.appearance || "" : "__custom"} disabled={readOnly} onChange={(event) => onChange(event.target.value === "__custom" ? question.appearance || "" : event.target.value)}>
           {presets.map((preset) => (
@@ -5264,7 +7068,7 @@ function MediaColumnField({ label, column, fieldName, value, accept, question, r
         <span>{label}</span>
         <InfoButton label={label}>{columnInfoText(column)}</InfoButton>
       </span>
-      <small>ODK XLS format: {column} column. Uploading here also adds the file as a form attachment.</small>
+      <small>ODK XLS format: "{column}" column. Uploading here also adds the file as a form attachment.</small>
       <div className="media-column-row">
         <input
           value={value || ""}
@@ -5320,7 +7124,8 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
   const showAppearance = canUseAppearance(question) || hasColumnValue(question, "appearance");
   const showParameters = canUseParameters(question) || hasColumnValue(question, "parameters");
   const showTrigger = canUseTrigger(question) || hasColumnValue(question, "trigger");
-  const showQuestionNote = hasColumnValue(question, "note");
+  const showCalculation = canUseCalculation(question);
+  const showQuestionNote = !END_STRUCTURAL_TYPES.has(question.type) || hasColumnValue(question, "note");
   const showGuidanceHint = canUseGuidanceHint(question) || hasColumnValue(question, "guidanceHint");
   const showEntitySaveTo = RESPONDENT_INPUT_TYPES.has(question.type) || hasColumnValue(question, "saveTo");
   const showPromptMedia = canUsePromptMedia(question) || hasColumnValue(question, "image", "bigImage", "audio", "video");
@@ -5343,11 +7148,16 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
 
   return (
     <div className="editor-stack">
+      <QuestionTypeField
+        question={question}
+        readOnly={readOnly}
+        onChange={(nextType) => updateQuestion(question.id, questionTypePatch(question, nextType))}
+      />
       <Field
         label="Question name"
         value={question.name}
         disabled={readOnly}
-        helpText="ODK XLS format: name column."
+        helpText={'ODK XLS format: "name" column.'}
         info={columnInfoText("name")}
         onChange={(value) => updateQuestion(question.id, { name: slug(value) })}
       />
@@ -5355,7 +7165,7 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
         label="Main question display text"
         value={question.label}
         disabled={readOnly}
-        helpText="ODK XLS format: label column."
+        helpText={'ODK XLS format: "label" column.'}
         info={columnInfoText("label")}
         onChange={(value) => updateQuestion(question.id, { label: value })}
         multiline
@@ -5364,7 +7174,7 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
         label="Question hint"
         value={question.hint}
         disabled={readOnly}
-        helpText="ODK XLS format: hint column."
+        helpText={'ODK XLS format: "hint" column.'}
         info={columnInfoText("hint")}
         onChange={(value) => updateQuestion(question.id, { hint: value })}
         multiline
@@ -5447,7 +7257,7 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
           label="Message for respondent about the above answering condition"
           value={question.constraintMessage}
           disabled={readOnly}
-          helpText="ODK XLS format: constraint_message column."
+          helpText={'ODK XLS format: "constraint_message" column.'}
           info={columnInfoText("constraint_message")}
           onChange={(value) => updateQuestion(question.id, { constraintMessage: value })}
         />
@@ -5457,19 +7267,27 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
           label="Required message"
           value={question.requiredMessage}
           disabled={readOnly}
-          helpText="ODK XLS format: required_message column."
+          helpText={'ODK XLS format: "required_message" column.'}
           info={columnInfoText("required_message")}
           onChange={(value) => updateQuestion(question.id, { requiredMessage: value })}
         />
       ) : null}
       {showDefault ? (
-        <Field
-          label="Default answer if respondent does not answer this question"
+        <DefaultValueBuilderCard
+          form={form}
+          question={question}
           value={question.defaultValue}
-          disabled={readOnly}
-          helpText="ODK XLS format: default column."
-          info={columnInfoText("default")}
-          onChange={(value) => updateQuestion(question.id, { defaultValue: value })}
+          readOnly={readOnly}
+          onChange={(value, builderState) => updateQuestion(question.id, updateLogicPatch(question, "default", "defaultValue", value, builderState))}
+        />
+      ) : null}
+      {showCalculation ? (
+        <CalculationBuilderCard
+          form={form}
+          question={question}
+          value={question.calculation}
+          readOnly={readOnly}
+          onChange={(value, builderState) => updateQuestion(question.id, updateLogicPatch(question, "calculation", "calculation", value, builderState))}
         />
       ) : null}
       {showAppearance ? <AppearanceField question={question} readOnly={readOnly} onChange={(value) => updateQuestion(question.id, { appearance: value })} /> : null}
@@ -5508,9 +7326,9 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
           onChange={(value, builderState) => updateQuestion(question.id, updateLogicPatch(question, "repeat_count", "repeatCount", value, builderState))}
         />
       ) : null}
-      {showQuestionNote ? <Field label="Question note" value={question.note} disabled={readOnly} helpText="ODK XLS format: note column." info={columnInfoText("note")} onChange={(value) => updateQuestion(question.id, { note: value })} multiline /> : null}
-      {showGuidanceHint ? <Field label="Guidance hint" value={question.guidanceHint} disabled={readOnly} helpText="ODK XLS format: guidance_hint column." info={columnInfoText("guidance_hint")} onChange={(value) => updateQuestion(question.id, { guidanceHint: value })} multiline /> : null}
-      {showEntitySaveTo ? <Field label="Entity save_to" value={question.saveTo} disabled={readOnly} helpText="ODK XLS format: save_to column. Leave blank unless this form creates or updates ODK Entities." info={columnInfoText("save_to")} onChange={(value) => updateQuestion(question.id, { saveTo: value })} /> : null}
+      {showQuestionNote ? <Field label="Designer note" value={question.note} disabled={readOnly} helpText={'ODK XLS format: "note" column.'} info={columnInfoText("note")} onChange={(value) => updateQuestion(question.id, { note: value })} multiline /> : null}
+      {showGuidanceHint ? <Field label="Guidance hint" value={question.guidanceHint} disabled={readOnly} helpText={'ODK XLS format: "guidance_hint" column.'} info={columnInfoText("guidance_hint")} onChange={(value) => updateQuestion(question.id, { guidanceHint: value })} multiline /> : null}
+      {showEntitySaveTo ? <Field label="Entity save_to" value={question.saveTo} disabled={readOnly} helpText={'ODK XLS format: "save_to" column. Leave blank unless this form creates or updates ODK Entities.'} info={columnInfoText("save_to")} onChange={(value) => updateQuestion(question.id, { saveTo: value })} /> : null}
       {showPromptMedia ? (
         <>
           <MediaColumnField
@@ -5559,16 +7377,6 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
           />
         </>
       ) : null}
-      {isCalculate ? (
-        <CalculationBuilderCard
-          form={form}
-          question={question}
-          value={question.calculation}
-          readOnly={readOnly}
-          onChange={(value, builderState) => updateQuestion(question.id, updateLogicPatch(question, "calculation", "calculation", value, builderState))}
-        />
-      ) : null}
-
       {hasOptions ? (
         <div className="options-editor">
           <div className="section-head">
@@ -5599,7 +7407,7 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
             label="External choices file"
             value={question.listName}
             disabled={readOnly}
-            helpText="ODK XLS format: type column after select_from_file, for example choices.csv."
+            helpText={'ODK XLS format: "type" column after select_from_file, for example choices.csv.'}
             onChange={(value) => updateQuestion(question.id, { listName: value })}
           />
         </div>
@@ -5608,23 +7416,28 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
   );
 }
 
-function FillForm({ workspaceId }) {
+function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
   const [form, setForm] = useState(null);
   const [formXml, setFormXml] = useState("");
   const [answers, setAnswers] = useState({});
   const [submissionSuccess, setSubmissionSuccess] = useState(false);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading form..." });
+  const encodedWorkspaceId = workspaceId ? encodeURIComponent(workspaceRouteId(workspaceId)) : "";
+  const encodedAccessCode = accessCode ? encodeURIComponent(normalizeAccessCodeInput(accessCode)) : "";
+  const formApiBase = accessCode
+    ? `/api/public/forms/${encodedAccessCode}`
+    : `/api/forms/${encodedWorkspaceId}`;
   const calculatedAnswers = form ? computeCalculatedAnswers(form, answers) : answers;
   const questionsToShow = form ? visibleQuestions(form, calculatedAnswers) : [];
 
   useEffect(() => {
     async function loadPublishedForm() {
       try {
-        const data = await requestJson(`/api/forms/${encodeURIComponent(workspaceId)}`);
+        const data = await requestJson(formApiBase);
         const draft = normalizeFormDraft(data.draft);
         let publishedForm = draft;
         if (data.hasXml) {
-          const xmlData = await requestJson(`/api/forms/${encodeURIComponent(workspaceId)}/xml`);
+          const xmlData = await requestJson(`${formApiBase}/xml`);
           setFormXml(xmlData.xml || "");
           publishedForm = parseXFormXml(xmlData.xml, draft);
         } else {
@@ -5645,7 +7458,7 @@ function FillForm({ workspaceId }) {
       }
     }
     loadPublishedForm();
-  }, [workspaceId]);
+  }, [formApiBase]);
 
   function setAnswer(name, value) {
     setSubmissionSuccess(false);
@@ -5665,7 +7478,7 @@ function FillForm({ workspaceId }) {
       for (const [name, value] of Object.entries(validation.answers)) {
         if (visibleNames.has(name)) submissionAnswers[name] = value;
       }
-      await postJson(`/api/forms/${encodeURIComponent(workspaceId)}/entries`, { answers: submissionAnswers });
+      await postJson(`${formApiBase}/entries`, { answers: submissionAnswers });
 	      setStatus({ kind: "ok", message: "Ready" });
 	      setSubmissionSuccess(true);
 	      setAnswers({});
@@ -5677,7 +7490,20 @@ function FillForm({ workspaceId }) {
   if (!form) {
     return (
       <div className="fill-shell">
-        <div className={`status-line ${status.kind}`}><AlertCircle size={16} /> <span>{status.message}</span></div>
+        <header className="fill-header">
+          <div>
+            <h1>ICPH Form</h1>
+            <p>{accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : "Loading workspace"}</p>
+          </div>
+          <div className="fill-header-actions">
+            {onBackToRespondent ? (
+              <button className="secondary small" onClick={onBackToRespondent}>
+                <ChevronRight size={16} /> Change Code
+              </button>
+            ) : null}
+            <div className={`status-line ${status.kind}`}><AlertCircle size={16} /> <span>{status.message}</span></div>
+          </div>
+        </header>
       </div>
     );
   }
@@ -5687,11 +7513,18 @@ function FillForm({ workspaceId }) {
       <header className="fill-header">
         <div>
           <h1>{form.title}</h1>
-          <p>{form.formId}</p>
+          <p>{accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
         </div>
-        <div className={`status-line ${status.kind}`}>
-          {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
-          <span>{status.message}</span>
+        <div className="fill-header-actions">
+          {onBackToRespondent ? (
+            <button className="secondary small" onClick={onBackToRespondent}>
+              <ChevronRight size={16} /> Change Code
+            </button>
+          ) : null}
+          <div className={`status-line ${status.kind}`}>
+            {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
+            <span>{status.message}</span>
+          </div>
         </div>
 	      </header>
 	      {formXml ? (
@@ -5699,6 +7532,7 @@ function FillForm({ workspaceId }) {
 	          <OdkWebFormIsland
 	            formXml={formXml}
 	            workspaceId={workspaceId}
+	            formApiBase={formApiBase}
 	            onSubmitted={() => {
 	              setStatus({ kind: "ok", message: "Ready in ODK Web Forms" });
 	              setSubmissionSuccess(true);
@@ -5709,7 +7543,7 @@ function FillForm({ workspaceId }) {
 	          />
 	          {submissionSuccess ? (
 	            <div className="submission-success-inline">
-	              <Check size={16} /> Submited!
+	              <Check size={16} /> Submitted!
 	            </div>
 	          ) : null}
 	        </main>
@@ -5726,7 +7560,7 @@ function FillForm({ workspaceId }) {
 	          <button className="primary submit-entry" onClick={submitEntry}>Submit Entry</button>
 	          {submissionSuccess ? (
 	            <div className="submission-success-inline">
-	              <Check size={16} /> Submited!
+	              <Check size={16} /> Submitted!
 	            </div>
 	          ) : null}
 	        </main>

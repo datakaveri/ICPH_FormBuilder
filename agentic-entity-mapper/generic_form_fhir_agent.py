@@ -55,10 +55,164 @@ NON_OBSERVATION_TYPES = {
 }
 QUESTION_EXTENSION_URL = "https://datakaveri.org/fhir/StructureDefinition/icph-form-builder-question"
 OPTION_EXTENSION_URL = "https://datakaveri.org/fhir/StructureDefinition/icph-form-builder-choice"
+APPROVED_TERMINOLOGY_EXTENSION_URL = "https://datakaveri.org/fhir/StructureDefinition/icph-approved-terminology"
+VOCABULARY_SYSTEM_URIS = {
+    "snomed": "http://snomed.info/sct",
+    "loinc": "http://loinc.org",
+    "icd10": "http://hl7.org/fhir/sid/icd-10-cm",
+    "rxnorm": "http://rxnorm.info/rxcui",
+}
 
 
 def _include_derived_observations() -> bool:
     return str(os.environ.get("ICPH_INCLUDE_DERIVED_OBSERVATIONS") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _vocabulary_key(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    if "loinc" in text:
+        return "loinc"
+    if "rxnorm" in text or "rxcui" in text:
+        return "rxnorm"
+    if "icd" in text:
+        return "icd10"
+    return "snomed"
+
+
+def _mapping_to_coding(mapping: dict[str, Any]) -> dict[str, str] | None:
+    code = _clean_text(mapping.get("code") or mapping.get("concept_id") or mapping.get("standard_concept_code"))
+    if not code:
+        return None
+    vocabulary = mapping.get("vocabulary") or mapping.get("vocabularyLabel") or mapping.get("terminology")
+    vocabulary_key = _vocabulary_key(vocabulary)
+    system = _clean_text(mapping.get("systemUri") or mapping.get("system_uri") or VOCABULARY_SYSTEM_URIS.get(vocabulary_key))
+    display = _clean_text(
+        mapping.get("display")
+        or mapping.get("term")
+        or mapping.get("preferredTerm")
+        or mapping.get("fsn")
+        or mapping.get("concept_name")
+        or code
+    )
+    if not system:
+        return None
+    return {"system": system, "code": code, "display": display or code}
+
+
+def _question_review_keys(question: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for value in (question.get("name"), question.get("id")):
+        text = _clean_text(value)
+        if text and text not in keys:
+            keys.append(text)
+    return keys
+
+
+def _approved_mappings_for_entity(entity: dict[str, Any]) -> list[dict[str, Any]]:
+    if entity.get("validationStatus") == "unmapped_confirmed":
+        return []
+    approved = entity.get("approvedMappings")
+    if isinstance(approved, list) and approved:
+        return [mapping for mapping in approved if isinstance(mapping, dict)]
+    if entity.get("validated") and entity.get("code"):
+        return [entity]
+    return []
+
+
+def _dedupe_codings(codings: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for coding in codings:
+        key = (coding.get("system", ""), coding.get("code", ""))
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        unique.append(coding)
+    return unique
+
+
+def _load_approved_terminology(terminology_review_path: str | Path | None) -> dict[str, list[dict[str, str]]]:
+    if not terminology_review_path:
+        return {}
+    path = Path(terminology_review_path)
+    if not path.is_file():
+        raise ValueError(f"Terminology review file was not found: {path}")
+
+    review = json.loads(path.read_text(encoding="utf-8"))
+    by_question: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for question in review.get("questions") or []:
+        if not isinstance(question, dict):
+            continue
+        question_keys = [key for key in _question_review_keys(question) if key]
+        for entity in question.get("entities") or []:
+            if not isinstance(entity, dict):
+                continue
+            for mapping in _approved_mappings_for_entity(entity):
+                coding = _mapping_to_coding(mapping)
+                if not coding:
+                    continue
+                for key in question_keys:
+                    by_question[key].append(coding)
+
+    return {key: _dedupe_codings(codings) for key, codings in by_question.items() if codings}
+
+
+def _approved_codings_for_question(
+    question: dict[str, Any],
+    terminology_by_question: dict[str, list[dict[str, str]]],
+) -> list[dict[str, str]]:
+    codings: list[dict[str, str]] = []
+    for key in _question_review_keys(question):
+        codings.extend(terminology_by_question.get(key, []))
+    return _dedupe_codings(codings)
+
+
+def _question_local_coding(workspace_id: str, question: dict[str, Any]) -> dict[str, str]:
+    name = str(question.get("name") or "").strip()
+    return {
+        "system": _local_system(workspace_id, "questions"),
+        "code": name,
+        "display": str(question.get("label") or name),
+    }
+
+
+def _question_codings(
+    workspace_id: str,
+    question: dict[str, Any],
+    terminology_by_question: dict[str, list[dict[str, str]]],
+) -> list[dict[str, str]]:
+    return [
+        _question_local_coding(workspace_id, question),
+        *_approved_codings_for_question(question, terminology_by_question),
+    ]
+
+
+def _approved_terminology_extension(codings: list[dict[str, str]]) -> dict[str, Any] | None:
+    if not codings:
+        return None
+    return {
+        "url": APPROVED_TERMINOLOGY_EXTENSION_URL,
+        "extension": [{"url": "coding", "valueCoding": coding} for coding in codings],
+    }
+
+
+def _approved_terminology_stats(
+    draft: dict[str, Any],
+    terminology_by_question: dict[str, list[dict[str, str]]],
+) -> tuple[int, int]:
+    question_count = 0
+    coding_count = 0
+    for question in _questionnaire_questions(draft):
+        codings = _approved_codings_for_question(question, terminology_by_question)
+        if not codings:
+            continue
+        question_count += 1
+        coding_count += len(codings)
+    return question_count, coding_count
 
 
 def _is_choice_type(question: dict[str, Any]) -> bool:
@@ -469,21 +623,20 @@ def _questionnaire_item(
     draft: dict[str, Any],
     question: dict[str, Any],
     source_by_name: dict[str, dict[str, Any]],
+    terminology_by_question: dict[str, list[dict[str, str]]],
 ) -> dict[str, Any]:
     name = str(question.get("name") or "").strip()
+    approved_codings = _approved_codings_for_question(question, terminology_by_question)
+    extensions = [_source_extension(question)]
+    if terminology_extension := _approved_terminology_extension(approved_codings):
+        extensions.append(terminology_extension)
     item: dict[str, Any] = {
         "linkId": name,
         "definition": _local_system(workspace_id, f"question/{name}"),
-        "code": [
-            {
-                "system": _local_system(workspace_id, "questions"),
-                "code": name,
-                "display": str(question.get("label") or name),
-            }
-        ],
+        "code": _question_codings(workspace_id, question, terminology_by_question),
         "text": str(question.get("label") or name),
         "type": _questionnaire_item_type(question),
-        "extension": [_source_extension(question)],
+        "extension": extensions,
     }
     if question.get("required"):
         item["required"] = True
@@ -520,7 +673,11 @@ def _append_nested_questionnaire_item(
         stack.append(item)
 
 
-def _questionnaire_items(workspace_id: str, draft: dict[str, Any]) -> list[dict[str, Any]]:
+def _questionnaire_items(
+    workspace_id: str,
+    draft: dict[str, Any],
+    terminology_by_question: dict[str, list[dict[str, str]]],
+) -> list[dict[str, Any]]:
     root_items: list[dict[str, Any]] = []
     stack: list[dict[str, Any]] = []
     source_by_name: dict[str, dict[str, Any]] = {}
@@ -533,13 +690,17 @@ def _questionnaire_items(workspace_id: str, draft: dict[str, Any]) -> list[dict[
         name = str(question.get("name") or "").strip()
         if not name or qtype in QUESTIONNAIRE_EXCLUDED_TYPES:
             continue
-        item = _questionnaire_item(workspace_id, draft, question, source_by_name)
+        item = _questionnaire_item(workspace_id, draft, question, source_by_name, terminology_by_question)
         _append_nested_questionnaire_item(root_items, stack, item, qtype)
         source_by_name.setdefault(name, question)
     return root_items
 
 
-def _questionnaire_resource(workspace_id: str, draft: dict[str, Any]) -> dict[str, Any]:
+def _questionnaire_resource(
+    workspace_id: str,
+    draft: dict[str, Any],
+    terminology_by_question: dict[str, list[dict[str, str]]],
+) -> dict[str, Any]:
     questionnaire_id = _slug(draft.get("formId") or draft.get("title") or workspace_id)
     return {
         "resourceType": "Questionnaire",
@@ -548,18 +709,27 @@ def _questionnaire_resource(workspace_id: str, draft: dict[str, Any]) -> dict[st
         "status": "active",
         "title": str(draft.get("title") or draft.get("formId") or "ICPH form"),
         "date": _now_iso(),
-        "item": _questionnaire_items(workspace_id, draft),
+        "item": _questionnaire_items(workspace_id, draft, terminology_by_question),
     }
 
 
-def _qr_item(workspace_id: str, question: dict[str, Any], answers: list[dict[str, Any]]) -> dict[str, Any]:
+def _qr_item(
+    workspace_id: str,
+    question: dict[str, Any],
+    answers: list[dict[str, Any]],
+    terminology_by_question: dict[str, list[dict[str, str]]],
+) -> dict[str, Any]:
     name = str(question.get("name") or "").strip()
+    approved_codings = _approved_codings_for_question(question, terminology_by_question)
+    extensions = [_source_extension(question)]
+    if terminology_extension := _approved_terminology_extension(approved_codings):
+        extensions.append(terminology_extension)
     return {
         "linkId": name,
         "definition": _local_system(workspace_id, f"question/{name}"),
         "text": str(question.get("label") or name),
         "answer": answers,
-        "extension": [_source_extension(question)],
+        "extension": extensions,
     }
 
 
@@ -581,6 +751,7 @@ def _questionnaire_response_items(
     workspace_id: str,
     draft: dict[str, Any],
     row: dict[str, str],
+    terminology_by_question: dict[str, list[dict[str, str]]],
 ) -> list[dict[str, Any]]:
     root_items: list[dict[str, Any]] = []
     stack: list[dict[str, Any]] = []
@@ -594,12 +765,16 @@ def _questionnaire_response_items(
         if not name or qtype in QUESTIONNAIRE_EXCLUDED_TYPES:
             continue
         if qtype in {"begin_group", "begin_repeat"}:
+            approved_codings = _approved_codings_for_question(question, terminology_by_question)
+            extensions = [_source_extension(question)]
+            if terminology_extension := _approved_terminology_extension(approved_codings):
+                extensions.append(terminology_extension)
             group = {
                 "linkId": name,
                 "definition": _local_system(workspace_id, f"question/{name}"),
                 "text": str(question.get("label") or name),
                 "item": [],
-                "extension": [_source_extension(question)],
+                "extension": extensions,
             }
             target = stack[-1].setdefault("item", []) if stack else root_items
             target.append(group)
@@ -609,7 +784,7 @@ def _questionnaire_response_items(
         if not answers:
             continue
         target = stack[-1].setdefault("item", []) if stack else root_items
-        target.append(_qr_item(workspace_id, question, answers))
+        target.append(_qr_item(workspace_id, question, answers, terminology_by_question))
     return _prune_empty_response_groups(root_items)
 
 
@@ -634,9 +809,10 @@ def _bundle_for_patient(
     primary_identifier_variable: str,
     patient_value: str,
     rows: list[tuple[int, dict[str, str]]],
+    terminology_by_question: dict[str, list[dict[str, str]]],
 ) -> dict[str, Any]:
     questions = _answer_questions(draft)
-    questionnaire = _questionnaire_resource(workspace_id, draft)
+    questionnaire = _questionnaire_resource(workspace_id, draft, terminology_by_question)
     patient = _patient_resource(workspace_id, primary_identifier_variable, patient_value)
     patient_id = str(patient["id"])
     resources: list[dict[str, Any]] = [questionnaire, patient]
@@ -660,7 +836,7 @@ def _bundle_for_patient(
             }
         )
 
-        questionnaire_items = _questionnaire_response_items(workspace_id, draft, row)
+        questionnaire_items = _questionnaire_response_items(workspace_id, draft, row, terminology_by_question)
         resources.append(
             {
                 "resourceType": "QuestionnaireResponse",
@@ -689,13 +865,7 @@ def _bundle_for_patient(
                         "id": _slug(f"obs-{entry_hash}-{name}"),
                         "status": "final",
                         "code": {
-                            "coding": [
-                                {
-                                    "system": _local_system(workspace_id, "questions"),
-                                    "code": name,
-                                    "display": str(question.get("label") or name),
-                                }
-                            ],
+                            "coding": _question_codings(workspace_id, question, terminology_by_question),
                             "text": str(question.get("label") or name),
                         },
                         "subject": {"reference": f"Patient/{patient_id}"},
@@ -727,6 +897,7 @@ def run_generic_form_csv_pipeline(
     *,
     primary_identifier_variable: str,
     output_dir: str | Path,
+    terminology_review_path: str | Path | None = None,
 ) -> dict[str, Any]:
     csv_path = Path(csv_path)
     form_draft_path = Path(form_draft_path)
@@ -736,6 +907,8 @@ def run_generic_form_csv_pipeline(
         raise ValueError("Primary identifier variable is required for generic form FHIR mapping.")
 
     draft = json.loads(form_draft_path.read_text(encoding="utf-8"))
+    terminology_by_question = _load_approved_terminology(terminology_review_path)
+    approved_question_count, approved_coding_count = _approved_terminology_stats(draft, terminology_by_question)
     workspace_id = csv_path.parent.parent.parent.name or _slug(draft.get("formId") or draft.get("title") or "workspace")
 
     with csv_path.open(newline="", encoding="utf-8") as handle:
@@ -761,6 +934,7 @@ def run_generic_form_csv_pipeline(
             primary_identifier_variable=primary_identifier,
             patient_value=patient_value,
             rows=patient_rows,
+            terminology_by_question=terminology_by_question,
         )
         bundle_path = output_dir / f"{_slug(patient_value)}-{_stable_id(workspace_id, patient_value)}_{_slug(draft.get('formId') or draft.get('title') or workspace_id)}.json"
         bundle_path.write_text(json.dumps(bundle, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -781,6 +955,9 @@ def run_generic_form_csv_pipeline(
         "mode": "generic_form_mapper",
         "source_csv_path": str(csv_path),
         "form_draft_path": str(form_draft_path),
+        "terminology_review_path": str(terminology_review_path) if terminology_review_path else "",
+        "approved_terminology_question_count": approved_question_count,
+        "approved_terminology_coding_count": approved_coding_count,
         "form_id": draft.get("formId") or "",
         "form_title": draft.get("title") or "",
         "primary_identifier_variable": primary_identifier,

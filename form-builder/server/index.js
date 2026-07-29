@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
@@ -26,14 +27,21 @@ const schemaPreprocessorPath = path.join(mapperRoot, "preprocess_icph_metaforms.
 const schemaManifestName = "icph_metaforms_manifest.json";
 const schemaAggregateChunksName = "icph_metaform_chunks.jsonl";
 const port = Number(process.env.ICPH_FORM_BUILDER_API_PORT || 8787);
+const adminPassword = process.env.ICPH_ADMIN_PASSWORD || "ICPH2026";
+const adminTokens = new Map();
+const adminTokenTtlMs = 12 * 60 * 60 * 1000;
+const accessCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const corsHeaders = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+  "access-control-allow-headers": "content-type,x-admin-token,x-admin-password,authorization"
+};
 
 function jsonResponse(res, status, payload) {
   const body = JSON.stringify(payload, null, 2);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-    "access-control-allow-headers": "content-type"
+    ...corsHeaders
   });
   res.end(body);
 }
@@ -41,9 +49,7 @@ function jsonResponse(res, status, payload) {
 function binaryResponse(res, status, body, contentType = "application/octet-stream") {
   res.writeHead(status, {
     "content-type": contentType,
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-    "access-control-allow-headers": "content-type"
+    ...corsHeaders
   });
   res.end(body);
 }
@@ -69,6 +75,73 @@ function timestampId() {
 
 function isoStamp() {
   return new Date().toISOString();
+}
+
+function cleanupAdminTokens() {
+  const now = Date.now();
+  for (const [token, expiresAt] of adminTokens) {
+    if (!expiresAt || expiresAt <= now) adminTokens.delete(token);
+  }
+}
+
+function createAdminToken() {
+  cleanupAdminTokens();
+  const token = randomBytes(24).toString("hex");
+  adminTokens.set(token, Date.now() + adminTokenTtlMs);
+  return token;
+}
+
+function adminTokenFromRequest(req) {
+  const explicit = req.headers["x-admin-token"];
+  if (explicit) return String(explicit).trim();
+  const authorization = String(req.headers.authorization || "");
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : "";
+}
+
+function isAdminRequest(req) {
+  cleanupAdminTokens();
+  const token = adminTokenFromRequest(req);
+  const password = String(req.headers["x-admin-password"] || "");
+  return Boolean((token && adminTokens.has(token)) || (password && password === adminPassword));
+}
+
+function assertAdmin(req) {
+  if (isAdminRequest(req)) return;
+  const error = new Error("Admin login required.");
+  error.statusCode = 401;
+  throw error;
+}
+
+async function loginAdmin(payload) {
+  const password = String(payload?.password || "");
+  if (password !== adminPassword) {
+    const error = new Error("Incorrect admin password.");
+    error.statusCode = 401;
+    throw error;
+  }
+  return {
+    ok: true,
+    token: createAdminToken(),
+    expiresInSeconds: Math.floor(adminTokenTtlMs / 1000)
+  };
+}
+
+function cleanRespondentAccessCode(value) {
+  const code = String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!/^[A-Z0-9]{5}$/.test(code)) {
+    const error = new Error("Enter the 5-character respondent form code.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return code;
+}
+
+function randomRespondentAccessCode() {
+  const bytes = randomBytes(5);
+  let code = "";
+  for (const byte of bytes) code += accessCodeAlphabet[byte % accessCodeAlphabet.length];
+  return code;
 }
 
 function safeSchemaStem(fileName) {
@@ -275,6 +348,43 @@ async function listSchemaDocuments() {
     const markdownPath = path.join(schemaProcessedDir, `${stem}.md`);
     const chunksPath = path.join(schemaProcessedDir, `${stem}.chunks.jsonl`);
     const info = manifest.documents?.[name] || {};
+    const formOptions = [];
+    if (info.chunks_path) {
+      const manifestChunksPath = path.join(mapperRoot, info.chunks_path);
+      if (existsSync(manifestChunksPath)) {
+        try {
+          const lines = (await readFile(manifestChunksPath, "utf8")).split(/\r?\n/).filter(Boolean);
+          const byForm = new Map();
+          for (const line of lines) {
+            const chunk = JSON.parse(line);
+            const formIndex = Number(chunk.form_index || 0);
+            if (!formIndex) continue;
+            if (!byForm.has(formIndex)) {
+              byForm.set(formIndex, {
+                formIndex,
+                title: chunk.form_title || `Form ${formIndex}`,
+                variableCount: 0,
+                variables: []
+              });
+            }
+            const formOption = byForm.get(formIndex);
+            if (chunk.chunk_type === "form") {
+              formOption.title = chunk.form_title || formOption.title;
+              formOption.variableCount = Array.isArray(chunk.variables) ? chunk.variables.length : formOption.variableCount;
+            }
+            if (chunk.chunk_type === "variable" && chunk.variable) {
+              formOption.variables.push({
+                name: chunk.variable,
+                label: chunk.question || "",
+                formatOptions: chunk.format_options || "",
+                instructions: chunk.instructions || ""
+              });
+            }
+          }
+          formOptions.push(...byForm.values());
+        } catch {}
+      }
+    }
     let sourceStat = null;
     try {
       sourceStat = await stat(sourcePath);
@@ -289,6 +399,7 @@ async function listSchemaDocuments() {
       updatedAt: sourceStat?.mtime?.toISOString?.() || info.processed_at || null,
       processedAt: info.processed_at || null,
       formCount: info.form_count || 0,
+      formOptions: formOptions.sort((a, b) => Number(a.formIndex || 0) - Number(b.formIndex || 0)),
       variableCount: info.variable_count || 0,
       chunkCount: info.chunk_count || 0,
       sha256: info.sha256 || null
@@ -368,15 +479,36 @@ async function createForm(payload) {
   const versionBaseId = `${timestampId()}_${slugify(title)}`;
   const workspaceId = `${versionBaseId}_v1`;
   const outputDir = await ensureWorkspace(workspaceId);
+  const metaFormLink = normalizeMetaFormLink(payload);
+  const linkedPrimary = metaFormLink ? await existingMetaFormPrimary(metaFormLink.fileName) : null;
+  if (metaFormLink) {
+    if (!metaFormLink.formIndex) throw new Error("Choose which form in the linked MetaForm you are building.");
+    if (!payload.primaryIdentifierAcknowledged) {
+      throw new Error("Acknowledge that this primary identifier is common to every XLSForm linked to this MetaForm.");
+    }
+  }
+  const primaryIdentifierVariable = String(linkedPrimary?.variable || payload.primaryIdentifierVariable || "").trim();
+  const variableDetails = metaFormLink && primaryIdentifierVariable
+    ? await metaFormVariableDetails(metaFormLink.fileName, metaFormLink.formIndex, primaryIdentifierVariable)
+    : null;
+  if (metaFormLink && !linkedPrimary && !variableDetails) {
+    throw new Error(`Primary identifier variable "${primaryIdentifierVariable}" was not found in the selected MetaForm form.`);
+  }
+  const questions = [];
+  if (metaFormLink && primaryIdentifierVariable) {
+    questions.push(copiedPrimaryQuestion(linkedPrimary?.question || variableDetailsToQuestion(variableDetails, primaryIdentifierVariable), primaryIdentifierVariable));
+  }
   const draft = {
     title,
     formId,
     version: payload.version || "1",
     versionNumber: 1,
     versionBaseId,
-    instanceName: "",
+    metaFormLink,
+    primaryIdentifierVariable,
+    instanceName: primaryIdentifierVariable ? instanceNameForPrimaryIdentifier(primaryIdentifierVariable) : "",
     defaultLanguage: "english",
-    questions: [],
+    questions,
     createdAt: isoStamp(),
     updatedAt: isoStamp()
   };
@@ -390,6 +522,89 @@ async function loadDraft(workspaceId) {
   const draftPath = path.join(outputDir, "drafts", "form.json");
   const draft = JSON.parse(await readFile(draftPath, "utf8"));
   return { workspaceId: cleanId, outputDir, draftPath, draft, ...(await workspaceMeta(cleanId)) };
+}
+
+async function findWorkspaceByRespondentCode(value) {
+  const code = cleanRespondentAccessCode(value);
+  await mkdir(outputRoot, { recursive: true });
+  const names = await readdir(outputRoot);
+  for (const name of names) {
+    const workspaceId = cleanWorkspaceId(name);
+    const draftPath = path.join(outputRoot, workspaceId, "drafts", "form.json");
+    if (!existsSync(draftPath)) continue;
+    try {
+      const draft = JSON.parse(await readFile(draftPath, "utf8"));
+      const respondentAccessCode = String(draft.respondentAccessCode || draft.publicAccessCode || "").trim().toUpperCase();
+      if (respondentAccessCode === code) {
+        return {
+          code,
+          workspaceId,
+          outputDir: path.join(outputRoot, workspaceId),
+          draftPath,
+          draft
+        };
+      }
+    } catch {}
+  }
+  const error = new Error("No published form matches that respondent code.");
+  error.statusCode = 404;
+  throw error;
+}
+
+async function generateUniqueRespondentAccessCode(workspaceId) {
+  const currentWorkspaceId = cleanWorkspaceId(workspaceId);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const code = randomRespondentAccessCode();
+    try {
+      const found = await findWorkspaceByRespondentCode(code);
+      if (found.workspaceId === currentWorkspaceId) return code;
+    } catch (error) {
+      if (error.statusCode === 404) return code;
+      throw error;
+    }
+  }
+  throw new Error("Could not generate a unique respondent form code.");
+}
+
+async function loadPublicForm(value) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const meta = await workspaceMeta(found.workspaceId);
+  if (!meta.hasXml) {
+    const error = new Error("That respondent code is not ready for form filling yet.");
+    error.statusCode = 404;
+    throw error;
+  }
+  return {
+    ok: true,
+    accessCode: found.code,
+    title: found.draft?.title || meta.title,
+    formId: found.draft?.formId || meta.formId,
+    hasXml: meta.hasXml,
+    draft: found.draft
+  };
+}
+
+async function loadPublicFormXml(value) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const data = await loadFormXml(found.workspaceId);
+  return { ok: true, accessCode: found.code, xml: data.xml };
+}
+
+async function loadPublicAttachment(value, fileName) {
+  const found = await findWorkspaceByRespondentCode(value);
+  return loadAttachment(found.workspaceId, fileName);
+}
+
+async function submitPublicEntry(value, payload) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const data = await submitEntry(found.workspaceId, payload);
+  return { ok: true, accessCode: found.code, entry: data.entry };
+}
+
+async function submitPublicOdkEntry(value, payload) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const data = await submitOdkEntry(found.workspaceId, payload);
+  return { ok: true, accessCode: found.code, entry: data.entry };
 }
 
 async function loadFormXml(workspaceId) {
@@ -484,6 +699,15 @@ function terminologyResultPath(outputDir) {
   return path.join(outputDir, "terminology", "question_entities.json");
 }
 
+async function workspaceHasPublishedXml(outputDir) {
+  try {
+    const files = await readdir(path.join(outputDir, "xml"));
+    return files.some((name) => name.toLowerCase().endsWith(".xml"));
+  } catch {
+    return false;
+  }
+}
+
 function latestSnomedLookupPath() {
   const lookupRoot = path.join(mapperRoot, "SchemaTerminologies", "artifacts", "shared", "snomed_ct");
   if (!existsSync(lookupRoot)) return null;
@@ -527,6 +751,20 @@ function latestLoincPath() {
 }
 
 function latestRxNormMetadataPath() {
+  const sharedRoot = path.join(mapperRoot, "SchemaTerminologies", "artifacts", "shared", "rxnorm");
+  if (existsSync(sharedRoot)) {
+    try {
+      const sharedMatches = readdirSync(sharedRoot)
+        .map((name) => path.join(sharedRoot, name, "lookups", "rxnorm_metadata.json"))
+        .filter((candidate) => existsSync(candidate))
+        .sort((a, b) => a.localeCompare(b));
+      const latestShared = sharedMatches.at(-1);
+      if (latestShared) return latestShared;
+    } catch {
+      // Fall back to the legacy dense-index location below.
+    }
+  }
+
   const rxnormRoot = path.join(mapperRoot, "SchemaTerminologies", "artifacts");
   if (!existsSync(rxnormRoot)) return null;
   const matches = [];
@@ -848,6 +1086,9 @@ async function loadTerminology(workspaceId) {
 
 async function startTerminologyExtraction(workspaceId, options = {}) {
   const { cleanId, outputDir } = await requireWorkspace(workspaceId);
+  if (await workspaceHasPublishedXml(outputDir)) {
+    throw new Error("Terminology review is locked after publishing. Create a new version to change mappings.");
+  }
   const draftPath = path.join(outputDir, "drafts", "form.json");
   const resultPath = terminologyResultPath(outputDir);
   const questionIds = Array.isArray(options.questionIds)
@@ -923,6 +1164,9 @@ async function startTerminologyExtraction(workspaceId, options = {}) {
 
 async function saveTerminologyReview(workspaceId, payload) {
   const { cleanId, outputDir } = await requireWorkspace(workspaceId);
+  if (await workspaceHasPublishedXml(outputDir)) {
+    throw new Error("Terminology review is locked after publishing. Create a new version to change mappings.");
+  }
   const resultPath = terminologyResultPath(outputDir);
   if (!existsSync(resultPath)) throw new Error("Run terminology extraction before saving vocabulary review.");
   const terminology = payload?.terminology;
@@ -973,6 +1217,9 @@ async function createFormVersion(workspaceId) {
     updatedAt: now
   };
   delete nextDraft.buildFinishedAt;
+  delete nextDraft.publishedAt;
+  delete nextDraft.respondentAccessCode;
+  delete nextDraft.publicAccessCode;
   const draftPath = path.join(outputDir, "drafts", "form.json");
   await writeFile(draftPath, JSON.stringify(nextDraft, null, 2) + "\n", "utf8");
   await copyDirIfExists(path.join(loaded.outputDir, "attachments"), path.join(outputDir, "attachments"));
@@ -1011,6 +1258,7 @@ async function exportForm(payload) {
   const { cleanId: workspaceId, outputDir } = await requireWorkspace(payload.workspaceId);
   const draft = { ...payload.form, updatedAt: isoStamp() };
   const existingMeta = await workspaceMeta(workspaceId);
+  const firstPublish = !existingMeta.hasXml;
   if (!existingMeta.hasXml && draft.previousVersionWorkspaceId && !formHasVersionChanges(draft)) {
     throw new Error("Edit at least one Build item before publishing a new version.");
   }
@@ -1023,6 +1271,16 @@ async function exportForm(payload) {
   }
   if (draft.primaryIdentifierVariable) {
     draft.instanceName = instanceNameForPrimaryIdentifier(draft.primaryIdentifierVariable);
+  }
+  const respondentAccessCode = firstPublish
+    ? draft.respondentAccessCode || draft.publicAccessCode || await generateUniqueRespondentAccessCode(workspaceId)
+    : draft.respondentAccessCode || draft.publicAccessCode || null;
+  if (firstPublish) {
+    delete draft.respondentAccessCode;
+    delete draft.publicAccessCode;
+    delete draft.publishedAt;
+  } else if (respondentAccessCode) {
+    draft.respondentAccessCode = respondentAccessCode;
   }
   const draftPath = path.join(outputDir, "drafts", "form.json");
   const xlsxPath = path.join(outputDir, "xlsform", `${slugify(draft.formId || draft.title)}.xlsx`);
@@ -1047,6 +1305,11 @@ async function exportForm(payload) {
   let xmlResult = { code: 1, stdout: "", stderr: "xls2xform not found" };
   if (existsSync(xls2xformBin)) {
     xmlResult = await runCommand(xls2xformBin, [xlsxPath, xmlPath]);
+  }
+  if (firstPublish && xmlResult.code === 0) {
+    draft.respondentAccessCode = respondentAccessCode;
+    draft.publishedAt = draft.publishedAt || isoStamp();
+    await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
   }
   const terminology = xmlResult.code === 0 && existsSync(terminologyResultPath(outputDir))
     ? await loadTerminology(workspaceId)
@@ -1104,7 +1367,92 @@ function normalizeMetaFormLink(payload) {
   if (!linkedMetaFormFileName) return null;
   return {
     fileName: linkedMetaFormFileName,
+    formIndex: payload.metaFormFormIndex ? Number(payload.metaFormFormIndex) : null,
+    formTitle: String(payload.metaFormFormTitle || "").trim(),
     linkedAt: isoStamp()
+  };
+}
+
+async function existingMetaFormPrimary(fileName) {
+  const cleanName = String(fileName || "").trim();
+  if (!cleanName) return null;
+  await mkdir(outputRoot, { recursive: true });
+  let names = [];
+  try {
+    names = await readdir(outputRoot);
+  } catch {}
+  for (const name of names) {
+    const draftPath = path.join(outputRoot, name, "drafts", "form.json");
+    if (!existsSync(draftPath)) continue;
+    try {
+      const draft = JSON.parse(await readFile(draftPath, "utf8"));
+      if (draft?.metaFormLink?.fileName !== cleanName) continue;
+      const variable = String(draft.primaryIdentifierVariable || "").trim();
+      if (!variable) continue;
+      const question = (draft.questions || []).find((item) => item.name === variable) || null;
+      return { variable, question, workspaceId: name, title: draft.title || name };
+    } catch {}
+  }
+  return null;
+}
+
+async function metaFormVariableDetails(fileName, formIndex, variable) {
+  const cleanName = String(fileName || "").trim();
+  const targetFormIndex = Number(formIndex || 0);
+  const targetVariable = String(variable || "").trim();
+  if (!cleanName || !targetFormIndex || !targetVariable) return null;
+  const chunksPath = path.join(schemaProcessedDir, `${safeSchemaStem(cleanName)}.chunks.jsonl`);
+  if (!existsSync(chunksPath)) return null;
+  const lines = (await readFile(chunksPath, "utf8")).split(/\r?\n/).filter(Boolean);
+  for (const line of lines) {
+    try {
+      const chunk = JSON.parse(line);
+      if (chunk.chunk_type !== "variable") continue;
+      if (Number(chunk.form_index || 0) !== targetFormIndex) continue;
+      if (String(chunk.variable || "").trim() !== targetVariable) continue;
+      return {
+        name: targetVariable,
+        label: chunk.question || targetVariable,
+        formatOptions: chunk.format_options || "",
+        instructions: chunk.instructions || "",
+        formTitle: chunk.form_title || ""
+      };
+    } catch {}
+  }
+  return null;
+}
+
+function variableDetailsToQuestion(details, variable) {
+  const format = String(details?.formatOptions || "").toLowerCase();
+  let type = "text";
+  if (/date and time|datetime|hh:mm/.test(format)) type = "dateTime";
+  else if (/date|dd-mm-yyyy/.test(format)) type = "date";
+  else if (/decimal/.test(format)) type = "decimal";
+  else if (/numeric|number|integer|range/.test(format)) type = "integer";
+  return {
+    type,
+    name: variable,
+    label: details?.label || variable,
+    hint: details?.instructions || "",
+    required: true
+  };
+}
+
+function copiedPrimaryQuestion(sourceQuestion, variable) {
+  const base = sourceQuestion && typeof sourceQuestion === "object"
+    ? sourceQuestion
+    : {
+        type: "text",
+        name: variable,
+        label: `Primary identifier ${variable}`,
+        hint: "",
+        required: true
+      };
+  return {
+    ...base,
+    id: `meta_primary_${slugify(variable)}_${timestampId()}`,
+    name: variable,
+    required: base.required !== false
   };
 }
 
@@ -1136,13 +1484,25 @@ async function importXlsx(payload) {
     };
   }
   const draft = JSON.parse(await readFile(draftPath, "utf8"));
+  const metaFormLink = normalizeMetaFormLink(payload);
+  const linkedPrimary = metaFormLink ? await existingMetaFormPrimary(metaFormLink.fileName) : null;
+  if (metaFormLink) {
+    if (!metaFormLink.formIndex) throw new Error("Choose which form in the linked MetaForm this XLSForm represents.");
+    if (!payload.primaryIdentifierAcknowledged) {
+      throw new Error("Acknowledge that this primary identifier is common to every XLSForm linked to this MetaForm.");
+    }
+  }
   const variableNames = new Set((draft.questions || []).map((question) => question.name).filter(Boolean));
-  const primaryIdentifierVariable = String(payload.primaryIdentifierVariable || "").trim();
+  const primaryIdentifierVariable = String(linkedPrimary?.variable || payload.primaryIdentifierVariable || "").trim();
   if (!primaryIdentifierVariable) throw new Error("Choose the primary identifier variable for this XLSForm.");
   if (!variableNames.has(primaryIdentifierVariable)) {
-    throw new Error(`Primary identifier variable "${primaryIdentifierVariable}" is not present in the XLSForm survey name column.`);
+    if (linkedPrimary && payload.addMissingPrimaryIdentifier) {
+      draft.questions = [copiedPrimaryQuestion(linkedPrimary.question, primaryIdentifierVariable), ...(draft.questions || [])];
+      variableNames.add(primaryIdentifierVariable);
+    } else {
+      throw new Error(`Primary identifier variable "${primaryIdentifierVariable}" is not present in the XLSForm survey name column.`);
+    }
   }
-  const metaFormLink = normalizeMetaFormLink(payload);
 	  const updatedDraft = {
 	    ...draft,
 		    importedFrom: originalName,
@@ -1405,6 +1765,7 @@ async function passToMapper(workspaceId) {
   const bundleDir = path.join(outputDir, "fhir_bundles");
   await mkdir(bundleDir, { recursive: true });
   const mapperResultPath = path.join(bundleDir, "mapper_result.json");
+  const terminologyPath = terminologyResultPath(outputDir);
   const mapperInput = await saveMapperCsv(workspaceId, loaded.draft, entries);
 
   if (!existsSync(mapperPythonBin)) throw new Error(`Mapper Python environment not found: ${mapperPythonBin}`);
@@ -1420,6 +1781,9 @@ async function passToMapper(workspaceId) {
     mapperInput.primaryIdentifierVariable
   ];
   mapperArgs.push("--generic-form-draft", loaded.draftPath);
+  if (existsSync(terminologyPath)) {
+    mapperArgs.push("--terminology-review", terminologyPath);
+  }
 
   const mapperResult = await runCommand(
     mapperPythonBin,
@@ -1451,6 +1815,7 @@ async function passToMapper(workspaceId) {
     ok: true,
     workspaceId,
     csvPath: mapperInput.csvPath,
+    terminologyPath: existsSync(terminologyPath) ? terminologyPath : null,
     mapperResultPath,
     result,
     fhirBundles,
@@ -1496,6 +1861,12 @@ async function workspaceMeta(workspaceId) {
     try {
       draft = JSON.parse(await readFile(draftPath, "utf8"));
     } catch {}
+  }
+  if (draft && xmlFiles.length && !draft.respondentAccessCode && !draft.publicAccessCode) {
+    draft.respondentAccessCode = await generateUniqueRespondentAccessCode(cleanId);
+    draft.publishedAt = draft.publishedAt || isoStamp();
+    draft.updatedAt = draft.updatedAt || isoStamp();
+    await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
   }
   let terminology = null;
   if (existsSync(terminologyPath)) {
@@ -1546,6 +1917,8 @@ async function workspaceMeta(workspaceId) {
     metaFormLink: draft?.metaFormLink || null,
     primaryIdentifierVariable: draft?.primaryIdentifierVariable || null,
     buildFinishedAt: draft?.buildFinishedAt || null,
+    publishedAt: draft?.publishedAt || null,
+    respondentAccessCode: draft?.respondentAccessCode || draft?.publicAccessCode || null,
   };
 }
 
@@ -1587,6 +1960,34 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/health") {
       return jsonResponse(res, 200, { ok: true, outputRoot });
     }
+    if (req.method === "POST" && pathname === "/api/admin/login") {
+      return jsonResponse(res, 200, await loginAdmin(await requestBody(req)));
+    }
+    if (req.method === "GET" && pathname === "/api/admin/session") {
+      return jsonResponse(res, 200, { ok: true, authenticated: isAdminRequest(req) });
+    }
+    const publicFormMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)$/);
+    const publicXmlMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/xml$/);
+    const publicEntriesMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries$/);
+    const publicOdkSubmissionMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/odk-submissions$/);
+    const publicAttachmentFileMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments\/([^/]+)$/);
+    if (req.method === "GET" && publicFormMatch) {
+      return jsonResponse(res, 200, await loadPublicForm(decodeURIComponent(publicFormMatch[1])));
+    }
+    if (req.method === "GET" && publicXmlMatch) {
+      return jsonResponse(res, 200, await loadPublicFormXml(decodeURIComponent(publicXmlMatch[1])));
+    }
+    if (req.method === "GET" && publicAttachmentFileMatch) {
+      const attachment = await loadPublicAttachment(decodeURIComponent(publicAttachmentFileMatch[1]), decodeURIComponent(publicAttachmentFileMatch[2]));
+      return binaryResponse(res, 200, attachment.data, attachment.contentType);
+    }
+    if (req.method === "POST" && publicEntriesMatch) {
+      return jsonResponse(res, 200, await submitPublicEntry(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
+    }
+    if (req.method === "POST" && publicOdkSubmissionMatch) {
+      return jsonResponse(res, 200, await submitPublicOdkEntry(decodeURIComponent(publicOdkSubmissionMatch[1]), await requestBody(req)));
+    }
+    assertAdmin(req);
     if (req.method === "GET" && pathname === "/api/forms") {
       return jsonResponse(res, 200, await listForms());
     }
@@ -1698,7 +2099,7 @@ const server = createServer(async (req, res) => {
     jsonResponse(res, 404, { ok: false, error: "Not found" });
   } catch (error) {
     const message = error.message || String(error);
-    const status = /not found/i.test(message) ? 404 : 500;
+    const status = error.statusCode || (/not found/i.test(message) ? 404 : 500);
     jsonResponse(res, status, { ok: false, error: message });
   }
 });

@@ -29,6 +29,11 @@ def main() -> int:
         required=True,
         help="Form-builder draft JSON used as the sole form definition for FHIR creation.",
     )
+    parser.add_argument(
+        "--terminology-review",
+        type=Path,
+        help="Reviewed terminology JSON whose approved mappings should code FHIR questionnaire items.",
+    )
     args = parser.parse_args()
 
     result = run_generic_form_csv_pipeline(
@@ -36,6 +41,7 @@ def main() -> int:
         args.generic_form_draft,
         primary_identifier_variable=args.primary_identifier_variable,
         output_dir=args.output_json_path.parent,
+        terminology_review_path=args.terminology_review,
     )
     args.output_json_path.parent.mkdir(parents=True, exist_ok=True)
     args.output_json_path.write_text(
