@@ -910,6 +910,54 @@ function latestRxNormMetadataPath() {
   }
 }
 
+async function fileSummary(filePath) {
+  if (!filePath) return { ok: false, path: null, exists: false };
+  try {
+    const info = await stat(filePath);
+    return {
+      ok: true,
+      path: filePath,
+      exists: true,
+      sizeBytes: info.size,
+      updatedAt: info.mtime.toISOString()
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      path: filePath,
+      exists: false,
+      error: error.message || String(error)
+    };
+  }
+}
+
+async function terminologyAssetsStatus() {
+  const schemaOriginalExists = existsSync(schemaOriginalDir);
+  const schemaProcessedExists = existsSync(schemaProcessedDir);
+  const aggregateChunksPath = path.join(schemaProcessedDir, schemaAggregateChunksName);
+  const assets = {
+    snomed: await fileSummary(latestSnomedLookupPath()),
+    icd10: await fileSummary(latestSharedLookupPath("icd10", "icd10_lookup.csv")),
+    loinc: await fileSummary(latestLoincPath()),
+    rxnorm: await fileSummary(latestRxNormMetadataPath()),
+    schemaAggregateChunks: await fileSummary(aggregateChunksPath)
+  };
+  const missing = Object.entries(assets)
+    .filter(([, value]) => !value.ok)
+    .map(([key]) => key);
+  return {
+    ok: missing.length === 0,
+    mapperRoot,
+    schemaTerminologiesRoot: path.join(mapperRoot, "SchemaTerminologies"),
+    schemaOriginalDir,
+    schemaOriginalExists,
+    schemaProcessedDir,
+    schemaProcessedExists,
+    assets,
+    missing
+  };
+}
+
 function parseCsvLine(line) {
   const values = [];
   let value = "";
@@ -2130,6 +2178,9 @@ const server = createServer(async (req, res) => {
         limit: url.searchParams.get("limit"),
         selectedCode: url.searchParams.get("selectedCode")
       }));
+    }
+    if (req.method === "GET" && pathname === "/api/terminology/assets") {
+      return jsonResponse(res, 200, await terminologyAssetsStatus());
     }
     if (req.method === "POST" && pathname === "/api/schema-documents/upload") {
       return jsonResponse(res, 200, await uploadSchemaDocument(await requestBody(req)));

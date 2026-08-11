@@ -39,7 +39,10 @@ import {
 import "./styles.css";
 import cdpgLogo from "./assets/cdpg-logo.png";
 
-const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || "http://localhost:8787";
+const DEFAULT_API_BASE = typeof window === "undefined"
+  ? "http://localhost:8787"
+  : `${window.location.protocol}//${window.location.hostname}:8787`;
+const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
 const ADMIN_TOKEN_KEY = "icph_admin_token";
 let runtimeAdminToken = "";
 let runtimeAdminPassword = "";

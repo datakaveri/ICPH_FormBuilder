@@ -3,8 +3,7 @@ FROM node:22-bookworm
 WORKDIR /app
 
 ENV NODE_ENV=development \
-    ICPH_FORM_BUILDER_API_PORT=8787 \
-    VITE_FORM_BUILDER_API=http://localhost:8787
+    ICPH_FORM_BUILDER_API_PORT=8787
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv python3-pip \

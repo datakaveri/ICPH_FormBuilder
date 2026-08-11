@@ -203,8 +203,8 @@ For deployments, change the admin password before starting:
 ICPH_ADMIN_PASSWORD='replace-this' docker compose up --build
 ```
 
-If the browser will access the app from another machine, set the API URL to the
-reachable host name:
+By default, the browser calls the API on the same hostname as the web app, port
+`8787`. If you need to override that, set the API URL explicitly:
 
 ```bash
 VITE_FORM_BUILDER_API='http://your-hostname:8787' docker compose up --build

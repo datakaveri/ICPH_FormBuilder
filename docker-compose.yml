@@ -9,7 +9,7 @@ services:
     environment:
       ICPH_ADMIN_PASSWORD: "${ICPH_ADMIN_PASSWORD:-ICPH2026}"
       ICPH_FORM_BUILDER_API_PORT: "8787"
-      VITE_FORM_BUILDER_API: "${VITE_FORM_BUILDER_API:-http://localhost:8787}"
+      VITE_FORM_BUILDER_API: "${VITE_FORM_BUILDER_API:-}"
     volumes:
       - ./output:/app/output
     restart: unless-stopped
