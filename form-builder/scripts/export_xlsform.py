@@ -36,6 +36,7 @@ SURVEY_HEADERS = [
     "guidance_hint",
     "save_to",
     "big-image",
+    "bind::type",
 ]
 
 CHOICES_HEADERS = ["list_name", "name", "label", "image", "audio", "video", "big-image", "geometry"]
@@ -97,6 +98,14 @@ def choice_signature(row: dict) -> tuple:
 
 def xls_type(question: dict) -> str:
     qtype = question.get("type", "text")
+    structural_types = {
+        "begin_group": "begin group",
+        "end_group": "end group",
+        "begin_repeat": "begin repeat",
+        "end_repeat": "end repeat",
+    }
+    if qtype in structural_types:
+        return structural_types[qtype]
     if qtype in {"select_one", "select_multiple", "rank"}:
         return f"{qtype} {list_name_for(question)}"
     if qtype in {"select_one_from_file", "select_multiple_from_file"}:
@@ -104,6 +113,39 @@ def xls_type(question: dict) -> str:
     if qtype == "dateTime":
         return "datetime"
     return qtype
+
+
+def timer_field_names(question: dict) -> dict[str, str]:
+    base = odk_name(question.get("name") or question.get("id") or "timer", "timer")
+    return {
+        "start": f"{base}_start",
+        "end": f"{base}_end",
+        "duration": f"{base}_duration_seconds",
+    }
+
+
+def expanded_survey_questions(questions: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for question in questions:
+        if question.get("type") != "timer":
+            rows.append(question)
+            continue
+        fields = timer_field_names(question)
+        label = str(question.get("label") or question.get("name") or "Timer").strip()
+        for key, suffix_label, bind_type in (
+            ("start", "start time", "dateTime"),
+            ("end", "end time", "dateTime"),
+            ("duration", "duration seconds", "int"),
+        ):
+            rows.append({
+                "id": f"{question.get('id') or fields[key]}_{key}",
+                "type": "hidden",
+                "name": fields[key],
+                "label": f"{label} {suffix_label}",
+                "required": False,
+                "extraColumns": {"bind::type": bind_type},
+            })
+    return rows
 
 
 def write_header(ws, headers):
@@ -154,7 +196,7 @@ def main() -> int:
     draft_path = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
     form = json.loads(draft_path.read_text(encoding="utf-8"))
-    questions = list(form.get("questions") or [])
+    questions = expanded_survey_questions(list(form.get("questions") or []))
     survey_names = {odk_name(question.get("name") or question.get("id")) for question in questions}
 
     wb = Workbook()
@@ -215,11 +257,12 @@ def main() -> int:
     write_header(entities, entity_headers)
 
     for row_idx, question in enumerate(questions, start=2):
+        is_end_structural = question.get("type") in {"end_group", "end_repeat"}
         values = {
             **(question.get("extraColumns") or {}),
             "type": xls_type(question),
-            "name": odk_name(question.get("name") or question.get("id")),
-            "label": question.get("label") or question.get("name") or "Untitled question",
+            "name": None if is_end_structural else odk_name(question.get("name") or question.get("id")),
+            "label": None if is_end_structural else question.get("label") or question.get("name") or "Untitled question",
             "hint": question.get("hint") or None,
             "required": boolean_or_expression(question.get("required"), question.get("requiredExpression") or question.get("required_expression")),
             "relevant": question.get("relevant") or None,

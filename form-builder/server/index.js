@@ -31,6 +31,24 @@ const adminPassword = process.env.ICPH_ADMIN_PASSWORD || "ICPH2026";
 const adminTokens = new Map();
 const adminTokenTtlMs = 12 * 60 * 60 * 1000;
 const accessCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const structuralQuestionTypes = new Set(["begin_group", "end_group", "begin_repeat", "end_repeat", "begin group", "end group", "begin repeat", "end repeat"]);
+const nonPrimaryIdentifierTypes = new Set([
+  ...structuralQuestionTypes,
+  "note",
+  "calculate",
+  "hidden",
+  "csv-external",
+  "timer",
+  "audit",
+  "start",
+  "end",
+  "today",
+  "deviceid",
+  "username",
+  "phonenumber",
+  "email",
+  "background-audio"
+]);
 const corsHeaders = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
@@ -67,6 +85,15 @@ function slugify(value) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 60) || "untitled-form";
+}
+
+function fieldName(value, fallback = "field") {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/[^A-Za-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  const safe = cleaned || fallback;
+  return /^\d/.test(safe) ? `q_${safe}` : safe.slice(0, 64);
 }
 
 function timestampId() {
@@ -241,6 +268,103 @@ function instanceNameForPrimaryIdentifier(primaryIdentifierVariable) {
   const variable = String(primaryIdentifierVariable || "").trim();
   if (!variable) return "";
   return `concat(\${${variable}}, ' - ', format-date-time(now(), '%Y-%m-%d %H:%M:%S'))`;
+}
+
+function escapeXmlText(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function escapeXmlAttribute(value) {
+  return escapeXmlText(value).replace(/"/g, "&quot;");
+}
+
+function normalizedQuestionType(question = {}) {
+  return String(question.type || "").trim().toLowerCase().replace(/\s+/g, "_");
+}
+
+function timerFieldNames(question = {}) {
+  const base = fieldName(question?.name || question?.id || "timer", "timer");
+  return {
+    start: `${base}_start`,
+    end: `${base}_end`,
+    duration: `${base}_duration_seconds`
+  };
+}
+
+function dataHeadersForDraft(draft = {}) {
+  const seen = new Set();
+  const headers = [];
+  const add = (name) => {
+    const clean = String(name || "").trim();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    headers.push(clean);
+  };
+  for (const question of draft.questions || []) {
+    const type = normalizedQuestionType(question);
+    if (type === "timer") {
+      const fields = timerFieldNames(question);
+      add(fields.start);
+      add(fields.end);
+      add(fields.duration);
+      continue;
+    }
+    if (
+      structuralQuestionTypes.has(type) ||
+      ["note", "csv-external", "timer", "audit", "background-audio"].includes(type)
+    ) {
+      continue;
+    }
+    add(question?.name);
+  }
+  return headers;
+}
+
+function primaryIdentifierProblem(questions = [], variable = "") {
+  const selected = String(variable || "").trim();
+  if (!selected) return "";
+  let repeatDepth = 0;
+  for (const question of questions || []) {
+    const type = normalizedQuestionType(question);
+    if (type === "end_repeat") repeatDepth = Math.max(0, repeatDepth - 1);
+    const name = String(question?.name || "").trim();
+    if (name === selected) {
+      if (structuralQuestionTypes.has(type)) return `Primary identifier "${selected}" is a group/repeat structure row. Choose an answer question outside the repeat instead.`;
+      if (nonPrimaryIdentifierTypes.has(type)) return `Primary identifier "${selected}" uses type "${question.type}", which cannot identify respondents. Choose a respondent answer question instead.`;
+      if (repeatDepth > 0) return `Primary identifier "${selected}" is inside a repeat. Choose an identifier question outside repeat sections so each submission has one stable respondent code.`;
+      return "";
+    }
+    if (type === "begin_repeat") repeatDepth += 1;
+  }
+  return `Primary identifier variable "${selected}" is not present in this form.`;
+}
+
+async function exposeStartGeopointsInXml(draft, xmlPath) {
+  if (!existsSync(xmlPath)) return;
+  const startQuestions = (draft.questions || []).filter((question) => normalizedQuestionType(question) === "start-geopoint" && String(question.name || "").trim());
+  if (!startQuestions.length) return;
+  let xml = await readFile(xmlPath, "utf8");
+  let additions = "";
+  for (const question of startQuestions) {
+    const name = String(question.name || "").trim();
+    if (new RegExp(`<input\\s+[^>]*ref=["']/data/${name}["']`).test(xml)) continue;
+    const label = escapeXmlText(question.label || name);
+    const hint = String(question.hint || "").trim() ? `<hint>${escapeXmlText(question.hint)}</hint>` : "";
+    const appearance = String(question.appearance || "").trim() ? ` appearance="${escapeXmlAttribute(question.appearance)}"` : "";
+    additions += `<input ref="/data/${escapeXmlAttribute(name)}"${appearance}><label>${label}</label>${hint}</input>`;
+  }
+  if (!additions) return;
+  if (xml.includes("</h:body>")) {
+    xml = xml.replace("</h:body>", `${additions}</h:body>`);
+  } else if (xml.includes("</body>")) {
+    xml = xml.replace("</body>", `${additions}</body>`);
+  } else {
+    return;
+  }
+  await writeFile(xmlPath, xml, "utf8");
 }
 
 function contentTypeFor(fileName) {
@@ -1265,11 +1389,9 @@ async function exportForm(payload) {
   if (draft.previousVersionWorkspaceId) {
     draft.versionChangeSummary = describeVersionChanges(draft);
   }
-  const fieldNames = new Set((draft.questions || []).map((question) => question.name).filter(Boolean));
-  if (draft.primaryIdentifierVariable && !fieldNames.has(draft.primaryIdentifierVariable)) {
-    throw new Error(`Primary identifier variable "${draft.primaryIdentifierVariable}" is not present in this form.`);
-  }
   if (draft.primaryIdentifierVariable) {
+    const identifierIssue = primaryIdentifierProblem(draft.questions || [], draft.primaryIdentifierVariable);
+    if (identifierIssue) throw new Error(identifierIssue);
     draft.instanceName = instanceNameForPrimaryIdentifier(draft.primaryIdentifierVariable);
   }
   const respondentAccessCode = firstPublish
@@ -1306,18 +1428,23 @@ async function exportForm(payload) {
   if (existsSync(xls2xformBin)) {
     xmlResult = await runCommand(xls2xformBin, [xlsxPath, xmlPath]);
   }
-  if (firstPublish && xmlResult.code === 0) {
+  let xmlOk = xmlResult.code === 0 && existsSync(xmlPath);
+  if (xmlOk) {
+    await exposeStartGeopointsInXml(draft, xmlPath);
+    xmlOk = existsSync(xmlPath);
+  }
+  if (firstPublish && xmlOk) {
     draft.respondentAccessCode = respondentAccessCode;
     draft.publishedAt = draft.publishedAt || isoStamp();
     await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
   }
-  const terminology = xmlResult.code === 0 && existsSync(terminologyResultPath(outputDir))
+  const terminology = xmlOk && existsSync(terminologyResultPath(outputDir))
     ? await loadTerminology(workspaceId)
     : null;
 
   return {
-    ok: xmlResult.code === 0,
-    stage: xmlResult.code === 0 ? "complete" : "xml",
+    ok: xmlOk,
+    stage: xmlOk ? "complete" : "xml",
     outputDir,
     draftPath,
     xlsxPath,
@@ -1586,9 +1713,7 @@ async function readEntries(workspaceId) {
 async function saveEntriesCsv(workspaceId, draft, entries) {
   const { outputDir } = await requireWorkspace(workspaceId);
   const csvPath = path.join(outputDir, "data", `${slugify(draft.formId || draft.title)}_entries.csv`);
-  const headers = (draft.questions || [])
-    .filter((question) => question.type !== "note")
-    .map((question) => question.name);
+  const headers = dataHeadersForDraft(draft);
   const rows = [headers.map(csvEscape).join(",")];
   for (const entry of entries) {
     rows.push(headers.map((header) => csvEscape(entryValue(entry.answers?.[header]))).join(","));
@@ -1635,15 +1760,7 @@ function primaryIdentifierForDraft(draft) {
 }
 
 function mapperHeadersForDraft(draft) {
-  const seen = new Set();
-  return (draft.questions || [])
-    .filter((question) => question?.name && question.type !== "note")
-    .map((question) => String(question.name).trim())
-    .filter((name) => {
-      if (!name || seen.has(name)) return false;
-      seen.add(name);
-      return true;
-    });
+  return dataHeadersForDraft(draft);
 }
 
 async function saveMapperCsv(workspaceId, draft, entries) {
@@ -1861,6 +1978,13 @@ async function workspaceMeta(workspaceId) {
     try {
       draft = JSON.parse(await readFile(draftPath, "utf8"));
     } catch {}
+  }
+  if (draft && !xmlFiles.length && (draft.respondentAccessCode || draft.publicAccessCode || draft.publishedAt)) {
+    delete draft.respondentAccessCode;
+    delete draft.publicAccessCode;
+    delete draft.publishedAt;
+    draft.updatedAt = isoStamp();
+    await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
   }
   if (draft && xmlFiles.length && !draft.respondentAccessCode && !draft.publicAccessCode) {
     draft.respondentAccessCode = await generateUniqueRespondentAccessCode(cleanId);

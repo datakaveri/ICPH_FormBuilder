@@ -115,10 +115,17 @@ def _question_review_keys(question: dict[str, Any]) -> list[str]:
 def _approved_mappings_for_entity(entity: dict[str, Any]) -> list[dict[str, Any]]:
     if entity.get("validationStatus") == "unmapped_confirmed":
         return []
+    if entity.get("validationStatus") == "auto_approved":
+        return []
     approved = entity.get("approvedMappings")
     if isinstance(approved, list) and approved:
-        return [mapping for mapping in approved if isinstance(mapping, dict)]
-    if entity.get("validated") and entity.get("code"):
+        return [
+            mapping
+            for mapping in approved
+            if isinstance(mapping, dict)
+            and mapping.get("approvedVia") != "automatic_high_confidence_brute_search"
+        ]
+    if entity.get("validated") and entity.get("code") and entity.get("validationStatus") in {"selected", "replaced"}:
         return [entity]
     return []
 

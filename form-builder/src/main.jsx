@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Clock,
   ClipboardList,
   Copy,
   Download,
@@ -105,7 +106,7 @@ const QUESTION_TYPES = [
   { type: "file", label: "File", icon: Upload },
   { type: "barcode", label: "Barcode", icon: Upload },
   { type: "audit", label: "Audit", icon: Settings },
-  { type: "csv-external", label: "CSV External", icon: Upload },
+  { type: "timer", label: "Timer", icon: Clock },
   { type: "acknowledge", label: "Acknowledge", icon: Check },
   { type: "start", label: "Start Time", icon: Calendar },
   { type: "end", label: "End Time", icon: Calendar },
@@ -119,6 +120,33 @@ const QUESTION_TYPES = [
   { type: "calculate", label: "Calculate", icon: Settings }
 ];
 
+const STRUCTURAL_TYPE_HELP = {
+  begin_group: {
+    title: "Begin Group opens a section",
+    body: "Use this to start a visual section that contains the questions below it. Add a matching End Group after the last question in that section.",
+    xls: 'ODK XLS format: "type" column is "begin group". The "name" column identifies the section; the "label" column is the section title.',
+    warning: "If this section is not closed by an End Group row, XML export will fail."
+  },
+  end_group: {
+    title: "End Group closes the nearest open group",
+    body: "Use this immediately after the last question in a group. It does not collect an answer.",
+    xls: 'ODK XLS format: "type" column is "end group". End rows usually do not need a question name or display label.',
+    warning: "Only add this when there is an earlier Begin Group that has not already been closed."
+  },
+  begin_repeat: {
+    title: "Begin Repeat opens a repeatable section",
+    body: "Use this when the respondent may enter the same set of questions multiple times, such as one row per visit, medication, or pregnancy.",
+    xls: 'ODK XLS format: "type" column is "begin repeat". The "name" column identifies the repeat block; optional Repeat Count controls how many copies are created.',
+    warning: "Every Begin Repeat must have a later End Repeat. Otherwise pyxform reports: Unmatched begin_repeat."
+  },
+  end_repeat: {
+    title: "End Repeat closes the nearest open repeat",
+    body: "Use this immediately after the last question that belongs inside the repeat. It does not collect an answer.",
+    xls: 'ODK XLS format: "type" column is "end repeat". End rows usually do not need a question name or display label.',
+    warning: "Only add this when there is an earlier Begin Repeat that has not already been closed."
+  }
+};
+
 const NON_REQUIRED_TYPES = new Set([
   "note",
   "calculate",
@@ -128,6 +156,7 @@ const NON_REQUIRED_TYPES = new Set([
   "begin_repeat",
   "end_repeat",
   "csv-external",
+  "timer",
   "start",
   "end",
   "today",
@@ -160,24 +189,94 @@ function instanceNameForPrimaryIdentifier(primaryIdentifierVariable) {
   return `concat(\${${variable}}, ' - ', format-date-time(now(), '%Y-%m-%d %H:%M:%S'))`;
 }
 
+const TIMER_MODES = [
+  {
+    value: "open_submit",
+    label: "Form opens -> submit",
+    description: "Starts when the respondent opens the form and stops when they submit it."
+  },
+  {
+    value: "first_input_submit",
+    label: "First answer -> submit",
+    description: "Starts when the respondent first types, selects, or changes any answer and stops on submit."
+  },
+  {
+    value: "manual",
+    label: "Respondent start/stop",
+    description: "Shows Start and Stop buttons. If the respondent starts but forgets to stop, submission time is used as the stop time."
+  }
+];
+
+function normalizeTimerConfig(config = {}) {
+  const mode = TIMER_MODES.some((item) => item.value === config.mode) ? config.mode : "open_submit";
+  return {
+    mode,
+    showToRespondent: mode === "manual" ? true : Boolean(config.showToRespondent)
+  };
+}
+
+function timerFieldNames(question = {}) {
+  const base = slug(question.name || question.id || "timer");
+  return {
+    start: `${base}_start`,
+    end: `${base}_end`,
+    duration: `${base}_duration_seconds`
+  };
+}
+
+function timerQuestions(form = {}) {
+  return (form.questions || []).filter((question) => question.type === "timer" && String(question.name || "").trim());
+}
+
+function timerGeneratedQuestions(question = {}) {
+  const names = timerFieldNames(question);
+  const label = question.label || question.name || "Timer";
+  return [
+    { id: `${question.id || names.start}:start`, type: "dateTime", name: names.start, label: `${label} start time`, generatedFromTimer: question.name || question.id },
+    { id: `${question.id || names.end}:end`, type: "dateTime", name: names.end, label: `${label} end time`, generatedFromTimer: question.name || question.id },
+    { id: `${question.id || names.duration}:duration`, type: "integer", name: names.duration, label: `${label} duration seconds`, generatedFromTimer: question.name || question.id }
+  ];
+}
+
+function dataExportQuestions(form = {}) {
+  const rows = [];
+  for (const question of form.questions || []) {
+    if (question.type === "timer") {
+      rows.push(...timerGeneratedQuestions(question));
+      continue;
+    }
+    rows.push(question);
+  }
+  return rows;
+}
+
 function newQuestion(type, index) {
   const id = crypto.randomUUID();
+  const isEndStructural = type === "end_group" || type === "end_repeat";
+  const structuralLabel = STRUCTURAL_TYPE_HELP[type]?.title;
+  const locationDefaults = {
+    geopoint: { label: "Choose a location point", appearance: "placement-map", parameters: "" },
+    geotrace: { label: "Draw or capture a route", appearance: "" },
+    geoshape: { label: "Draw or capture an area", appearance: "" },
+    "start-geopoint": { label: "Capture start location automatically", appearance: "" }
+  };
+  const locationDefault = locationDefaults[type] || {};
   const base = {
     id,
     type,
-    name: `q${index + 1}`,
-    label: type === "note" ? "Instruction note" : "Untitled question",
+    name: isEndStructural ? "" : type === "timer" ? `timer_${index + 1}` : `q${index + 1}`,
+    label: isEndStructural ? "" : type === "timer" ? "Form timer" : type === "note" ? "Instruction note" : structuralLabel || locationDefault.label || "Untitled question",
     hint: "",
     required: !NON_REQUIRED_TYPES.has(type),
     relevant: "",
-    appearance: "",
+    appearance: locationDefault.appearance || "",
     defaultValue: "",
     constraint: "",
     constraintMessage: "",
     calculation: "",
     trigger: "",
     choiceFilter: "",
-    parameters: "",
+    parameters: locationDefault.parameters || "",
     repeatCount: "",
     requiredExpression: "",
     readOnlyExpression: "",
@@ -191,14 +290,21 @@ function newQuestion(type, index) {
     bigImage: "",
     extraColumns: {},
     logicBuilders: {},
+    timerConfig: normalizeTimerConfig(),
     readOnly: type === "calculate"
   };
   if (type === "select_one" || type === "select_multiple" || type === "rank") {
     base.listName = `q${index + 1}_choices`;
-    base.options = [
-      { id: crypto.randomUUID(), name: "0", label: "No" },
-      { id: crypto.randomUUID(), name: "1", label: "Yes" }
-    ];
+    base.options = type === "rank"
+      ? [
+          { id: crypto.randomUUID(), name: "item_1", label: "Item 1" },
+          { id: crypto.randomUUID(), name: "item_2", label: "Item 2" },
+          { id: crypto.randomUUID(), name: "item_3", label: "Item 3" }
+        ]
+      : [
+          { id: crypto.randomUUID(), name: "0", label: "No" },
+          { id: crypto.randomUUID(), name: "1", label: "Yes" }
+        ];
   }
   if (type === "select_one_from_file" || type === "select_multiple_from_file") {
     base.listName = "choices.csv";
@@ -222,11 +328,36 @@ function questionTypePatch(question, nextType) {
   } else if (currentType === "calculate") {
     patch.readOnly = false;
   }
+  if (nextType === "timer") {
+    patch.required = false;
+    patch.readOnly = false;
+    patch.name = question?.name?.startsWith("timer_") ? question.name : `timer_${Date.now().toString().slice(-5)}`;
+    patch.label = question?.label && question.label !== "Untitled question" ? question.label : "Form timer";
+    patch.timerConfig = normalizeTimerConfig(question?.timerConfig);
+  }
+  if (nextType === "geopoint") {
+    patch.appearance = question?.appearance || "placement-map";
+    patch.parameters = question?.parameters || "";
+  } else if (nextType === "geotrace" || nextType === "geoshape") {
+    patch.appearance = question?.appearance || "";
+  }
+  if (nextType === "start-geopoint") {
+    patch.required = false;
+    patch.appearance = "";
+  } else if (currentType === "start-geopoint") {
+    patch.readOnly = false;
+  }
   if (nextType === "select_one" || nextType === "select_multiple" || nextType === "rank") {
     patch.listName = question?.listName || `${question?.name || "q"}_choices`;
     patch.options = question?.options?.length
       ? question.options
-      : [
+      : nextType === "rank"
+        ? [
+            { id: crypto.randomUUID(), name: "item_1", label: "Item 1" },
+            { id: crypto.randomUUID(), name: "item_2", label: "Item 2" },
+            { id: crypto.randomUUID(), name: "item_3", label: "Item 3" }
+          ]
+        : [
           { id: crypto.randomUUID(), name: "0", label: "No" },
           { id: crypto.randomUUID(), name: "1", label: "Yes" }
         ];
@@ -410,22 +541,140 @@ function relevantLogicIssues(form, question, label) {
   return [`${prefix}: ${contradictions[0]}`];
 }
 
+function defaultValueIssue(question = {}) {
+  const value = String(question.defaultValue || "").trim();
+  if (!value) return "";
+  const type = question.type || "";
+  if (["integer", "decimal", "range"].includes(type)) {
+    if (/today\(\)|now\(\)/.test(value)) return `${question.name}: numeric questions cannot use today() or now() as a default.`;
+    if (!isExpressionLike(value) && Number.isNaN(Number(value))) return `${question.name}: default must be numeric.`;
+  }
+  if (type === "date" && /now\(\)/.test(value)) return `${question.name}: date questions should use a date value or today(), not now().`;
+  if (type === "time" && /today\(\)/.test(value)) return `${question.name}: time questions cannot use today() as a default.`;
+  if ((type === "geopoint" || type === "start-geopoint") && !isExpressionLike(value)) {
+    const parts = value.split(/\s+/).filter(Boolean);
+    const numericParts = parts.map(Number);
+    if (parts.length < 2 || numericParts.some((part) => Number.isNaN(part))) {
+      return `${question.name}: location point default must use ODK geopoint format: latitude longitude altitude accuracy.`;
+    }
+    if (numericParts[0] < -90 || numericParts[0] > 90 || numericParts[1] < -180 || numericParts[1] > 180) {
+      return `${question.name}: location point default latitude/longitude is outside valid bounds.`;
+    }
+  }
+  return "";
+}
+
+function primaryIdentifierIssue(form = {}) {
+  const selected = String(form.primaryIdentifierVariable || "").trim();
+  if (!selected) return "";
+  const question = primaryIdentifierCandidateRows(form).find((item) => item.name === selected || item.question?.name === selected);
+  if (question) {
+    if (question.inRepeat) return `Primary identifier "${selected}" is inside a repeat. Choose an identifier question outside repeat sections.`;
+    if (STRUCTURAL_TYPES.has(question.type)) return `Primary identifier "${selected}" is a group/repeat structure row. Choose an answer question outside the repeat instead.`;
+    if (!RESPONDENT_INPUT_TYPES.has(question.type)) return `Primary identifier "${selected}" is not a respondent answer question. Choose a named answer question instead.`;
+    return "";
+  }
+  return `Primary identifier "${selected}" is not present in this form.`;
+}
+
+function primaryIdentifierCandidateRows(form = {}) {
+  const rows = [];
+  let repeatDepth = 0;
+  for (const question of form.questions || []) {
+    const type = String(question.type || "").trim().replace(/\s+/g, "_");
+    if (type === "end_repeat") repeatDepth = Math.max(0, repeatDepth - 1);
+    const name = String(question.name || "").trim();
+    if (name) {
+      rows.push({
+        name,
+        type,
+        label: question.label || question.name,
+        inRepeat: repeatDepth > 0,
+        eligible: repeatDepth === 0 && RESPONDENT_INPUT_TYPES.has(type) && !STRUCTURAL_TYPES.has(type),
+        question
+      });
+    }
+    if (type === "begin_repeat") repeatDepth += 1;
+  }
+  return rows;
+}
+
+function primaryIdentifierCandidatesForForm(form = {}) {
+  return primaryIdentifierCandidateRows(form)
+    .filter((row) => row.eligible)
+    .map(({ name, type, label }) => ({ name, type, label }));
+}
+
+function validateStructuralPairing(questions = []) {
+  const issues = [];
+  const stack = [];
+  const openTypes = new Map([
+    ["begin_group", "end_group"],
+    ["begin_repeat", "end_repeat"]
+  ]);
+  const closeTypes = new Map([
+    ["end_group", "begin_group"],
+    ["end_repeat", "begin_repeat"]
+  ]);
+
+  for (const [index, question] of questions.entries()) {
+    const type = question.type;
+    const rowLabel = question.name || question.label || `row ${index + 1}`;
+    if (openTypes.has(type)) {
+      stack.push({ type, question, index });
+      continue;
+    }
+    if (!closeTypes.has(type)) continue;
+    const expectedOpen = closeTypes.get(type);
+    if (!stack.length) {
+      issues.push(`${questionTypeLabel(type)} at row ${index + 1} has no earlier matching ${questionTypeLabel(expectedOpen)}.`);
+      continue;
+    }
+    const open = stack[stack.length - 1];
+    if (open.type !== expectedOpen) {
+      issues.push(`${questionTypeLabel(type)} at row ${index + 1} is closing the wrong block. Close ${questionTypeLabel(open.type)} '${open.question.name || open.question.label || `row ${open.index + 1}`}' first.`);
+      continue;
+    }
+    stack.pop();
+  }
+
+  for (const open of stack.reverse()) {
+    const closeType = openTypes.get(open.type);
+    issues.push(`${questionTypeLabel(open.type)} '${open.question.name || open.question.label || `row ${open.index + 1}`}' at row ${open.index + 1} needs a matching ${questionTypeLabel(closeType)} later in the form.`);
+  }
+  return issues;
+}
+
 function validateForm(form) {
   const issues = [];
   if (!form.title?.trim()) issues.push("Form title is required.");
   if (!form.formId?.trim()) issues.push("Form ID is required.");
+  if (!(form.questions || []).length) issues.push("Add at least one question before finishing Build.");
+  const primaryIssue = primaryIdentifierIssue(form);
+  if (primaryIssue) issues.push(primaryIssue);
+  if ((form.questions || []).length && !form.primaryIdentifierVariable && !primaryIdentifierCandidatesForForm(form).length) {
+    issues.push("Add at least one named respondent answer question outside repeats so it can be used as the Primary Identifier Variable before publishing. Passive rows such as note, calculate, timer, and device metadata cannot identify a respondent.");
+  }
   const seenNames = new Set();
   for (const [index, question] of (form.questions || []).entries()) {
     const label = question.label || `Question ${index + 1}`;
-    if (!question.name?.trim()) issues.push(`${label}: name is required.`);
-    const normalized = slug(question.name);
-    if (normalized !== question.name) issues.push(`${label}: name should be XLSForm-safe, suggested: ${normalized}.`);
-    if (seenNames.has(question.name)) issues.push(`${label}: duplicate question name '${question.name}'.`);
-    seenNames.add(question.name);
-    if (!question.label?.trim()) issues.push(`${question.name}: label is required.`);
+    const isEndStructural = END_STRUCTURAL_TYPES.has(question.type);
+    if (!isEndStructural && !question.name?.trim()) issues.push(`${label}: name is required.`);
+    if (question.name?.trim()) {
+      const normalized = slug(question.name);
+      if (normalized !== question.name) issues.push(`${label}: name should be XLSForm-safe, suggested: ${normalized}.`);
+      if (seenNames.has(question.name)) issues.push(`${label}: duplicate question name '${question.name}'.`);
+      seenNames.add(question.name);
+    }
+    if (!isEndStructural && !question.label?.trim()) issues.push(`${question.name}: label is required.`);
     if (question.type === "calculate" && !question.calculation?.trim()) {
       issues.push(`${question.name}: calculate questions need a calculation expression.`);
     }
+    if (question.trigger?.trim() && !question.calculation?.trim()) {
+      issues.push(`${question.name}: trigger can only be used with a calculated value.`);
+    }
+    const defaultIssue = defaultValueIssue(question);
+    if (defaultIssue) issues.push(defaultIssue);
     issues.push(...relevantLogicIssues(form, question, label));
     if (question.type === "select_one" || question.type === "select_multiple" || question.type === "rank") {
       if (!question.listName?.trim()) issues.push(`${question.name}: list name is required.`);
@@ -456,6 +705,7 @@ function validateForm(form) {
       }
     }
   }
+  issues.push(...validateStructuralPairing(form.questions || []));
   return issues;
 }
 
@@ -546,7 +796,11 @@ function computeCalculatedAnswers(form, answers) {
 
 function visibleQuestions(form, answers) {
   const calculated = computeCalculatedAnswers(form, answers);
-  return (form.questions || []).filter((question) => isQuestionVisible(question, calculated));
+  return (form.questions || []).filter((question) => (
+    !STRUCTURAL_TYPES.has(question.type) &&
+    !NON_DISPLAY_TYPES.has(question.type) &&
+    isQuestionVisible(question, calculated)
+  ));
 }
 
 function validateAnswers(form, answers) {
@@ -680,13 +934,6 @@ function formResourceRequirements(form, attachmentNames = []) {
         requiredBecause: `${question.type} uses an external choices file`
       });
     }
-    if (question.type === "csv-external") {
-      addRequirement(question, {
-        column: "name",
-        fileName: `${question.name}.csv`,
-        requiredBecause: "csv-external expects a CSV attachment named after the question"
-      });
-    }
     for (const column of ["image", "audio", "video", "bigImage"]) {
       if (question[column]) {
         addRequirement(question, {
@@ -793,6 +1040,7 @@ function normalizeFormDraft(draft) {
       bigImage: question.bigImage || question["big-image"] || "",
       extraColumns: question.extraColumns && typeof question.extraColumns === "object" ? question.extraColumns : {},
       logicBuilders: question.logicBuilders && typeof question.logicBuilders === "object" ? question.logicBuilders : {},
+      timerConfig: normalizeTimerConfig(question.timerConfig),
       readOnly: booleanColumnTrue(question.readOnly),
       listName: question.listName || "",
       options: Array.isArray(question.options)
@@ -851,6 +1099,9 @@ function xformInputType(bindType) {
   if (type === "date") return "date";
   if (type === "time") return "time";
   if (type === "datetime" || type === "datetime-local" || type === "dateTime".toLowerCase()) return "dateTime";
+  if (type === "geopoint") return "geopoint";
+  if (type === "geotrace") return "geotrace";
+  if (type === "geoshape") return "geoshape";
   if (type === "binary") return "file";
   return "text";
 }
@@ -956,12 +1207,14 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
     };
   });
 
+  const hiddenTimerQuestions = (fallbackDraft.questions || []).filter((question) => question.type === "timer");
+
   return normalizeFormDraft({
     ...fallbackDraft,
     title,
     formId,
     version,
-    questions,
+    questions: [...questions, ...hiddenTimerQuestions],
     source: "published_xml"
   });
 }
@@ -990,7 +1243,9 @@ function InfoButton({ label, children }) {
 
 const STRUCTURAL_TYPES = new Set(["begin_group", "end_group", "begin_repeat", "end_repeat"]);
 const END_STRUCTURAL_TYPES = new Set(["end_group", "end_repeat"]);
-const PASSIVE_TYPES = new Set(["note", "calculate", "csv-external", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email"]);
+const LOCATION_TYPES = new Set(["geopoint", "geotrace", "geoshape", "start-geopoint"]);
+const DRAWN_LOCATION_TYPES = new Set(["geopoint", "geotrace", "geoshape"]);
+const PASSIVE_TYPES = new Set(["note", "calculate", "csv-external", "timer", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email"]);
 const RESPONDENT_INPUT_TYPES = new Set([
   "text",
   "integer",
@@ -1007,7 +1262,6 @@ const RESPONDENT_INPUT_TYPES = new Set([
   "geopoint",
   "geotrace",
   "geoshape",
-  "start-geopoint",
   "image",
   "audio",
   "video",
@@ -1015,9 +1269,10 @@ const RESPONDENT_INPUT_TYPES = new Set([
   "barcode",
   "acknowledge"
 ]);
-const MEDIA_PROMPT_EXCLUDED_TYPES = new Set(["end_group", "end_repeat", "calculate", "hidden", "csv-external", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email"]);
+const MEDIA_PROMPT_EXCLUDED_TYPES = new Set(["end_group", "end_repeat", "calculate", "hidden", "csv-external", "timer", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email"]);
 const PARAMETER_TYPES = new Set(["range", "image", "audio", "video", "background-audio", "file", "barcode"]);
 const CALCULATION_TYPES = new Set(["text", "integer", "decimal", "date", "time", "dateTime", "range", "hidden", "calculate"]);
+const NON_DISPLAY_TYPES = new Set(["calculate", "hidden", "csv-external", "timer", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email", "background-audio"]);
 
 function hasColumnValue(question, ...fields) {
   return fields.some((field) => String(question?.[field] || "").trim());
@@ -1032,15 +1287,15 @@ function canValidateAnswer(question) {
 }
 
 function canDefaultQuestion(question) {
-  return !STRUCTURAL_TYPES.has(question.type) && !["note", "calculate", "csv-external", "audit", "background-audio"].includes(question.type);
+  return !STRUCTURAL_TYPES.has(question.type) && !["note", "calculate", "csv-external", "timer", "audit", "background-audio"].includes(question.type);
 }
 
 function canUseTrigger(question) {
-  return canDefaultQuestion(question) || canUseCalculation(question);
+  return canUseCalculation(question) || hasColumnValue(question, "trigger");
 }
 
 function canUseAppearance(question) {
-  return !["end_group", "end_repeat", "calculate", "hidden", "csv-external", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email"].includes(question.type);
+  return !["end_group", "end_repeat", "calculate", "hidden", "csv-external", "timer", "audit", "start", "end", "today", "deviceid", "username", "phonenumber", "email"].includes(question.type);
 }
 
 function canUseParameters(question) {
@@ -1072,7 +1327,7 @@ function columnInfoText(column) {
     default: "Pre-fills an answer when the form entry is first created. Example: default today's date for a visit date question.",
     appearance: "Changes how a question looks. Example: autocomplete makes a long select list searchable.",
     parameters: "Extra settings for certain question widgets. Example: range can use start=0 end=100 step=5.",
-    trigger: "Recalculates a calculated/default value when another answer changes. Example: update diagnosis age when current age changes.",
+    trigger: "Recalculates this row's calculated value when another visible answer changes. Example: update diagnosis age when current age changes.",
     choice_filter: "Filters a select list using an earlier answer. Example: show only facilities from the selected district.",
     repeat_count: "Sets how many repeat groups are created. Example: repeat child details once for each child count.",
     note: "Designer note carried in the XLSForm survey sheet. This is useful for local review notes and imported templates.",
@@ -1082,7 +1337,7 @@ function columnInfoText(column) {
     "big-image": "A larger image shown with the question label. Example: body_map.png.",
     audio: "An audio prompt shown with the question. Example: consent_audio.mp3.",
     video: "A video prompt shown with the question. Example: inhaler_demo.mp4.",
-    calculation: "Computes or prefills a value from earlier answers. For visible questions, combine it with a trigger and optionally mark read-only."
+    calculation: "Computes or prefills a value. Add a trigger only when this calculated value should update after another answer changes."
   };
   return info[column] || "This controls the corresponding XLSForm column.";
 }
@@ -1170,9 +1425,11 @@ function normalizeApprovedMapping(mapping = {}) {
 
 function approvedMappingsForEntity(entity = {}) {
   const source = entity || {};
+  if (source.validationStatus === "auto_approved") return [];
   return (Array.isArray(source.approvedMappings) ? source.approvedMappings : [])
     .map(normalizeApprovedMapping)
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((mapping) => mapping.approvedVia !== "automatic_high_confidence_brute_search");
 }
 
 function candidateMappingsForEntity(entity = {}) {
@@ -1198,8 +1455,10 @@ function candidateMappingsForEntity(entity = {}) {
 }
 
 function entityReviewComplete(entity = {}) {
+  if (entity.validationStatus === "auto_approved") return false;
   return Boolean(
     entity.validationStatus === "unmapped_confirmed" ||
+    ["selected", "replaced"].includes(entity.validationStatus) ||
     approvedMappingsForEntity(entity).length > 0
   );
 }
@@ -1273,12 +1532,12 @@ function csvEscape(value) {
 
 function entryCsvQuestions(form = {}) {
   const seen = new Set();
-  return (form.questions || [])
+  return dataExportQuestions(form)
     .filter((question) => {
       const name = String(question?.name || "").trim();
       if (!name || seen.has(name)) return false;
       if (STRUCTURAL_TYPES.has(question.type)) return false;
-      if (["note", "csv-external", "audit", "background-audio"].includes(question.type)) return false;
+      if (["note", "csv-external", "timer", "audit", "background-audio"].includes(question.type)) return false;
       seen.add(name);
       return true;
     });
@@ -1431,7 +1690,10 @@ function manualEntityQuestionDetails(question = {}, form = {}) {
 }
 
 function terminologyQuestionText(question = {}, form = {}) {
-  return manualEntityQuestionDetails(question, form).map((item) => item.value).join(" ");
+  return manualEntityQuestionDetails(question, form)
+    .filter((item) => item.label !== "Question name")
+    .map((item) => item.value)
+    .join(" ");
 }
 
 function unmatchedManualEntityWords(entityText, question = {}, form = {}) {
@@ -1441,6 +1703,11 @@ function unmatchedManualEntityWords(entityText, question = {}, form = {}) {
 
 function manualEntityKey(value) {
   return terminologyWords(value).join(" ");
+}
+
+function isStructuralQuestion(question = {}) {
+  const type = String(question.type || "").trim().replace(/\s+/g, "_");
+  return STRUCTURAL_TYPES.has(type);
 }
 
 function entitySourceLabel(entity = {}) {
@@ -1456,8 +1723,7 @@ const ENTITY_SOURCE_LEGEND = [
   { key: "hint", label: "Question hint", emoji: "💡" },
   { key: "guidance_hint", label: "Guidance hint", emoji: "🧭" },
   { key: "option", label: "Option/choice", emoji: "☑️" },
-  { key: "name", label: "Question name", emoji: "🏷️" },
-  { key: "manual", label: "Manual entry", emoji: "✍️" },
+  { key: "manual", label: "Added by admin", emoji: "✍️" },
   { key: "unknown", label: "Source not recorded", emoji: "•" }
 ];
 
@@ -1547,8 +1813,14 @@ class AppErrorBoundary extends React.Component {
   }
 }
 
-function isWorkspaceLocked(workspace, form) {
+function isWorkspaceLocked(workspace, form, issues = []) {
   const stage = String(workspace?.pipelineStage || "").toLowerCase();
+  const buildFinishedWithFixableIssues = Boolean(
+    (form?.buildFinishedAt || workspace?.buildFinishedAt) &&
+    !hasPublishedForm(workspace) &&
+    issues.length
+  );
+  if (buildFinishedWithFixableIssues) return false;
   return Boolean(
     form?.buildFinishedAt ||
     workspace?.buildFinishedAt ||
@@ -1686,9 +1958,11 @@ function AccessLanding({ message = "", onAuthenticated }) {
     <div className="access-shell">
       <main className="access-card">
         <div className="access-head">
+          <div>
+            <h1>ICPH Forms</h1>
+            <p>Choose how you want to continue.</p>
+          </div>
           <img className="access-logo" src={cdpgLogo} alt="CDPG" />
-          <h1>ICPH Forms</h1>
-          <p>Choose how you want to continue.</p>
         </div>
 
         <div className="access-role-tabs" aria-label="Choose access type">
@@ -1808,9 +2082,11 @@ function RespondentPortal({ initialCode = "" }) {
     <div className="access-shell respondent-only">
       <main className="access-card respondent-code-card">
         <div className="access-head">
+          <div>
+            <h1>ICPH Form</h1>
+            <p>Enter the form code shared by the study team.</p>
+          </div>
           <img className="access-logo" src={cdpgLogo} alt="CDPG" />
-          <h1>ICPH Form</h1>
-          <p>Enter the form code shared by the study team.</p>
         </div>
         <form className="respondent-code-form" onSubmit={submitCode}>
           <label className="field">
@@ -2181,13 +2457,7 @@ function DashboardApp({ onLogout }) {
   }
 
   function primaryIdentifierCandidates(sourceForm = form) {
-    return (sourceForm.questions || [])
-      .filter((question) => String(question.name || "").trim())
-      .map((question) => ({
-        name: question.name,
-        type: question.type,
-        label: question.label || question.name
-      }));
+    return primaryIdentifierCandidatesForForm(sourceForm);
   }
 
   function publishConfirmationMessage() {
@@ -2248,6 +2518,7 @@ function DashboardApp({ onLogout }) {
     const explicitPrimaryIdentifier = typeof primaryIdentifierVariable === "string" ? primaryIdentifierVariable : "";
     const selectedPrimaryIdentifier = String(explicitPrimaryIdentifier || form.primaryIdentifierVariable || "").trim();
     const linkedToMetaForm = Boolean(form.metaFormLink?.fileName);
+    const identifierCandidates = primaryIdentifierCandidates();
     if (!alreadyPublished && !selectedPrimaryIdentifier) {
       if (linkedToMetaForm) {
         setStatus({
@@ -2256,13 +2527,26 @@ function DashboardApp({ onLogout }) {
         });
         return;
       }
-      if (!primaryIdentifierCandidates().length) {
-        setStatus({ kind: "error", message: "Add at least one named question before moving to Publish." });
+      if (!identifierCandidates.length) {
+        setStatus({ kind: "error", message: "Add at least one named answer question outside repeats before moving to Publish." });
         return;
       }
       setPublishConfirmationAccepted(true);
       setPublishIdentifierPrompt(true);
       return;
+    }
+    if (!alreadyPublished && selectedPrimaryIdentifier) {
+      const identifierIssue = primaryIdentifierIssue({ ...form, primaryIdentifierVariable: selectedPrimaryIdentifier });
+      if (identifierIssue) {
+        if (!identifierCandidates.length) {
+          setStatus({ kind: "error", message: identifierIssue });
+          return;
+        }
+        setStatus({ kind: "error", message: identifierIssue });
+        setPublishConfirmationAccepted(true);
+        setPublishIdentifierPrompt(true);
+        return;
+      }
     }
 	    const formForExport = selectedPrimaryIdentifier
 	      ? {
@@ -2519,7 +2803,7 @@ function DashboardApp({ onLogout }) {
             entity: entityText,
             originalEntity: entityText,
             sourceComponent: "manual",
-            sourceLabel: "Manual entry",
+            sourceLabel: "Added by admin",
             sourceText: entityText,
             sourceQuestion: question.name || question.id || "",
             decompositionMethod: "ui_manual_entity",
@@ -2535,7 +2819,7 @@ function DashboardApp({ onLogout }) {
               confidence: "Manual",
               source_question: question.name || question.id || "",
               source_component: "manual",
-              source_label: "Manual entry",
+              source_label: "Added by admin",
               source_text: entityText,
               review_note: "Admin manually added this entity from the Terminology tab."
             },
@@ -3674,8 +3958,11 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
 }
 
 function PublishIdentifierModal({ form, candidates, status, onCancel, onPublish }) {
-  const [primaryIdentifierVariable, setPrimaryIdentifierVariable] = useState(form.primaryIdentifierVariable || candidates[0]?.name || "");
-  const canPublish = primaryIdentifierVariable && status.kind !== "busy";
+  const initialPrimaryIdentifier = candidates.some((candidate) => candidate.name === form.primaryIdentifierVariable)
+    ? form.primaryIdentifierVariable
+    : candidates[0]?.name || "";
+  const [primaryIdentifierVariable, setPrimaryIdentifierVariable] = useState(initialPrimaryIdentifier);
+  const canPublish = candidates.some((candidate) => candidate.name === primaryIdentifierVariable) && status.kind !== "busy";
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -3777,7 +4064,7 @@ function BuilderPage(props) {
     refreshEntries,
     onLogout
   } = props;
-	  const locked = isWorkspaceLocked(workspace, form);
+	  const locked = isWorkspaceLocked(workspace, form, issues);
 	  const published = hasPublishedForm(workspace);
 	  const buildFinished = hasFinishedBuild(workspace, form);
 	  const currentStage = activeStage === "fhir"
@@ -4107,12 +4394,25 @@ function BuilderFooter({
 	}) {
 	  const missingResources = resourceRequirements.some((item) => !item.uploaded);
 	  const busy = status.kind === "busy";
+  const publishDisabledReason = !published && activeStage === "terminology"
+    ? !buildFinished
+      ? "Click Build Finished before moving to Publish."
+      : issues.length > 0
+        ? `Fix ${issues.length} validation issue${issues.length === 1 ? "" : "s"} before moving to Publish.`
+        : reviewIssue
+          ? reviewIssue
+          : isCopiedVersionDraft && !copiedVersionHasChanges
+            ? "Edit at least one Build item before this new version can be published."
+            : ""
+    : "";
 	  const footerMessage = activeStage === "terminology" && reviewIssue
 	    ? reviewIssue
+      : publishDisabledReason
+        ? publishDisabledReason
 	    : isCopiedVersionDraft && !copiedVersionHasChanges
 	      ? "Edit at least one Build item before this new version can be published."
 	      : status.message || "Ready";
-	  const footerKind = activeStage === "terminology" && reviewIssue ? "error" : status.kind;
+	  const footerKind = activeStage === "terminology" && (reviewIssue || publishDisabledReason) ? "error" : status.kind;
 	  return (
 	    <footer className="builder-footer" aria-label="Page actions">
 	      <div className={`footer-status ${footerKind}`}>
@@ -4388,7 +4688,7 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, s
 }
 
 function TerminologyPanel({ form, workspace, terminology = {}, status, runTerminologyExtraction, replaceTerminologyMapping, addTerminologyEntity, reviewIssue, locked = false }) {
-  const questions = Array.isArray(terminology.questions) ? terminology.questions : [];
+  const questions = (Array.isArray(terminology.questions) ? terminology.questions : []).filter((question) => !isStructuralQuestion(question));
   const questionsWithEntities = questions.filter((question) => Array.isArray(question.entities) && question.entities.length > 0);
   const questionsWithoutEntities = questions.filter((question) => !Array.isArray(question.entities) || question.entities.length === 0);
   const entityCount = terminology.entityCount ?? questions.reduce((sum, question) => sum + (question.entities?.length || 0), 0);
@@ -4412,7 +4712,10 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
     [questions]
   );
   const manualEntityQuestion = useMemo(
-    () => questions.find((question) => String(question.id || question.name) === manualEntityQuestionId || String(question.name || "") === manualEntityQuestionId) || null,
+    () => {
+      if (!manualEntityQuestionId) return null;
+      return questions.find((question) => String(question.id || question.name) === manualEntityQuestionId || String(question.name || "") === manualEntityQuestionId) || null;
+    },
     [questions, manualEntityQuestionId]
   );
   const manualEntityUnmatchedWords = useMemo(
@@ -4537,6 +4840,7 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
 
   function openManualEntityDialog(question) {
     if (reviewLocked) return;
+    if (isStructuralQuestion(question)) return;
     setManualEntityQuestionId(String(question.id || question.name));
     setManualEntityText("");
     setManualEntityStatus({ kind: "idle", message: "" });
@@ -4686,9 +4990,7 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
 		                        const questionId = String(question.id || question.name);
 		                        const active = activeSelection?.questionId === questionId && activeSelection?.entityIndex === index;
 		                        const selectedVocabulary = active ? activeVocabulary : vocabularyKey(entity.terminology);
-		                        const currentVocabulary = entity.code ? vocabularyOption(entity.terminology) : null;
 		                        const approvedMappings = approvedMappingsForEntity(entity);
-		                        const candidateMappings = candidateMappingsForEntity(entity);
 		                        const reviewed = entityReviewComplete(entity);
                             const sourceLegend = entitySourceLegendItem(entity);
 		                        return (
@@ -4696,54 +4998,34 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
 		                            className={`entity-card ${active ? "active" : ""} ${reviewed ? "validated" : ""}`}
 		                            key={`${question.id || question.name}_${index}`}
 		                          >
-                                <span className="entity-source-emoji" title={sourceLegend.label} aria-label={sourceLegend.label}>
-                                  {sourceLegend.emoji}
-                                </span>
+                                <div className="entity-card-meta">
+                                  <span className={`entity-card-status ${reviewed ? "reviewed" : "pending"}`}>
+                                    {reviewed ? "reviewed" : "pending"}
+                                  </span>
+                                  <span className="entity-source-emoji" title={sourceLegend.label} aria-label={sourceLegend.label}>
+                                    {sourceLegend.emoji}
+                                  </span>
+                                </div>
 		                            <button
 		                              type="button"
 	                              className="entity-card-main"
 	                              onClick={() => openEntityReview(question, entity, index, selectedVocabulary)}
 		                            >
 		                              <strong>{entity.entity}</strong>
-		                              {entity.code ? <span>{currentVocabulary?.label || entity.terminology}: {entity.code}</span> : <span>unmapped</span>}
 		                              {entity.term ? <em>{entity.term}</em> : null}
 		                            </button>
-		                            {approvedMappings.length ? (
-		                              <div className="entity-approved-badges" aria-label="Approved vocabulary matches">
-		                                {approvedMappings.slice(0, 3).map((mapping) => (
-		                                  <span key={approvedMappingKey(mapping)}>{mapping.vocabularyLabel}: {mapping.code}</span>
-		                                ))}
-		                                {approvedMappings.length > 3 ? <span>+{approvedMappings.length - 3} more</span> : null}
-		                              </div>
-		                            ) : null}
-		                            {candidateMappings.length ? (
-		                              <div className="entity-candidate-badges" aria-label="Brute search vocabulary candidates">
-		                                <span>{candidateMappings.length} brute candidate{candidateMappings.length === 1 ? "" : "s"}</span>
-		                                {[...new Set(candidateMappings.map((mapping) => mapping.vocabularyLabel).filter(Boolean))].slice(0, 4).map((label) => (
-		                                  <span key={label}>{label}</span>
-		                                ))}
-		                              </div>
-		                            ) : null}
-		                            <div className="entity-vocabulary-row">
-		                              <label>
-		                                <span>Review vocabulary</span>
-	                                <select
-	                                  value={selectedVocabulary}
-                                    disabled={reviewLocked}
-	                                  onChange={(event) => openEntityReview(question, entity, index, event.target.value)}
-	                                >
-	                                  {VOCABULARY_OPTIONS.map((option) => {
-	                                    const isCurrent = entity.code && currentVocabulary?.id === option.id;
-	                                    return (
-	                                      <option key={option.id} value={option.id}>
-	                                        {isCurrent ? "Selected: " : ""}{option.label}
-	                                      </option>
-	                                    );
-		                                  })}
-		                                </select>
-		                              </label>
-		                              {reviewed ? <span className="entity-validation">reviewed</span> : <span className="entity-validation pending">pending</span>}
-		                            </div>
+                                {approvedMappings.length ? (
+                                  <div className="entity-approved-summary" aria-label="Approved vocabulary matches">
+                                    {approvedMappings.slice(0, 3).map((mapping) => (
+                                      <span key={approvedMappingKey(mapping)}>
+                                        <strong>{mapping.vocabularyLabel}</strong>
+                                        {mapping.display || mapping.term ? `: ${mapping.display || mapping.term}` : ""}
+                                        {mapping.code ? ` (${mapping.code})` : ""}
+                                      </span>
+                                    ))}
+                                    {approvedMappings.length > 3 ? <span>+{approvedMappings.length - 3} more approved</span> : null}
+                                  </div>
+                                ) : null}
 		                          </div>
 	                        );
 	                      })}
@@ -4839,11 +5121,13 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
 	                    <div className="current-selection-head">
 	                      <span>Mapper suggestion</span>
 	                    </div>
-	                    {activeEntity.code ? (
+	                    {activeEntity.code && activeEntity.validationStatus !== "auto_approved" ? (
 	                      <>
 	                        <strong>{activeEntity.term || activeEntity.entity}</strong>
 	                        <p>{activeEntity.terminology || activeVocabularyOption.label}: {activeEntity.code}</p>
 	                      </>
+	                    ) : activeEntity.validationStatus === "auto_approved" ? (
+                        <p>Suggested match found, but it still needs admin review.</p>
 	                    ) : (
 	                      <p>{activeEntity.validationStatus === "unmapped_confirmed" ? "Unmapped confirmed" : "No mapper suggestion"}</p>
 	                    )}
@@ -4898,10 +5182,7 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
 	                  </div>
                   {activeCandidateMappings.length ? (
                     <div className="brute-candidates-box">
-                      <div className="current-selection-head">
-                        <span>Brute search candidates</span>
-                        <strong>{activeCandidateMappings.length}</strong>
-                      </div>
+                      <h2>High probability candidates</h2>
                       <div className="brute-candidate-list">
                         {activeCandidateMappings.slice(0, 10).map((mapping) => (
                           <div className="brute-candidate" key={approvedMappingKey(mapping)}>
@@ -4918,7 +5199,7 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
                               disabled={reviewLocked || snomedStatus.kind === "busy"}
                               onClick={() => approveVocabularyResult(mapping)}
                               aria-label={`Approve ${mapping.vocabularyLabel} ${mapping.code}`}
-                              title="Approve this brute-search candidate"
+                              title="Approve this high probability candidate"
                             >
                               <span className="result-empty-box" aria-hidden="true" />
                             </button>
@@ -5122,6 +5403,7 @@ function QuestionList({ form, resourceRequirements = [], locked, selectedId, set
                 {question.readOnly || question.type === "calculate" ? <span className="state-chip readonly">read only</span> : null}
                 {!question.readOnly && question.type !== "calculate" && question.readOnlyExpression ? <span className="state-chip readonly">conditional read only</span> : null}
                 {question.calculation ? <span className="state-chip calculation">calculation</span> : null}
+                {question.type === "timer" ? <span className="state-chip timer">{normalizeTimerConfig(question.timerConfig).mode.replace(/_/g, " ")}</span> : null}
                 {resources?.missing ? <span className="resource-chip missing">{resources.missing} files needed</span> : resources?.total ? <span className="resource-chip uploaded">files ready</span> : null}
               </div>
             </div>
@@ -5365,6 +5647,65 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
       </label>
     );
   }
+  if (question.type === "start-geopoint") {
+    return (
+      <div className="preview-field location-preview-field">
+        <span>{question.label}</span>
+        {hintNode}
+        <p>Captured automatically when the ODK form opens.</p>
+        {value ? <code>{value}</code> : null}
+      </div>
+    );
+  }
+  if (question.type === "geopoint") {
+    const parts = String(value || "").split(/\s+/);
+    const [lat = "", lon = "", alt = "", acc = ""] = parts;
+    const commit = (next) => onChange([next.lat, next.lon, next.alt, next.acc].filter((item, index) => index < 2 || String(item || "").trim()).join(" "));
+    const captureCurrentLocation = () => {
+      if (!navigator.geolocation) return;
+      navigator.geolocation.getCurrentPosition((position) => {
+        const coords = position.coords;
+        commit({
+          lat: String(coords.latitude),
+          lon: String(coords.longitude),
+          alt: Number.isFinite(coords.altitude) ? String(coords.altitude) : "0",
+          acc: Number.isFinite(coords.accuracy) ? String(coords.accuracy) : ""
+        });
+      });
+    };
+    return (
+      <div className="preview-field location-preview-field">
+        <span>{question.label}</span>
+        {hintNode}
+        <div className="geo-point-grid">
+          <input type="number" value={lat} disabled={disabled} placeholder="Latitude" onChange={(event) => commit({ lat: event.target.value, lon, alt, acc })} />
+          <input type="number" value={lon} disabled={disabled} placeholder="Longitude" onChange={(event) => commit({ lat, lon: event.target.value, alt, acc })} />
+          <input type="number" value={alt} disabled={disabled} placeholder="Altitude" onChange={(event) => commit({ lat, lon, alt: event.target.value, acc })} />
+          <input type="number" value={acc} disabled={disabled} placeholder="Accuracy" onChange={(event) => commit({ lat, lon, alt, acc: event.target.value })} />
+        </div>
+        {!disabled && !forceDisabled ? (
+          <button type="button" className="secondary small" onClick={captureCurrentLocation}>
+            <MapPin size={14} /> Use Current Location
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+  if (question.type === "geotrace" || question.type === "geoshape") {
+    return (
+      <label className="preview-field location-preview-field">
+        <span>{question.label}</span>
+        {hintNode}
+        <textarea
+          value={value}
+          disabled={disabled}
+          placeholder={question.type === "geotrace" ? "lat lon alt acc; lat lon alt acc" : "lat lon alt acc; lat lon alt acc; lat lon alt acc; lat lon alt acc"}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        <small>{question.type === "geotrace" ? "A trace is saved as ordered GPS points." : "A shape is saved as a closed polygon of GPS points."}</small>
+      </label>
+    );
+  }
   const inputType = forceDisabled
     ? "text"
     : question.type === "date"
@@ -5390,16 +5731,202 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
   );
 }
 
-function OdkWebFormIsland({ formXml, workspaceId, formApiBase, onSubmitted, onError }) {
+function localTimestamp(date = new Date()) {
+  const pad = (value, size = 2) => String(value).padStart(size, "0");
+  const offsetMinutes = -date.getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}${sign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`;
+}
+
+function timerQuestionKey(question = {}) {
+  return String(question.id || question.name || "");
+}
+
+function durationSeconds(start, end) {
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return "";
+  return String(Math.round((endMs - startMs) / 1000));
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function xmlEscape(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function setXmlLeafValue(xml, name, value) {
+  const text = String(value || "");
+  if (!text) return xml;
+  const safeName = escapeRegExp(name);
+  const escaped = xmlEscape(text);
+  const fullTag = new RegExp(`<(${safeName})(\\s[^>]*)?>([\\s\\S]*?)<\\/\\1>`);
+  if (fullTag.test(xml)) {
+    return xml.replace(fullTag, (_match, tag, attrs = "") => `<${tag}${attrs}>${escaped}</${tag}>`);
+  }
+  const selfClosing = new RegExp(`<(${safeName})(\\s[^>]*)?\\s*\\/>`);
+  if (selfClosing.test(xml)) {
+    return xml.replace(selfClosing, (_match, tag, attrs = "") => `<${tag}${attrs}>${escaped}</${tag}>`);
+  }
+  const rootClose = xml.match(/<\/([A-Za-z_][\w:.-]*)>\s*$/);
+  return rootClose ? xml.replace(rootClose[0], `<${name}>${escaped}</${name}>${rootClose[0]}`) : xml;
+}
+
+function injectTimerValuesIntoXml(instanceXml, values = {}) {
+  return Object.entries(values).reduce((xml, [name, value]) => setXmlLeafValue(xml, name, value), instanceXml);
+}
+
+function useTimerController(form, eventRootRef) {
+  const timers = useMemo(() => timerQuestions(form), [form]);
+  const timersKey = useMemo(() => timers.map((timer) => `${timerQuestionKey(timer)}:${timer.name}:${normalizeTimerConfig(timer.timerConfig).mode}`).join("|"), [timers]);
+  const valuesRef = useRef({});
+  const [values, setValues] = useState({});
+
+  function updateTimer(question, patch) {
+    const key = timerQuestionKey(question);
+    const nextForTimer = { ...(valuesRef.current[key] || {}), ...patch };
+    const names = timerFieldNames(question);
+    if (nextForTimer.start && nextForTimer.end) {
+      nextForTimer.duration = durationSeconds(nextForTimer.start, nextForTimer.end);
+    }
+    valuesRef.current = {
+      ...valuesRef.current,
+      [key]: nextForTimer
+    };
+    setValues(valuesRef.current);
+    return { names, state: nextForTimer };
+  }
+
+  function startTimer(question) {
+    const current = valuesRef.current[timerQuestionKey(question)] || {};
+    if (current.start) return;
+    updateTimer(question, { start: localTimestamp(), end: "", duration: "" });
+  }
+
+  function stopTimer(question) {
+    const current = valuesRef.current[timerQuestionKey(question)] || {};
+    if (!current.start || current.end) return;
+    updateTimer(question, { end: localTimestamp() });
+  }
+
+  useEffect(() => {
+    const initialValues = {};
+    const now = localTimestamp();
+    for (const timer of timers) {
+      const config = normalizeTimerConfig(timer.timerConfig);
+      if (config.mode === "open_submit") {
+        initialValues[timerQuestionKey(timer)] = { start: now, end: "", duration: "" };
+      }
+    }
+    valuesRef.current = initialValues;
+    setValues(initialValues);
+  }, [timersKey]);
+
+  useEffect(() => {
+    const root = eventRootRef?.current;
+    if (!root || !timers.length) return undefined;
+    const firstInputTimers = timers.filter((timer) => normalizeTimerConfig(timer.timerConfig).mode === "first_input_submit");
+    if (!firstInputTimers.length) return undefined;
+    const handleFirstInput = (event) => {
+      const target = event.target;
+      if (!target?.closest?.("input, textarea, select")) return;
+      firstInputTimers.forEach(startTimer);
+    };
+    root.addEventListener("input", handleFirstInput, true);
+    root.addEventListener("change", handleFirstInput, true);
+    return () => {
+      root.removeEventListener("input", handleFirstInput, true);
+      root.removeEventListener("change", handleFirstInput, true);
+    };
+  }, [eventRootRef, timersKey]);
+
+  function finalizeTimers() {
+    if (!timers.length) return {};
+    const now = localTimestamp();
+    const nextValues = { ...valuesRef.current };
+    const output = {};
+    for (const timer of timers) {
+      const key = timerQuestionKey(timer);
+      const config = normalizeTimerConfig(timer.timerConfig);
+      const state = { ...(nextValues[key] || {}) };
+      if (config.mode === "open_submit" && !state.start) state.start = now;
+      if (config.mode === "first_input_submit" && !state.start) state.start = now;
+      if (config.mode !== "manual" || state.start) {
+        if (!state.end) state.end = now;
+      }
+      if (state.start && state.end) state.duration = durationSeconds(state.start, state.end);
+      nextValues[key] = state;
+      const names = timerFieldNames(timer);
+      if (state.start) output[names.start] = state.start;
+      if (state.end) output[names.end] = state.end;
+      if (state.duration) output[names.duration] = state.duration;
+    }
+    valuesRef.current = nextValues;
+    setValues(nextValues);
+    return output;
+  }
+
+  return { timers, values, startTimer, stopTimer, finalizeTimers };
+}
+
+function TimerRespondentPanel({ timers, values, startTimer, stopTimer }) {
+  const visibleTimers = timers.filter((timer) => normalizeTimerConfig(timer.timerConfig).showToRespondent);
+  if (!visibleTimers.length) return null;
+  return (
+    <div className="respondent-timer-stack">
+      {visibleTimers.map((timer) => {
+        const config = normalizeTimerConfig(timer.timerConfig);
+        const state = values[timerQuestionKey(timer)] || {};
+        return (
+          <section className="respondent-timer-card" key={timerQuestionKey(timer)}>
+            <div>
+              <span>{timer.label || timer.name || "Timer"}</span>
+              <p>{TIMER_MODES.find((item) => item.value === config.mode)?.label || "Timer"}</p>
+            </div>
+            <dl>
+              <div><dt>Start</dt><dd>{state.start || "Not started"}</dd></div>
+              <div><dt>End</dt><dd>{state.end || "Not stopped"}</dd></div>
+              <div><dt>Duration</dt><dd>{state.duration ? `${state.duration}s` : "Pending"}</dd></div>
+            </dl>
+            {config.mode === "manual" ? (
+              <div className="respondent-timer-actions">
+                <button type="button" className="secondary small" disabled={Boolean(state.start)} onClick={() => startTimer(timer)}>
+                  <Clock size={14} /> Start
+                </button>
+                <button type="button" className="secondary small" disabled={!state.start || Boolean(state.end)} onClick={() => stopTimer(timer)}>
+                  <Check size={14} /> Stop
+                </button>
+              </div>
+            ) : null}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted, onError }) {
   const mountRef = useRef(null);
   const submittedRef = useRef(onSubmitted);
   const errorRef = useRef(onError);
   const apiBase = formApiBase || `/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}`;
+  const timerController = useTimerController(form, mountRef);
+  const finalizeTimersRef = useRef(timerController.finalizeTimers);
 
   useEffect(() => {
     submittedRef.current = onSubmitted;
     errorRef.current = onError;
   }, [onSubmitted, onError]);
+
+  useEffect(() => {
+    finalizeTimersRef.current = timerController.finalizeTimers;
+  }, [timerController.finalizeTimers]);
 
   useEffect(() => {
     const mountPoint = mountRef.current;
@@ -5416,6 +5943,7 @@ function OdkWebFormIsland({ formXml, workspaceId, formApiBase, onSubmitted, onEr
         }
       }
       if (!instanceXml) throw new Error("ODK Web Forms did not provide xml_submission_file.");
+      instanceXml = injectTimerValuesIntoXml(instanceXml, finalizeTimersRef.current());
       await postJson(`${apiBase}/odk-submissions`, {
         instanceXml,
         payloadType: payload?.payloadType || "monolithic",
@@ -5453,7 +5981,12 @@ function OdkWebFormIsland({ formXml, workspaceId, formApiBase, onSubmitted, onEr
     return () => app.unmount();
   }, [apiBase, formXml, workspaceId]);
 
-  return <div className="odk-web-form-host" ref={mountRef} />;
+  return (
+    <>
+      <TimerRespondentPanel {...timerController} />
+      <div className="odk-web-form-host" ref={mountRef} />
+    </>
+  );
 }
 
 function expressionLiteral(value) {
@@ -6279,13 +6812,21 @@ function initialCalculationState(value, sources) {
 
 function calculationPresetOptions(question) {
   const type = question?.type || "text";
-  const options = [
-    { value: "copy", label: "Copy another answer" },
-    { value: "today", label: "Today" },
-    { value: "now", label: "Current date-time" },
-    { value: "empty", label: "Clear value" }
-  ];
-  if (["integer", "decimal", "range", "calculate"].includes(type)) {
+  const options = [{ value: "copy", label: "Copy another answer" }];
+  if (type === "date") {
+    options.push({ value: "today", label: "Today" });
+  }
+  if (type === "dateTime" || type === "time") {
+    options.push({ value: "now", label: "Current date-time" });
+  }
+  if (["calculate", "hidden"].includes(type)) {
+    options.push(
+      { value: "today", label: "Today" },
+      { value: "now", label: "Current date-time" }
+    );
+  }
+  options.push({ value: "empty", label: "Clear value" });
+  if (["integer", "decimal", "range", "calculate", "hidden"].includes(type)) {
     options.push(
       { value: "sum", label: "Add two answers" },
       { value: "difference", label: "Subtract two answers" },
@@ -6344,6 +6885,41 @@ function defaultInputType(question) {
   return "text";
 }
 
+function defaultPlaceholder(question) {
+  const type = question?.type || "";
+  if (type === "geopoint" || type === "start-geopoint") return "90 0 0 0";
+  if (type === "geotrace") return "90 0 0 0; 89.9 0 0 0";
+  if (type === "geoshape") return "90 0 0 0; 89.9 0 0 0; 89.9 0.1 0 0; 90 0 0 0";
+  if (type === "integer" || type === "decimal" || type === "range") return "0";
+  if (type === "date") return todayString();
+  if (type === "dateTime") return `${todayString()}T00:00`;
+  if (type === "time") return "00:00";
+  return "";
+}
+
+function defaultFormatHint(question) {
+  const type = question?.type || "";
+  if (type === "geopoint" || type === "start-geopoint") return "ODK geopoint format: latitude longitude altitude accuracy.";
+  if (type === "geotrace") return "ODK trace format: multiple geopoints separated by semicolons.";
+  if (type === "geoshape") return "ODK shape format: a closed set of geopoints separated by semicolons.";
+  if (type === "integer" || type === "decimal" || type === "range") return "Use a numeric default only.";
+  if (type === "date") return "Use a date default, or Builder > Today.";
+  if (type === "dateTime") return "Use a date-time default, or Builder > Current date-time.";
+  if (type === "time") return "Use a time default.";
+  return "";
+}
+
+function defaultQuickValues(question) {
+  const type = question?.type || "";
+  if (type === "geopoint" || type === "start-geopoint") {
+    return [
+      { label: "North Pole", value: "90 0 0 0" },
+      { label: "South Pole", value: "-90 0 0 0" }
+    ];
+  }
+  return [];
+}
+
 function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = false }) {
   const sources = useMemo(() => calculationSources(form, question), [form, question]);
   const sourceKey = sources.map((source) => source.name).join("|");
@@ -6363,6 +6939,8 @@ function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = f
       ? buildCalculationExpression(effectiveDynamic)
       : state.rawValue;
   const options = conditionValueOptions(question);
+  const quickValues = defaultQuickValues(question);
+  const formatHint = defaultFormatHint(question);
 
   function commit(nextState) {
     setState(nextState);
@@ -6416,9 +6994,26 @@ function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = f
               type={defaultInputType(question)}
               value={state.staticValue || ""}
               disabled={readOnly}
+              placeholder={defaultPlaceholder(question)}
               onChange={(event) => commit({ ...state, staticValue: event.target.value })}
             />
           )}
+          {quickValues.length ? (
+            <div className="default-quick-values">
+              {quickValues.map((item) => (
+                <button
+                  key={item.value}
+                  type="button"
+                  className="secondary small"
+                  disabled={readOnly}
+                  onClick={() => commit({ ...state, staticValue: item.value })}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {formatHint ? <small>{formatHint}</small> : null}
         </label>
       ) : state.mode === "builder" ? (
         <div className="logic-builder compact">
@@ -6468,7 +7063,7 @@ function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = f
           className="logic-raw"
           value={state.rawValue || ""}
           disabled={readOnly}
-          placeholder="today()"
+          placeholder={defaultPlaceholder(question) || "Raw XLSForm value"}
           onChange={(event) => commit({ ...state, rawValue: event.target.value })}
         />
       )}
@@ -6937,6 +7532,7 @@ function TriggerBuilderCard({ form, question, value, onChange, readOnly = false 
   const enabled = Boolean(String(value || "").trim());
   const open = enabled || forceOpen;
   const generatedExpression = mode === "guided" ? sourceName ? fieldReference(sourceName) : "" : String(value || "");
+  const hasCalculation = Boolean(String(question.calculation || "").trim());
 
   function enableTrigger(nextEnabled) {
     if (!nextEnabled) {
@@ -6954,15 +7550,17 @@ function TriggerBuilderCard({ form, question, value, onChange, readOnly = false 
       <div className="logic-card-head">
         <div>
           <span className="logic-title-row">
-            <h3>Dynamic Default Trigger</h3>
-            <InfoButton label="Dynamic Default Trigger">{columnInfoText("trigger")}</InfoButton>
+            <h3>Recalculate Trigger</h3>
+            <InfoButton label="Recalculate trigger">{columnInfoText("trigger")}</InfoButton>
           </span>
           <small>ODK XLS format: "trigger" column.</small>
         </div>
-        <Toggle label="Use trigger" checked={open} disabled={readOnly} onChange={enableTrigger} />
+        <Toggle label="Recalculate when another answer changes" checked={open} disabled={readOnly || !hasCalculation} onChange={enableTrigger} />
       </div>
-      {!open ? (
-        <p className="logic-muted">The default value is not recalculated by another answer.</p>
+      {!hasCalculation ? (
+        <p className="logic-muted">Add a Calculated value first. A trigger only controls when that calculation reruns.</p>
+      ) : !open ? (
+        <p className="logic-muted">This calculated value will not be rerun by another answer changing.</p>
       ) : (
         <>
           <div className="logic-tabs">
@@ -7020,6 +7618,7 @@ const APPEARANCE_PRESETS = {
 };
 
 function QuestionTypeField({ question, readOnly, onChange }) {
+  const knownType = QUESTION_TYPES.some((item) => item.type === question.type);
   return (
     <label className="field">
       <span className="field-heading">
@@ -7031,6 +7630,9 @@ function QuestionTypeField({ question, readOnly, onChange }) {
         disabled={readOnly}
         onChange={(event) => onChange(event.target.value)}
       >
+        {!knownType && question.type ? (
+          <option value={question.type}>Legacy imported type: {question.type}</option>
+        ) : null}
         {QUESTION_TYPES.map((item) => (
           <option key={item.type} value={item.type}>{item.label}</option>
         ))}
@@ -7095,6 +7697,136 @@ function MediaColumnField({ label, column, fieldName, value, accept, question, r
   );
 }
 
+function StructuralTypeHelp({ type }) {
+  const help = STRUCTURAL_TYPE_HELP[type];
+  if (!help) return null;
+  return (
+    <div className="structural-help-card">
+      <div className="structural-help-title">
+        <ClipboardList size={18} />
+        <span>{help.title}</span>
+      </div>
+      <p>{help.body}</p>
+      <p>{help.xls}</p>
+      <div className="structural-help-warning">
+        <AlertCircle size={16} />
+        <span>{help.warning}</span>
+      </div>
+    </div>
+  );
+}
+
+function LocationTypeHelp({ question }) {
+  if (!LOCATION_TYPES.has(question?.type)) return null;
+  const helpByType = {
+    geopoint: {
+      title: "Location Point captures one GPS point",
+      body: "Use this when the respondent should choose one place, such as home, hospital, household, or interview location.",
+      setup: 'Use Appearance "placement-map" when the respondent should manually place or adjust the point on a map. Use blank Appearance only when you want current-location capture.'
+    },
+    geotrace: {
+      title: "Location Trace captures a route",
+      body: "Use this when the respondent should draw or record a line, such as a travel path or route.",
+      setup: "Leave Appearance blank for the standard ODK browser trace widget. The saved value is a sequence of location points."
+    },
+    geoshape: {
+      title: "Location Shape captures an area",
+      body: "Use this when the respondent should draw a polygon, such as a catchment area, facility boundary, or residence zone.",
+      setup: "Leave Appearance blank for the standard ODK browser shape widget. The saved value is a closed sequence of location points."
+    },
+    "start-geopoint": {
+      title: "Start Location is auto-filled",
+      body: "Use this when the form should capture the device/browser location as soon as the form opens.",
+      setup: "In this local browser workflow, respondents can see the captured value. It is still filled from the device location at form start."
+    }
+  };
+  const help = helpByType[question.type];
+  return (
+    <div className="location-help-card">
+      <div className="location-help-title">
+        <MapPin size={18} />
+        <span>{help.title}</span>
+      </div>
+      <p>{help.body}</p>
+      <p>{help.setup}</p>
+      {question.type === "start-geopoint" ? (
+        <div className="location-help-warning">
+          <Info size={16} />
+          <span>Do not use this as the Primary Identifier. It is metadata about where the form began, not a respondent answer.</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function TimerTypeHelp({ question }) {
+  if (question?.type !== "timer") return null;
+  return (
+    <div className="timer-help-card">
+      <div className="timer-help-title">
+        <Clock size={18} />
+        <span>Timer saves start, end, and duration</span>
+      </div>
+      <p>Use this when you want timing metadata without asking the respondent to type timestamps.</p>
+      <p>The saved CSV/FHIR fields are generated from the timer name below.</p>
+    </div>
+  );
+}
+
+function TimerSettingsCard({ question, updateQuestion, readOnly = false }) {
+  if (question.type !== "timer") return null;
+  const config = normalizeTimerConfig(question.timerConfig);
+  const fields = timerFieldNames(question);
+  const mode = TIMER_MODES.find((item) => item.value === config.mode) || TIMER_MODES[0];
+  const updateConfig = (patch) => {
+    const next = normalizeTimerConfig({ ...config, ...patch });
+    updateQuestion(question.id, { timerConfig: next });
+  };
+  return (
+    <div className="logic-card timer-settings-card">
+      <div className="logic-card-head">
+        <div>
+          <h3>Timer settings</h3>
+          <small>Simple timing rules for the local respondent form.</small>
+        </div>
+      </div>
+      <label className="field">
+        <span className="field-heading">
+          <span>When should the timer run?</span>
+          <InfoButton label="Timer behavior">
+            <span>Choose the event that fills the generated start and end timestamp fields.</span>
+          </InfoButton>
+        </span>
+        <select
+          value={config.mode}
+          disabled={readOnly}
+          onChange={(event) => updateConfig({ mode: event.target.value })}
+        >
+          {TIMER_MODES.map((item) => (
+            <option key={item.value} value={item.value}>{item.label}</option>
+          ))}
+        </select>
+      </label>
+      <p className="logic-muted">{mode.description}</p>
+      <Toggle
+        label="Show timer to respondent"
+        checked={config.showToRespondent}
+        disabled={readOnly || config.mode === "manual"}
+        onChange={(value) => updateConfig({ showToRespondent: value })}
+      />
+      {config.mode === "manual" ? (
+        <p className="logic-muted">Manual timers are always visible because the respondent needs Start and Stop buttons.</p>
+      ) : null}
+      <div className="timer-field-list">
+        <span>Saved fields</span>
+        <code>{fields.start}</code>
+        <code>{fields.end}</code>
+        <code>{fields.duration}</code>
+      </div>
+    </div>
+  );
+}
+
 function updateLogicPatch(question, column, fieldName, value, builderState = {}) {
   return {
     [fieldName]: value,
@@ -7110,7 +7842,8 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
   const hasExternalList = question.type === "select_one_from_file" || question.type === "select_multiple_from_file";
   const options = question.options || [];
   const isCalculate = question.type === "calculate";
-  const showRelevant = !END_STRUCTURAL_TYPES.has(question.type) && question.type !== "csv-external" && question.type !== "audit" || hasColumnValue(question, "relevant");
+  const isRank = question.type === "rank";
+  const showRelevant = !END_STRUCTURAL_TYPES.has(question.type) && question.type !== "csv-external" && question.type !== "timer" && question.type !== "audit" || hasColumnValue(question, "relevant");
   const showRequiredControls = canRequireQuestion(question) || question.required || hasColumnValue(question, "requiredExpression", "requiredMessage");
   const showReadOnlyControls = (
     RESPONDENT_INPUT_TYPES.has(question.type) ||
@@ -7153,6 +7886,10 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
         readOnly={readOnly}
         onChange={(nextType) => updateQuestion(question.id, questionTypePatch(question, nextType))}
       />
+      <StructuralTypeHelp type={question.type} />
+      <LocationTypeHelp question={question} />
+      <TimerTypeHelp question={question} />
+      <TimerSettingsCard question={question} updateQuestion={updateQuestion} readOnly={readOnly} />
       <Field
         label="Question name"
         value={question.name}
@@ -7378,17 +8115,33 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
         </>
       ) : null}
       {hasOptions ? (
-        <div className="options-editor">
+        <div className={`options-editor ${isRank ? "rank-items-editor" : ""}`}>
           <div className="section-head">
-            <h3>Options</h3>
-            <button className="secondary small" disabled={readOnly} onClick={addOption}><Plus size={14} /> Add</button>
+            <div>
+              <h3>{isRank ? "Items respondents will rank" : "Options"}</h3>
+              {isRank ? <p>Each row below is one item the respondent can place in order. The saved value is the item code; respondents see the display text.</p> : null}
+            </div>
+            <button className="secondary small" disabled={readOnly} onClick={addOption}><Plus size={14} /> {isRank ? "Add Item" : "Add"}</button>
           </div>
-          <Field label="List Name" value={question.listName} disabled={readOnly} onChange={(value) => updateQuestion(question.id, { listName: slug(value).toLowerCase() })} />
+          <Field
+            label={isRank ? "Rank item list name" : "List Name"}
+            value={question.listName}
+            disabled={readOnly}
+            helpText={'ODK XLS format: "list_name" column in the choices sheet.'}
+            info={isRank ? "All rank items are saved in one choices list. Keep this stable after publishing so older responses remain interpretable." : "The choices sheet list name that stores this question's answer options."}
+            onChange={(value) => updateQuestion(question.id, { listName: slug(value).toLowerCase() })}
+          />
           {options.map((option) => (
             <div className="option-block" key={option.id}>
               <div className="option-row">
-                <input value={option.name} disabled={readOnly} placeholder="name" onChange={(event) => updateOption(option.id, { name: event.target.value })} />
-                <input value={option.label} disabled={readOnly} placeholder="label" onChange={(event) => updateOption(option.id, { label: event.target.value })} />
+                <label>
+                  <span>{isRank ? "Item code" : "Value"}</span>
+                  <input value={option.name} disabled={readOnly} placeholder={isRank ? "item_1" : "name"} onChange={(event) => updateOption(option.id, { name: event.target.value })} />
+                </label>
+                <label>
+                  <span>{isRank ? "Item display text" : "Display text"}</span>
+                  <input value={option.label} disabled={readOnly} placeholder={isRank ? "Item to rank" : "label"} onChange={(event) => updateOption(option.id, { label: event.target.value })} />
+                </label>
                 <button className="icon-button danger" disabled={readOnly} onClick={() => removeOption(option.id)}><Trash2 size={14} /></button>
               </div>
               <div className="option-media-row">
@@ -7530,6 +8283,7 @@ function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
 	      {formXml ? (
 	        <main className="fill-card odk-fill-card">
 	          <OdkWebFormIsland
+	            form={form}
 	            formXml={formXml}
 	            workspaceId={workspaceId}
 	            formApiBase={formApiBase}

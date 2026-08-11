@@ -34,7 +34,9 @@ SKIP_TYPES = {
     "email",
     "audit",
     "csv-external",
+    "timer",
 }
+STRUCTURAL_TYPES = {"begin_group", "end_group", "begin_repeat", "end_repeat"}
 
 OPTION_SKIP_VALUES = {
     "yes",
@@ -282,7 +284,6 @@ def question_text(question: dict[str, Any]) -> str:
         display_text(question.get("label")),
         display_text(question.get("hint")),
         display_text(question.get("guidanceHint") or question.get("guidance_hint")),
-        f"Variable name: {clean_text(question.get('name'))}" if question.get("name") else "",
     ]
     options = []
     for option in question.get("options") or []:
@@ -805,13 +806,6 @@ def extract_form_entities(question: dict[str, Any], lookup: BruteVocabularyLooku
         source_label="Guidance hint",
     ))
 
-    if not candidates:
-        candidates.extend(sourced_phrase_candidates(
-            humanize_name(question.get("name")),
-            source_component="name",
-            source_label="Question name",
-        ))
-
     if qtype.startswith("select_"):
         for option in question.get("options") or []:
             option_text = option_display_text(option)
@@ -846,40 +840,8 @@ def extract_form_entities(question: dict[str, Any], lookup: BruteVocabularyLooku
             "decomposition_method": "field_level_phrase_candidates",
         }
         candidates_from_vocabularies = lookup.search(candidate) if lookup is not None else []
-        high_confidence_matches = [
-            match
-            for match in candidates_from_vocabularies
-            if match.get("confidence") == "High"
-        ]
-        high_confidence_by_vocabulary = []
-        seen_vocabularies = set()
-        for match in high_confidence_matches:
-            vocabulary = match.get("vocabulary")
-            if vocabulary in seen_vocabularies:
-                continue
-            seen_vocabularies.add(vocabulary)
-            high_confidence_by_vocabulary.append(match)
         if candidates_from_vocabularies:
             mapping["candidate_mappings"] = candidates_from_vocabularies[:12]
-        if high_confidence_by_vocabulary:
-            match = high_confidence_by_vocabulary[0]
-            mapping.update(
-                {
-                    "code": match.get("code", ""),
-                    "display": match.get("display", ""),
-                    "term": match.get("term", ""),
-                    "fsn": match.get("fsn", ""),
-                    "systemUri": match.get("systemUri", ""),
-                    "vocabulary": match.get("vocabulary", ""),
-                    "vocabularyLabel": match.get("vocabularyLabel", ""),
-                    "terminology": match.get("terminology") or match.get("vocabularyLabel", ""),
-                    "approved_mappings": [approved_mapping(item) for item in high_confidence_by_vocabulary],
-                    "validation_status": "auto_approved",
-                    "validated": True,
-                    "matched_via": "form_definition_brute_vocabulary_search",
-                    "confidence": "High",
-                }
-            )
         entities.append(
             compact_entity(mapping)
         )
@@ -901,7 +863,11 @@ def main() -> int:
 
     started_at = utc_stamp()
     form = json.loads(args.draft_path.read_text(encoding="utf-8"))
-    questions = list(form.get("questions") or [])
+    questions = [
+        question
+        for question in list(form.get("questions") or [])
+        if clean_text(question.get("type")) not in STRUCTURAL_TYPES
+    ]
     selected_ids = {item.strip() for item in args.question_ids.split(",") if item.strip()}
     existing_by_key: dict[str, dict[str, Any]] = {}
     existing_questions: list[dict[str, Any]] = []
