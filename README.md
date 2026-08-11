@@ -164,6 +164,52 @@ The frontend API URL can be changed at build/runtime with:
 VITE_FORM_BUILDER_API=http://localhost:8787 npm run client
 ```
 
+## Run With Docker
+
+The ICPH form-builder and mapper app can be shared as a Docker image. The image
+builds the Node app plus both Python environments expected by the server:
+
+- `ODK/.venv-xlsform` for `pyxform` and `xls2xform`
+- `agentic-entity-mapper/.venv` for mapper/preprocessing scripts
+
+Build and start:
+
+```bash
+cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH
+docker compose up --build
+```
+
+Open:
+
+```text
+http://localhost:5173
+```
+
+The API is exposed at:
+
+```text
+http://localhost:8787
+```
+
+Generated workspaces are persisted on the host in:
+
+```text
+output/forms/
+```
+
+For deployments, change the admin password before starting:
+
+```bash
+ICPH_ADMIN_PASSWORD='replace-this' docker compose up --build
+```
+
+If the browser will access the app from another machine, set the API URL to the
+reachable host name:
+
+```bash
+VITE_FORM_BUILDER_API='http://your-hostname:8787' docker compose up --build
+```
+
 ## Refresh ICPH Schema Metadata
 
 Run this after changing or adding a schema DOCX:

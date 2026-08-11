@@ -1,0 +1,30 @@
+.DS_Store
+.git
+.git-unlinked-backups
+
+# Local runtime state
+output/
+*.log
+
+# Node/Vite artifacts
+**/node_modules/
+**/dist/
+**/.vite/
+**/coverage/
+
+# Python environments and caches
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# Local ODK Central state and vendored runtime artifacts
+ODK/.venv-xlsform/
+ODK/central/.env
+ODK/central/files/
+ODK/central/*/files/
+ODK/central/*/node_modules/
+ODK/central/*/tmp/

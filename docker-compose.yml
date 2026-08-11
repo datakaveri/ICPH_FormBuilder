@@ -1,0 +1,15 @@
+services:
+  icph:
+    build:
+      context: .
+    image: icph-form-builder:local
+    ports:
+      - "5173:5173"
+      - "8787:8787"
+    environment:
+      ICPH_ADMIN_PASSWORD: "${ICPH_ADMIN_PASSWORD:-ICPH2026}"
+      ICPH_FORM_BUILDER_API_PORT: "8787"
+      VITE_FORM_BUILDER_API: "${VITE_FORM_BUILDER_API:-http://localhost:8787}"
+    volumes:
+      - ./output:/app/output
+    restart: unless-stopped

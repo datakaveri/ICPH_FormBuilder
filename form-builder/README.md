@@ -37,6 +37,23 @@ The React app calls the local API server at:
 http://localhost:8787
 ```
 
+## Run With Docker
+
+From the repository root:
+
+```bash
+docker compose up --build
+```
+
+Open:
+
+```text
+http://localhost:5173
+```
+
+The compose setup persists generated forms and submissions to `output/forms/`
+on the host.
+
 ## Current Flow
 
 The app opens on a home dashboard. It shows every form workspace under
