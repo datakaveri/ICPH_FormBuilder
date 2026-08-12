@@ -19,7 +19,8 @@ builds the Node app plus both Python environments expected by the server:
 First get the project onto your laptop. Either option is fine:
 
 - Clone the repository with Git.
-- Download the repository as a ZIP from GitHub, then unzip it.
+- Download the repository as a ZIP from GitHub, then unzip it and rename the
+  unzipped folder to `ICPH`.
 
 After that, open the main project folder named `ICPH`. This is the folder that
 contains `docker-compose.yml`.
@@ -32,8 +33,8 @@ cd ICPH
 docker compose up --build
 ```
 
-If you downloaded the repository as a ZIP from GitHub, unzip it first, open the
-unzipped folder in Terminal, and then run:
+If you downloaded the repository as a ZIP from GitHub, unzip it first, rename
+the unzipped folder to `ICPH`, open that folder in Terminal, and then run:
 
 ```bash
 docker compose up --build
@@ -42,6 +43,11 @@ docker compose up --build
 If Docker says `no configuration file provided: not found`, you are probably
 one folder too high or too low. Move into the main `ICPH` project folder, the
 one that contains `docker-compose.yml`, and run the Docker command again.
+
+If Docker says it `failed to connect to the docker API` or asks whether the
+Docker daemon is running, open Docker Desktop first and wait until it says
+Docker is running. Then run the Docker command again from the main `ICPH`
+folder.
 
 ## Add Client Terminology Assets
 
