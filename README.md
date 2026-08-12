@@ -16,7 +16,15 @@ builds the Node app plus both Python environments expected by the server:
 - `ODK/.venv-xlsform` for `pyxform` and `xls2xform`
 - `agentic-entity-mapper/.venv` for mapper/preprocessing scripts
 
-From a fresh clone:
+First get the project onto your laptop. Either option is fine:
+
+- Clone the repository with Git.
+- Download the repository as a ZIP from GitHub, then unzip it.
+
+After that, open the main project folder named `ICPH`. This is the folder that
+contains `docker-compose.yml`.
+
+If you are using Git, the commands look like this:
 
 ```bash
 git clone https://github.com/nikipatil281/ICPH_health.git ICPH
@@ -24,48 +32,51 @@ cd ICPH
 docker compose up --build
 ```
 
-Run `docker compose up --build` from the directory that contains
-`docker-compose.yml`. If Docker says `no configuration file provided: not
-found`, check your current folder:
+If you downloaded the repository as a ZIP from GitHub, unzip it first, open the
+unzipped folder in Terminal, and then run:
 
 ```bash
-pwd
-ls docker-compose.yml
-```
-
-If `ls` cannot find `docker-compose.yml`, `cd` into the cloned `ICPH` folder
-before running Docker Compose.
-
-## Add Client Terminology Assets
-
-The Git repository contains a lightweight `SchemaTerminologies/` folder so the
-app can run from a fresh clone. For client handoff, copy the provided
-`ICPH_SchemaTerminologies.zip` file into:
-
-```text
-agentic-entity-mapper/
-```
-
-Then replace the lightweight folder with the unzipped one. From the repository
-root:
-
-```bash
-cd agentic-entity-mapper
-mv SchemaTerminologies SchemaTerminologies.git-lite
-unzip ICPH_SchemaTerminologies.zip
-cd ..
 docker compose up --build
 ```
 
-The ZIP file is named `ICPH_SchemaTerminologies.zip`, but it must unzip to a
-folder named exactly:
+If Docker says `no configuration file provided: not found`, you are probably
+one folder too high or too low. Move into the main `ICPH` project folder, the
+one that contains `docker-compose.yml`, and run the Docker command again.
+
+## Add Client Terminology Assets
+
+You may receive a separate file named:
+
+```text
+ICPH_SchemaTerminologies.zip
+```
+
+Place that ZIP file inside:
+
+```text
+ICPH/agentic-entity-mapper/
+```
+
+Then unzip it there. After unzipping, you should see a folder named:
 
 ```text
 SchemaTerminologies
 ```
 
-The ZIP itself is ignored by Git and Docker. Docker uses the unzipped
-`agentic-entity-mapper/SchemaTerminologies/` folder when building the app.
+inside:
+
+```text
+ICPH/agentic-entity-mapper/
+```
+
+The ZIP file name can stay as `ICPH_SchemaTerminologies.zip`; the folder created
+after unzipping must be named `SchemaTerminologies`.
+
+Once that folder is in place, return to the main `ICPH` folder and start the app:
+
+```bash
+docker compose up --build
+```
 
 Open the app:
 
