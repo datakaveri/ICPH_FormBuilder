@@ -22,10 +22,14 @@ The source of truth is a small JSON form model that exports to XLSForm sheets:
 From the repository root:
 
 ```bash
-cd ICPH/form-builder
+cd form-builder
 npm install
 npm run dev
 ```
+
+For local development without Docker, also create the Python environments
+documented in the root `README.md`; XLSForm conversion, terminology extraction,
+and FHIR handoff depend on them.
 
 Open:
 
@@ -41,10 +45,9 @@ http://localhost:8787
 
 ## Run With Docker
 
-From the `ICPH/` directory:
+From the repository root:
 
 ```bash
-cd ICPH
 docker compose up --build
 ```
 
@@ -107,7 +110,8 @@ fhir_bundles/
 logs/
 ```
 
-The `data/` and `fhir_bundles/` folders are placeholders for the next pipeline stages:
+The `data/` and `fhir_bundles/` folders are written by the local collection and
+FHIR handoff stages:
 
 1. local form visualization/data entry
 2. collected CSV export
@@ -115,7 +119,7 @@ The `data/` and `fhir_bundles/` folders are placeholders for the next pipeline s
 
 ## Test Exporter Directly
 
-The app uses the existing ODK Python environment:
+The app uses the ODK Python environment created by Docker or local setup:
 
 ```text
 ../ODK/.venv-xlsform
@@ -130,5 +134,5 @@ scripts/export_xlsform.py
 Then converts XLSX to XML with:
 
 ```text
-ICPH/ODK/.venv-xlsform/bin/xls2xform
+../ODK/.venv-xlsform/bin/xls2xform
 ```

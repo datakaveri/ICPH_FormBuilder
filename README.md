@@ -6,7 +6,7 @@ This repository contains one user-facing web app and one lean mapper backend:
   and FHIR handoff UI.
 - `agentic-entity-mapper/`: backend-only Python scripts for MetaForm
   preprocessing and FHIR bundle generation.
-- `ODK/`: XLSForm/ODK assets and tooling used by the app.
+- `ODK/`: lightweight XLSForm conversion tooling used by the app.
 
 ## Quick Start With Docker
 
@@ -20,7 +20,7 @@ From a fresh clone:
 
 ```bash
 git clone <repo-url>
-cd <repo>/ICPH
+cd <repo>
 docker compose up --build
 ```
 
@@ -52,7 +52,7 @@ ICPH_ADMIN_PASSWORD='replace-this' docker compose up --build
 Generated form workspaces and submissions are persisted on the host at:
 
 ```text
-ICPH/output/forms/
+output/forms/
 ```
 
 Stop the containers with:
@@ -140,11 +140,26 @@ creation.
 First-time setup:
 
 ```bash
-cd ICPH/agentic-entity-mapper
+cd agentic-entity-mapper
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+Create the XLSForm conversion environment from the repository root:
+
+```bash
+python3 -m venv ODK/.venv-xlsform
+ODK/.venv-xlsform/bin/python -m pip install --upgrade pip
+ODK/.venv-xlsform/bin/python -m pip install -r ODK/tools/requirements-xlsform.txt
+```
+
+Install the Node app dependencies:
+
+```bash
+cd form-builder
+npm install
 ```
 
 ## Key Paths
@@ -161,12 +176,17 @@ Processed schema Markdown/chunks:
 agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/
 ```
 
-Terminology lookup assets:
+Optional terminology lookup assets:
 
 ```text
 agentic-entity-mapper/SchemaTerminologies/artifacts/shared/
 agentic-entity-mapper/SchemaTerminologies/terminologies/loinc/
 ```
+
+These lookup assets are intentionally not tracked in this client repository.
+Without them, the app still runs and admins can skip terminology mapping or add
+reviewed mappings manually. Add the lookup folders only if a deployment needs
+automatic SNOMED CT, ICD-10, LOINC, or RxNorm suggestions.
 
 Generated form workspaces:
 
@@ -180,7 +200,7 @@ submitted entries, mapper CSV, and generated FHIR bundles.
 ## Run Form Builder
 
 ```bash
-cd ICPH/form-builder
+cd form-builder
 npm install
 npm run dev
 ```
@@ -233,7 +253,7 @@ VITE_FORM_BUILDER_API=http://localhost:8787 npm run client
 Run this after changing or adding a schema DOCX:
 
 ```bash
-cd ICPH/agentic-entity-mapper
+cd agentic-entity-mapper
 ./.venv/bin/python preprocess_icph_metaforms.py
 ```
 
@@ -246,13 +266,13 @@ To force a full rebuild:
 ## Smoke Checks
 
 ```bash
-cd ICPH/form-builder
+cd form-builder
 node --check server/index.js
 npm run build
 ```
 
 ```bash
-cd ICPH/agentic-entity-mapper
+cd agentic-entity-mapper
 ./.venv/bin/python -m py_compile generic_form_fhir_agent.py preprocess_icph_metaforms.py
 ./.venv/bin/python -m unittest discover tests
 ```

@@ -9,15 +9,18 @@ only the pieces that are called by that app:
 | --- | --- |
 | `generic_form_fhir_agent.py` | Converts a saved form draft plus submitted answer CSV into per-patient FHIR R4 bundles. |
 | `preprocess_icph_metaforms.py` | Converts ICPH MetaForm DOCX files into Markdown plus JSONL chunks. |
-| `SchemaTerminologies/` | Stores pruned terminology lookup assets and ICPH MetaForm source/processed metadata. |
+| `SchemaTerminologies/` | Stores the tracked FHIR schema plus ICPH MetaForm source/processed metadata folders. |
 
 The old clinical-text agent stack, standalone FastAPI backend, prompt files,
 Docker/Kubernetes wrappers, and agent-specific tests were removed from this ICPH
 copy because the current local app does not call them.
 
-Dense Faiss/USearch/TurboVec indexes and local embedding model copies were also
-removed. The form-builder terminology UI now relies on lightweight shared
-lookup files for SNOMED CT, ICD-10, and RxNorm, plus the raw `Loinc.csv` table.
+Dense Faiss/USearch/TurboVec indexes, local embedding model copies, and large
+terminology source files are not tracked in this client repository. The
+form-builder terminology UI can use optional lightweight lookup files for
+SNOMED CT, ICD-10, RxNorm, and LOINC if they are added under
+`SchemaTerminologies/`, but the app can also proceed without automatic
+terminology suggestions.
 
 ## Integration With Form Builder
 
@@ -75,7 +78,8 @@ ICPH_INCLUDE_DERIVED_OBSERVATIONS=1
 ## Dependencies
 
 The FHIR generator uses only the Python standard library. The only package in
-`requirements.txt` is for DOCX preprocessing:
+`requirements.txt` is for DOCX preprocessing. Docker creates this environment
+automatically. For local development:
 
 ```bash
 python3.11 -m venv .venv
