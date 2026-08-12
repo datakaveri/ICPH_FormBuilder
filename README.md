@@ -11,7 +11,8 @@ This repository contains one user-facing web app and one lean mapper backend:
 ## Quick Start With Docker
 
 Docker is the recommended way to run the ICPH app on a new machine. The image
-builds the Node app plus both Python environments expected by the server:
+builds the web app once, then starts the web app plus both Python environments
+expected by the server:
 
 - `ODK/.venv-xlsform` for `pyxform` and `xls2xform`
 - `agentic-entity-mapper/.venv` for mapper/preprocessing scripts
@@ -259,6 +260,8 @@ submitted entries, mapper CSV, and generated FHIR bundles.
 
 ## Run Form Builder
 
+For day-to-day development without Docker:
+
 ```bash
 cd form-builder
 npm install
@@ -302,10 +305,17 @@ The API port can be changed with:
 ICPH_FORM_BUILDER_API_PORT=8787 npm run server
 ```
 
-The frontend API URL can be changed at build/runtime with:
+The frontend API URL can be changed for local development with:
 
 ```bash
 VITE_FORM_BUILDER_API=http://localhost:8787 npm run client
+```
+
+To test the built frontend locally:
+
+```bash
+npm run build
+npm run start
 ```
 
 ## Refresh ICPH Schema Metadata

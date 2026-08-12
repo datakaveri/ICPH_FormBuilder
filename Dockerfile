@@ -23,8 +23,9 @@ RUN python3 -m venv agentic-entity-mapper/.venv \
     && agentic-entity-mapper/.venv/bin/python -m pip install -r agentic-entity-mapper/requirements.txt
 
 COPY . .
+RUN cd form-builder && npm run build
 
 EXPOSE 5173 8787
 
 WORKDIR /app/form-builder
-CMD ["npm", "run", "dev"]
+CMD ["npm", "run", "start"]

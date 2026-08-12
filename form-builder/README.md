@@ -17,7 +17,7 @@ The source of truth is a small JSON form model that exports to XLSForm sheets:
 - `choices`
 - `settings`
 
-## Run
+## Run For Local Development
 
 From the repository root:
 
@@ -57,8 +57,9 @@ Open:
 http://localhost:5173
 ```
 
-The compose setup persists generated forms and submissions to `output/forms/`
-on the host.
+The Docker image builds the frontend first and then serves the built app on
+port `5173`. The compose setup persists generated forms and submissions to
+`output/forms/` on the host.
 
 ## Current Flow
 

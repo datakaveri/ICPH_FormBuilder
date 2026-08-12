@@ -7,8 +7,9 @@
     "dev": "concurrently -k \"npm:server\" \"npm:client\"",
     "client": "vite --host 0.0.0.0 --port 5173",
     "server": "node server/index.js",
+    "start": "concurrently -k \"npm:server\" \"npm:preview\"",
     "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 4173"
+    "preview": "vite preview --host 0.0.0.0 --port 5173"
   },
   "dependencies": {
     "@getodk/web-forms": "^0.24.0",
