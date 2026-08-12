@@ -1,7 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { createApp, h } from "vue";
-import { OdkWebForm, POST_SUBMIT__NEW_INSTANCE, webFormsPlugin } from "@getodk/web-forms";
 import {
   AlertCircle,
   Calendar,
@@ -46,6 +44,23 @@ const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
 const ADMIN_TOKEN_KEY = "icph_admin_token";
 let runtimeAdminToken = "";
 let runtimeAdminPassword = "";
+let odkWebFormsLoader = null;
+
+function loadOdkWebForms() {
+  if (!odkWebFormsLoader) {
+    odkWebFormsLoader = Promise.all([
+      import("vue"),
+      import("@getodk/web-forms")
+    ]).then(([vue, webForms]) => ({
+      createApp: vue.createApp,
+      h: vue.h,
+      OdkWebForm: webForms.OdkWebForm,
+      POST_SUBMIT__NEW_INSTANCE: webForms.POST_SUBMIT__NEW_INSTANCE,
+      webFormsPlugin: webForms.webFormsPlugin
+    }));
+  }
+  return odkWebFormsLoader;
+}
 
 function getAdminToken() {
   if (runtimeAdminToken) return runtimeAdminToken;
@@ -6071,6 +6086,7 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
   const mountRef = useRef(null);
   const submittedRef = useRef(onSubmitted);
   const errorRef = useRef(onError);
+  const [loadState, setLoadState] = useState({ kind: "busy", message: "Loading form..." });
   const apiBase = formApiBase || `/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}`;
   const timerController = useTimerController(form, mountRef);
   const finalizeTimersRef = useRef(timerController.finalizeTimers);
@@ -6087,6 +6103,9 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
   useEffect(() => {
     const mountPoint = mountRef.current;
     if (!mountPoint || !formXml) return undefined;
+    let app = null;
+    let cancelled = false;
+    setLoadState({ kind: "busy", message: "Loading form..." });
 
     async function submitOdkPayload(payload) {
       const dataItems = Array.isArray(payload?.data) ? payload.data : [];
@@ -6107,39 +6126,74 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
       });
     }
 
-    const app = createApp({
-      render() {
-        return h(OdkWebForm, {
-          formXml,
-          trackDevice: true,
-          fetchFormAttachment: async (resource) => {
-            const fileName = String(resource?.href || resource || "").split(/[\\/]/).filter(Boolean).pop() || "";
-            return fetch(`${API_BASE}${apiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: adminAuthHeaders() });
-          },
-          onSubmit: (payload, done) => {
-            const completion = submitOdkPayload(payload)
-              .then(() => {
-                submittedRef.current?.();
-                return { next: POST_SUBMIT__NEW_INSTANCE };
-              })
-              .catch((error) => {
-                errorRef.current?.(error);
-                return null;
-              });
-            done(completion);
+    async function mountOdkForm() {
+      try {
+        const {
+          createApp,
+          h,
+          OdkWebForm,
+          POST_SUBMIT__NEW_INSTANCE,
+          webFormsPlugin
+        } = await loadOdkWebForms();
+        if (cancelled) return;
+        app = createApp({
+          render() {
+            return h(OdkWebForm, {
+              formXml,
+              trackDevice: true,
+              fetchFormAttachment: async (resource) => {
+                const fileName = String(resource?.href || resource || "").split(/[\\/]/).filter(Boolean).pop() || "";
+                return fetch(`${API_BASE}${apiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: adminAuthHeaders() });
+              },
+              onSubmit: (payload, done) => {
+                const completion = submitOdkPayload(payload)
+                  .then(() => {
+                    submittedRef.current?.();
+                    return { next: POST_SUBMIT__NEW_INSTANCE };
+                  })
+                  .catch((error) => {
+                    errorRef.current?.(error);
+                    return null;
+                  });
+                done(completion);
+              }
+            });
           }
         });
+        app.use(webFormsPlugin);
+        app.mount(mountPoint);
+        setLoadState({ kind: "idle", message: "" });
+      } catch (error) {
+        if (cancelled) return;
+        const message = error?.message || String(error);
+        setLoadState({ kind: "error", message });
+        errorRef.current?.(error);
       }
-    });
-    app.use(webFormsPlugin);
-    app.mount(mountPoint);
+    }
 
-    return () => app.unmount();
+    mountOdkForm();
+
+    return () => {
+      cancelled = true;
+      if (app) app.unmount();
+    };
   }, [apiBase, formXml, workspaceId]);
 
   return (
     <>
       <TimerRespondentPanel {...timerController} />
+      {loadState.kind === "busy" ? (
+        <div className="status-line busy">
+          <RefreshCw size={16} />
+          <span>{loadState.message}</span>
+        </div>
+      ) : null}
+      {loadState.kind === "error" ? (
+        <div className="status-line error">
+          <AlertCircle size={16} />
+          <span>{loadState.message}</span>
+        </div>
+      ) : null}
       <div className="odk-web-form-host" ref={mountRef} />
     </>
   );
