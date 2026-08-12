@@ -1340,9 +1340,11 @@ async function saveTerminologyReview(workspaceId, payload) {
     throw new Error("Terminology review is locked after publishing. Create a new version to change mappings.");
   }
   const resultPath = terminologyResultPath(outputDir);
-  if (!existsSync(resultPath)) throw new Error("Run terminology extraction before saving vocabulary review.");
   const terminology = payload?.terminology;
   if (!terminology || typeof terminology !== "object") throw new Error("Terminology review payload is required.");
+  if (!existsSync(resultPath) && terminology.status !== "skipped_unmapped") {
+    throw new Error("Run terminology extraction before saving vocabulary review.");
+  }
   const body = {
     ...terminology,
     ok: terminology.ok !== false,

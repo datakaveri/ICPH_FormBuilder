@@ -1479,6 +1479,7 @@ function terminologyReviewStats(terminology = {}) {
 }
 
 function terminologyPublishIssue(terminology = {}) {
+  if (terminology.status === "skipped_unmapped") return "";
   if (terminology.status === "running") return "Terminology extraction is still running. Review the vocabulary results before publishing.";
   if (terminology.status !== "complete") return "Run Terminology before publishing, then approve every vocabulary item.";
   const stats = terminologyReviewStats(terminology);
@@ -2130,6 +2131,8 @@ function DashboardApp({ onLogout }) {
   const [newFormPromptOpen, setNewFormPromptOpen] = useState(false);
   const [publishIdentifierPrompt, setPublishIdentifierPrompt] = useState(false);
   const [publishConfirmationAccepted, setPublishConfirmationAccepted] = useState(false);
+  const [confirmationDialog, setConfirmationDialog] = useState(null);
+  const confirmationResolverRef = useRef(null);
   const [form, setForm] = useState(defaultForm());
   const [workspace, setWorkspace] = useState(null);
   const [entries, setEntries] = useState([]);
@@ -2275,6 +2278,20 @@ function DashboardApp({ onLogout }) {
       return;
     }
     setStatus({ kind: "error", message });
+  }
+
+  function requestConfirmation(options) {
+    return new Promise((resolve) => {
+      confirmationResolverRef.current = resolve;
+      setConfirmationDialog(options);
+    });
+  }
+
+  function closeConfirmationDialog(confirmed) {
+    const resolver = confirmationResolverRef.current;
+    confirmationResolverRef.current = null;
+    setConfirmationDialog(null);
+    if (resolver) resolver(Boolean(confirmed));
   }
 
   function updateForm(patch) {
@@ -2425,9 +2442,12 @@ function DashboardApp({ onLogout }) {
 	      setStatus({ kind: "error", message: "Edit at least one Build item before finishing this new version." });
 	      return;
 	    }
-    const confirmed = window.confirm(
-      "Finish Build?\n\nAfter this point, the form definition cannot be edited. You can continue to Terminology review and Publish, but Build will be locked.\n\nProceed?"
-    );
+    const confirmed = await requestConfirmation({
+      title: "Finish Build?",
+      message: "After this point, the form definition cannot be edited. You can continue to Terminology review and Publish, but Build will be locked.",
+      confirmLabel: "Finish Build",
+      confirmIcon: "check"
+    });
     if (!confirmed) return;
     const finishedAt = form.buildFinishedAt || new Date().toISOString();
     const nextForm = { ...form, buildFinishedAt: finishedAt, updatedAt: finishedAt };
@@ -2463,26 +2483,6 @@ function DashboardApp({ onLogout }) {
     return primaryIdentifierCandidatesForForm(sourceForm);
   }
 
-  function publishConfirmationMessage() {
-    const lines = [
-      "Move to Publish?",
-      "",
-      "After this point, the terminology review will be locked and vocabulary mappings cannot be edited. The form will move into local collection.",
-      ""
-    ];
-    if (form.previousVersionWorkspaceId) {
-      const summary = copiedVersionChanges.length ? copiedVersionChanges : ["No detected build changes"];
-      lines.push(
-        `Version ${form.versionNumber || form.version || ""} changes:`,
-        ...summary.slice(0, 12).map((item) => `- ${item}`)
-      );
-      if (summary.length > 12) lines.push(`- +${summary.length - 12} more`);
-      lines.push("");
-    }
-    lines.push("Proceed?");
-    return lines.join("\n");
-  }
-
   async function exportXlsForm(primaryIdentifierVariable = "", options = {}) {
     if (!workspace?.workspaceId) {
       setStatus({ kind: "error", message: "Create a form workspace before export." });
@@ -2502,10 +2502,13 @@ function DashboardApp({ onLogout }) {
       focusMissingResources(missingResourceRequirements);
       return;
     }
+    const localReviewIssue = options.terminologyOverride
+      ? terminologyPublishIssue(options.terminologyOverride)
+      : reviewIssue;
     if (!alreadyPublished) {
-	      if (reviewIssue) {
+	      if (localReviewIssue) {
 	        setActiveStage("terminology");
-	        setStatus({ kind: "error", message: reviewIssue });
+	        setStatus({ kind: "error", message: localReviewIssue });
 	        return;
 	      }
 	    }
@@ -2515,7 +2518,18 @@ function DashboardApp({ onLogout }) {
 	      return;
 	    }
     if (!alreadyPublished && !options.publishConfirmed) {
-      const confirmed = window.confirm(publishConfirmationMessage());
+      const confirmed = await requestConfirmation({
+        title: "Move to Publish?",
+        message: "After this point, the terminology review will be locked and vocabulary mappings cannot be edited. The form will move into local collection.",
+        details: form.previousVersionWorkspaceId
+          ? [
+              `Version ${form.versionNumber || form.version || ""} changes:`,
+              ...(copiedVersionChanges.length ? copiedVersionChanges : ["No detected build changes"]).slice(0, 12)
+            ]
+          : [],
+        confirmLabel: "Move to Publish",
+        confirmIcon: "forward"
+      });
       if (!confirmed) return;
     }
     const explicitPrimaryIdentifier = typeof primaryIdentifierVariable === "string" ? primaryIdentifierVariable : "";
@@ -2636,7 +2650,7 @@ function DashboardApp({ onLogout }) {
 		  }
 	  }
 
-		  async function createNewVersion() {
+  async function createNewVersion() {
 	    if (!workspace?.workspaceId) {
 	      setStatus({ kind: "error", message: "Open a published form before creating a new version." });
 	      return;
@@ -2645,9 +2659,12 @@ function DashboardApp({ onLogout }) {
 	      setStatus({ kind: "error", message: "Publish the current form before creating a new version." });
 	      return;
 	    }
-	    const confirmed = window.confirm(
-	      "Create a new version?\n\nThis copies the form definition, attachments, and terminology review into a new editable workspace. Submitted entries, XML, and FHIR bundles stay with the published version.\n\nProceed?"
-	    );
+	    const confirmed = await requestConfirmation({
+	      title: "Create a new version?",
+	      message: "This copies the form definition, attachments, and terminology review into a new editable workspace. Submitted entries, XML, and FHIR bundles stay with the published version.",
+	      confirmLabel: "Create Version",
+	      confirmIcon: "copy"
+	    });
 	    if (!confirmed) return;
 	    setStatus({ kind: "busy", message: "Creating new editable version..." });
 	    try {
@@ -2775,6 +2792,76 @@ function DashboardApp({ onLogout }) {
     }
     setStatus({ kind: "ok", message: "Vocabulary review updated locally. Publish is unlocked only after every entity is reviewed." });
     return nextTerminology;
+  }
+
+  async function leaveAllTerminologyUnmappedAndPublish() {
+    if (!workspace?.workspaceId) {
+      setStatus({ kind: "error", message: "Open a form workspace before moving to Publish." });
+      return;
+    }
+    const stats = terminologyReviewStats(terminology);
+    const hasExtractedEntities = stats.total > 0;
+    const confirmed = await requestConfirmation({
+      title: "Leave Everything Unmapped?",
+      message: hasExtractedEntities
+        ? "Every terminology entity will be marked as reviewed with no vocabulary code selected, then the form will move to Publish. This locks terminology review for this version."
+        : "Terminology extraction will be skipped, no vocabulary codes will be attached, and the form will move to Publish. This locks terminology review for this version.",
+      details: hasExtractedEntities
+        ? [`${stats.pending} pending item${stats.pending === 1 ? "" : "s"} will be marked unmapped.`, `${stats.total} total terminology item${stats.total === 1 ? "" : "s"} will have no approved mapping.`]
+        : ["No terminology extraction results are required for this action.", "FHIR generation will use the form definition and submitted answers without approved vocabulary mappings."],
+      confirmLabel: "Leave Unmapped and Publish",
+      confirmIcon: "forward",
+      danger: true
+    });
+    if (!confirmed) return;
+
+    const previousTerminology = terminology || {};
+    const now = new Date().toISOString();
+    const nextTerminology = {
+      ...previousTerminology,
+      ok: true,
+      status: "skipped_unmapped",
+      completedAt: previousTerminology.completedAt || now,
+      skippedAt: now,
+      skipReason: "User chose to leave all terminology unmapped and move to Publish.",
+      questions: (Array.isArray(previousTerminology.questions) ? previousTerminology.questions : []).map((question) => ({
+        ...question,
+        entities: (Array.isArray(question.entities) ? question.entities : []).map((entity) => ({
+          ...entity,
+          previousSelection: {
+            terminology: entity.terminology || "",
+            code: entity.code || "",
+            term: entity.term || "",
+            approvedMappings: approvedMappingsForEntity(entity),
+            raw: entity.raw || null
+          },
+          terminology: "",
+          code: "",
+          term: "",
+          approvedMappings: [],
+          validated: true,
+          validationStatus: "unmapped_confirmed",
+          raw: {
+            ...(entity.raw || {}),
+            matched_via: "ui_bulk_unmapped_publish",
+            review_note: "User confirmed that all terminology entities should remain unmapped before publishing.",
+            reviewed_at: now
+          }
+        }))
+      }))
+    };
+
+    setStatus({ kind: "busy", message: "Marking terminology entities unmapped..." });
+    try {
+      const saved = await postJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspace.workspaceId))}/terminology/review`, {
+        terminology: nextTerminology
+      });
+      const savedTerminology = saved?.questions ? saved : nextTerminology;
+      setTerminology(savedTerminology);
+      await exportXlsForm("", { publishConfirmed: true, terminologyOverride: savedTerminology });
+    } catch (error) {
+      handleRequestError(error);
+    }
   }
 
   async function addTerminologyEntity(payload) {
@@ -2969,9 +3056,13 @@ function DashboardApp({ onLogout }) {
   }
 
   async function deleteSchemaDocument(fileName) {
-    const confirmed = window.confirm(
-      `Delete schema metadata document "${fileName}"?\n\nThis removes the uploaded DOCX and its processed Markdown/chunks. Existing FHIR bundles will not be changed.`
-    );
+    const confirmed = await requestConfirmation({
+      title: "Delete MetaForm?",
+      message: `Delete schema metadata document "${fileName}"? This removes the uploaded DOCX and its processed Markdown/chunks. Existing FHIR bundles will not be changed.`,
+      confirmLabel: "Delete",
+      confirmIcon: "trash",
+      danger: true
+    });
     if (!confirmed) return;
     setStatus({ kind: "busy", message: `Deleting ${fileName}...` });
     try {
@@ -2986,9 +3077,13 @@ function DashboardApp({ onLogout }) {
 
   async function deleteWorkspace(workspaceId, title) {
     const id = workspaceRouteId(workspaceId);
-    const confirmed = window.confirm(
-      `Delete "${title || id}"?\n\nThis will permanently remove its backend folder, including XLSForm, XML, entries, and FHIR bundles.`
-    );
+    const confirmed = await requestConfirmation({
+      title: "Delete Form?",
+      message: `Delete "${title || id}"? This will permanently remove its backend folder, including XLSForm, XML, entries, and FHIR bundles.`,
+      confirmLabel: "Delete",
+      confirmIcon: "trash",
+      danger: true
+    });
     if (!confirmed) return;
     setStatus({ kind: "busy", message: "Deleting form workspace..." });
     try {
@@ -3116,7 +3211,13 @@ function DashboardApp({ onLogout }) {
   async function deleteWorkspaceAttachment(workspaceId, fileName) {
     const id = workspaceRouteId(workspaceId);
     if (!id || !fileName) return;
-    const confirmed = window.confirm(`Delete attachment "${fileName}" from this form workspace?`);
+    const confirmed = await requestConfirmation({
+      title: "Delete Attachment?",
+      message: `Delete attachment "${fileName}" from this form workspace?`,
+      confirmLabel: "Delete",
+      confirmIcon: "trash",
+      danger: true
+    });
     if (!confirmed) return;
     setStatus({ kind: "busy", message: `Deleting ${fileName}...` });
     try {
@@ -3196,6 +3297,7 @@ function DashboardApp({ onLogout }) {
 	          isCopiedVersionDraft={isCopiedVersionDraft}
 	          copiedVersionHasChanges={copiedVersionHasChanges}
 	          createNewVersion={createNewVersion}
+	          leaveAllTerminologyUnmappedAndPublish={leaveAllTerminologyUnmappedAndPublish}
 	          passToMapper={passToMapper}
           backHome={backHome}
           fillForm={fillForm}
@@ -3223,6 +3325,13 @@ function DashboardApp({ onLogout }) {
             setPublishConfirmationAccepted(false);
             exportXlsForm(primaryIdentifierVariable, { publishConfirmed });
           }}
+        />
+      ) : null}
+      {confirmationDialog ? (
+        <ConfirmationModal
+          {...confirmationDialog}
+          onCancel={() => closeConfirmationDialog(false)}
+          onConfirm={() => closeConfirmationDialog(true)}
         />
       ) : null}
     </div>
@@ -4021,6 +4130,38 @@ function PublishIdentifierModal({ form, candidates, status, onCancel, onPublish 
   );
 }
 
+function ConfirmationModal({ title, message, details = [], confirmLabel = "Confirm", cancelLabel = "Cancel", confirmIcon = "check", danger = false, onCancel, onConfirm }) {
+  const Icon = confirmIcon === "forward" ? Forward : confirmIcon === "copy" ? Copy : confirmIcon === "trash" ? Trash2 : Check;
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="link-modal confirmation-modal" role="dialog" aria-modal="true" aria-label={title || "Confirm action"}>
+        <div className="modal-head">
+          <div>
+            <h2>{title || "Confirm action"}</h2>
+            {message ? <p>{message}</p> : null}
+          </div>
+          <button className="icon-button" onClick={onCancel} aria-label="Close confirmation dialog">
+            <X size={15} />
+          </button>
+        </div>
+        {details.length ? (
+          <div className="confirmation-details">
+            {details.map((item, index) => (
+              <span key={`${item}_${index}`}>{item}</span>
+            ))}
+          </div>
+        ) : null}
+        <div className="modal-actions">
+          <button className="secondary" onClick={onCancel}>{cancelLabel}</button>
+          <button className={danger ? "primary danger-confirm" : "primary"} onClick={onConfirm}>
+            <Icon size={16} /> {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BuilderPage(props) {
   const {
     form,
@@ -4056,6 +4197,7 @@ function BuilderPage(props) {
 	    isCopiedVersionDraft,
 	    copiedVersionHasChanges,
 	    createNewVersion,
+	    leaveAllTerminologyUnmappedAndPublish,
 	    passToMapper,
     backHome,
     fillForm,
@@ -4347,7 +4489,7 @@ function BuilderPage(props) {
         ) : null}
       </main>
       )}
-      <BuilderFooter
+        <BuilderFooter
         activeStage={activeStage}
         status={status}
         locked={locked}
@@ -4368,6 +4510,7 @@ function BuilderPage(props) {
 	        isCopiedVersionDraft={isCopiedVersionDraft}
 	        copiedVersionHasChanges={copiedVersionHasChanges}
 	        createNewVersion={createNewVersion}
+	        leaveAllTerminologyUnmappedAndPublish={leaveAllTerminologyUnmappedAndPublish}
 	      />
     </>
   );
@@ -4393,7 +4536,8 @@ function BuilderFooter({
 	  reviewIssue,
 	  isCopiedVersionDraft,
 	  copiedVersionHasChanges,
-	  createNewVersion
+	  createNewVersion,
+	  leaveAllTerminologyUnmappedAndPublish
 	}) {
 	  const missingResources = resourceRequirements.some((item) => !item.uploaded);
 	  const busy = status.kind === "busy";
@@ -4437,6 +4581,15 @@ function BuilderFooter({
         ) : null}
 	        {activeStage === "terminology" ? (
 	          <>
+	            {!published ? (
+	              <button
+	                className="secondary"
+	                disabled={busy || !buildFinished || issues.length > 0 || (isCopiedVersionDraft && !copiedVersionHasChanges)}
+	                onClick={leaveAllTerminologyUnmappedAndPublish}
+	              >
+	                <X size={16} /> Leave everything unmapped and move to Publish
+	              </button>
+	            ) : null}
 	            <button
 	              className="primary"
 	              disabled={published ? busy : busy || !buildFinished || issues.length > 0 || Boolean(reviewIssue) || (isCopiedVersionDraft && !copiedVersionHasChanges)}

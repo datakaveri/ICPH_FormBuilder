@@ -42,7 +42,12 @@ SchemaTerminologies/schemas/*
 !SchemaTerminologies/schemas/fhir/
 !SchemaTerminologies/schemas/fhir/**
 !SchemaTerminologies/schemas/ICPH_MetaForms/
-!SchemaTerminologies/schemas/ICPH_MetaForms/**
+!SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/
+!SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/
+SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/*
+SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/*
+!SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/.gitkeep
+!SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/.gitkeep
 SchemaTerminologies/**/.DS_Store
 
 # Local implementation notes and one-off audit reports

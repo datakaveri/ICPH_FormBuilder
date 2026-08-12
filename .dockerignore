@@ -4,6 +4,7 @@
 
 # Local runtime state
 output/
+input/
 *.log
 
 # Node/Vite artifacts
@@ -11,6 +12,7 @@ output/
 **/dist/
 **/.vite/
 **/coverage/
+form-builder/scripts/smoke_pipeline.mjs
 
 # Python environments and caches
 **/.venv/
@@ -23,8 +25,20 @@ output/
 
 # Local ODK Central state and vendored runtime artifacts
 ODK/.venv-xlsform/
+ODK/central/
+ODK/README-local-odk.md
+ODK/tools/central-*.sh
+ODK/*.xlsx
+ODK/*.csv
+ODK/Exit_Interview/
+ODK/ICPH_All_Question_Types_Test_assets/
+ODK/forms/converted/
 ODK/central/.env
 ODK/central/files/
 ODK/central/*/files/
 ODK/central/*/node_modules/
 ODK/central/*/tmp/
+
+# Uploaded MetaForms and generated schema chunks.
+agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/*
+agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/*

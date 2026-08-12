@@ -39,10 +39,23 @@ coverage/
 
 # Local app outputs and uploaded/generated data
 output/
+input/
 agentic-entity-mapper/output/
 agentic-entity-mapper/cache/
 agentic-entity-mapper/data/
 form-builder/dist/
+form-builder/scripts/smoke_pipeline.mjs
+
+# Local/demo XLSForms, MetaForms, and generated schema chunks.
+ODK/*.xlsx
+ODK/*.csv
+ODK/Exit_Interview/
+ODK/ICPH_All_Question_Types_Test_assets/
+ODK/forms/converted/
+agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/*
+agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/*
+!agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/.gitkeep
+!agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/.gitkeep
 
 # Large terminology/model assets. Keep lightweight schemas tracked.
 agentic-entity-mapper/SchemaTerminologies/artifacts/
@@ -52,6 +65,9 @@ agentic-entity-mapper/SchemaTerminologies/nltk_data/
 
 # Local ODK runtimes and mutable Central data
 ODK/.venv-xlsform/
+ODK/central/
+ODK/README-local-odk.md
+ODK/tools/central-*.sh
 ODK/central/.env
 ODK/central/files/
 ODK/central/*/files/

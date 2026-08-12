@@ -19,8 +19,10 @@ The source of truth is a small JSON form model that exports to XLSForm sheets:
 
 ## Run
 
+From the repository root:
+
 ```bash
-cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH/form-builder
+cd ICPH/form-builder
 npm install
 npm run dev
 ```
@@ -39,9 +41,10 @@ http://localhost:8787
 
 ## Run With Docker
 
-From the repository root:
+From the `ICPH/` directory:
 
 ```bash
+cd ICPH
 docker compose up --build
 ```
 
@@ -57,7 +60,7 @@ on the host.
 ## Current Flow
 
 The app opens on a home dashboard. It shows every form workspace under
-`ICPH/output/forms`, including the current pipeline stage:
+`../output/forms`, including the current pipeline stage:
 
 - `Building`: draft exists, XML has not been generated yet
 - `Publishing`: XLSForm/XML exist and the form can be filled locally
@@ -89,7 +92,7 @@ data/<form-id>_entries.csv
 Clicking `Create New Form` creates a dedicated folder under:
 
 ```text
-/Users/NIKITA/Desktop/IISc_CDPG/ICPH/output/forms/
+../output/forms/
 ```
 
 Each form workspace contains:
@@ -115,7 +118,7 @@ The `data/` and `fhir_bundles/` folders are placeholders for the next pipeline s
 The app uses the existing ODK Python environment:
 
 ```text
-/Users/NIKITA/Desktop/IISc_CDPG/ICPH/ODK/.venv-xlsform
+../ODK/.venv-xlsform
 ```
 
 The server writes XLSX with:

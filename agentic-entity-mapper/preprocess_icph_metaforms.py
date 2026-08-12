@@ -19,14 +19,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-try:
-    from markitdown import MarkItDown
-except ImportError as exc:  # pragma: no cover - gives a useful CLI failure.
-    raise SystemExit(
-        "markitdown is not installed. Run: "
-        "python -m pip install 'markitdown[docx]'"
-    ) from exc
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_META_FORMS_ROOT = PROJECT_ROOT / "SchemaTerminologies" / "schemas" / "ICPH_MetaForms"
@@ -82,6 +74,26 @@ def clean_markdown_cell(value: str) -> str:
     value = re.sub(r"\*(.*?)\*", r"\1", value)
     value = value.replace("\\|", "|")
     return re.sub(r"\s+", " ", value).strip()
+
+
+def clean_markdown_text(value: str) -> str:
+    value = clean_markdown_cell(value)
+    value = value.replace("\\*", "*").replace("\\_", "_")
+    value = re.sub(r"[_]{3,}", " ", value)
+    value = value.replace("☐", " ")
+    return re.sub(r"\s+", " ", value).strip(" -*\\")
+
+
+def variable_name_from_label(label: str, fallback: str) -> str:
+    text = clean_markdown_text(label).lower()
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    text = re.sub(r"_+", "_", text)
+    if not text:
+        return fallback
+    if re.match(r"^\d", text):
+        text = f"q_{text}"
+    return text[:64]
 
 
 def split_markdown_row(line: str) -> list[str]:
@@ -175,6 +187,187 @@ def extract_schema_rows(markdown_text: str, document_name: str, document_sha256:
                     row_index=row_index,
                 )
             )
+    if rows:
+        return rows
+    return extract_interview_rows(markdown_text, document_name, document_sha256)
+
+
+def markdown_heading_text(line: str) -> str:
+    match = re.fullmatch(r"\*\*(.+?)\*\*", line.strip())
+    return clean_markdown_text(match.group(1)) if match else ""
+
+
+def extract_document_title(lines: list[str], document_name: str) -> str:
+    for line in lines:
+        heading = markdown_heading_text(line)
+        if heading:
+            return heading
+    return Path(document_name).stem.replace("_", " ")
+
+
+def is_section_heading(text: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z]\s+.+", text)) and not re.match(r"^[A-Z]\d+\.", text)
+
+
+def option_text_from_line(line: str) -> str:
+    if "☐" not in line:
+        return ""
+    parts = [clean_markdown_text(part) for part in line.split("☐")]
+    return "; ".join(part for part in parts if part)
+
+
+def append_interview_row(
+    rows: list[SchemaRow],
+    *,
+    document_name: str,
+    document_sha256: str,
+    form_title: str,
+    variable: str,
+    question: str,
+    format_options: str = "",
+    instructions: str = "",
+) -> None:
+    if not variable or not question:
+        return
+    rows.append(
+        SchemaRow(
+            document_name=document_name,
+            document_sha256=document_sha256,
+            form_title=form_title,
+            form_index=1,
+            variable=variable,
+            question=question,
+            format_options=format_options,
+            instructions=instructions,
+            row_index=len(rows) + 1,
+        )
+    )
+
+
+def extract_identification_rows(table: list[list[str]], *, document_name: str, document_sha256: str, form_title: str) -> list[SchemaRow]:
+    rows: list[SchemaRow] = []
+    seen: set[str] = set()
+    for cells in table:
+        for cell in cells:
+            for match in re.finditer(r"\*\*(.+?)\*\*", cell):
+                label = clean_markdown_text(match.group(1))
+                if not label or len(label) > 90:
+                    continue
+                variable = variable_name_from_label(label, f"id_{len(rows) + 1}")
+                if variable in seen:
+                    continue
+                seen.add(variable)
+                append_interview_row(
+                    rows,
+                    document_name=document_name,
+                    document_sha256=document_sha256,
+                    form_title=form_title,
+                    variable=variable,
+                    question=label,
+                    format_options="free text/date field" if "date" in label.lower() else "free text",
+                )
+    return rows
+
+
+def extract_inline_label_rows(lines: list[str], *, document_name: str, document_sha256: str, form_title: str) -> list[SchemaRow]:
+    rows: list[SchemaRow] = []
+    seen: set[str] = set()
+    for line in lines:
+        if "___" not in line and "\\_" not in line:
+            continue
+        for match in re.finditer(r"\*\*(.+?)\*\*", line):
+            label = clean_markdown_text(match.group(1))
+            if not label or re.match(r"^[A-Z]\d+[A-Za-z]?\.", label) or is_section_heading(label):
+                continue
+            variable = variable_name_from_label(label, f"field_{len(rows) + 1}")
+            if variable in seen:
+                continue
+            seen.add(variable)
+            append_interview_row(
+                rows,
+                document_name=document_name,
+                document_sha256=document_sha256,
+                form_title=form_title,
+                variable=variable,
+                question=label,
+                format_options="free text/date field" if "date" in label.lower() else "free text",
+            )
+    return rows
+
+
+def extract_interview_rows(markdown_text: str, document_name: str, document_sha256: str) -> list[SchemaRow]:
+    lines = [line.strip() for line in markdown_text.splitlines() if line.strip()]
+    form_title = extract_document_title(lines, document_name)
+    rows: list[SchemaRow] = extract_inline_label_rows(
+        lines,
+        document_name=document_name,
+        document_sha256=document_sha256,
+        form_title=form_title,
+    )
+
+    for table in iter_markdown_tables(markdown_text):
+        if any("Participant ID" in cell for row in table for cell in row):
+            rows.extend(extract_identification_rows(table, document_name=document_name, document_sha256=document_sha256, form_title=form_title))
+
+    current: dict[str, object] | None = None
+    section = ""
+
+    def flush_current() -> None:
+        nonlocal current
+        if not current:
+            return
+        append_interview_row(
+            rows,
+            document_name=document_name,
+            document_sha256=document_sha256,
+            form_title=form_title,
+            variable=str(current["variable"]),
+            question=str(current["question"]),
+            format_options="; ".join(current["options"]) if current["options"] else str(current["format_options"]),
+            instructions=" ".join(current["instructions"]),
+        )
+        current = None
+
+    for line in lines:
+        heading = markdown_heading_text(line)
+        if heading and is_section_heading(heading):
+            flush_current()
+            section = heading
+            continue
+
+        question_match = re.match(r"\*\*([A-Z]\d+[A-Za-z]?)\.\s*(.+)\*\*", line)
+        if question_match:
+            flush_current()
+            variable = question_match.group(1)
+            question = clean_markdown_text(question_match.group(2))
+            current = {
+                "variable": variable,
+                "question": question,
+                "options": [],
+                "format_options": "",
+                "instructions": [section] if section else [],
+            }
+            continue
+
+        if not current:
+            continue
+
+        options = option_text_from_line(line)
+        if options:
+            current["options"].append(options)
+            continue
+
+        cleaned = clean_markdown_text(line)
+        if not cleaned:
+            if not current["format_options"]:
+                current["format_options"] = "free text"
+            continue
+        if cleaned.startswith("*") or cleaned.startswith("|"):
+            continue
+        if re.search(r"Hours:|minutes|describe|details|notes|approximately|If ", cleaned, flags=re.IGNORECASE):
+            current["instructions"].append(cleaned)
+
+    flush_current()
     return rows
 
 
@@ -251,6 +444,14 @@ def save_manifest(path: Path, manifest: dict) -> None:
 
 
 def process_docx(docx_path: Path, output_dir: Path, *, force: bool, manifest: dict) -> tuple[str, dict]:
+    try:
+        from markitdown import MarkItDown
+    except ImportError as exc:  # pragma: no cover - gives a useful CLI failure.
+        raise SystemExit(
+            "markitdown is not installed. Run: "
+            "python -m pip install 'markitdown[docx]'"
+        ) from exc
+
     digest = sha256_file(docx_path)
     stem = safe_stem(docx_path)
     markdown_path = output_dir / f"{stem}.md"

@@ -3094,6 +3094,36 @@ button:disabled {
   flex-wrap: wrap;
 }
 
+.confirmation-modal {
+  max-width: 540px;
+}
+
+.confirmation-details {
+  display: grid;
+  gap: 8px;
+  margin: 4px 0 18px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcff;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.confirmation-details span {
+  line-height: 1.35;
+}
+
+.danger-confirm {
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
+.danger-confirm:hover {
+  background: #a92319;
+  border-color: #a92319;
+}
+
 @media (max-width: 1100px) {
   .access-head {
     grid-template-columns: 1fr;

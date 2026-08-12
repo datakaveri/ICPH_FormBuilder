@@ -1,13 +1,72 @@
 # ICPH Form Builder And Mapper Workspace
 
-This workspace has one user-facing web app and one lean mapper backend:
+This repository contains one user-facing web app and one lean mapper backend:
 
 - `form-builder/`: React form builder, local form filling, terminology review,
   and FHIR handoff UI.
 - `agentic-entity-mapper/`: backend-only Python scripts for MetaForm
   preprocessing and FHIR bundle generation.
-- `ODK/.venv-xlsform/`: XLSForm tooling used by the Node API for XLSX/XML
-  import/export.
+- `ODK/`: XLSForm/ODK assets and tooling used by the app.
+
+## Quick Start With Docker
+
+Docker is the recommended way to run the ICPH app on a new machine. The image
+builds the Node app plus both Python environments expected by the server:
+
+- `ODK/.venv-xlsform` for `pyxform` and `xls2xform`
+- `agentic-entity-mapper/.venv` for mapper/preprocessing scripts
+
+From a fresh clone:
+
+```bash
+git clone <repo-url>
+cd <repo>/ICPH
+docker compose up --build
+```
+
+Open the app:
+
+```text
+http://localhost:5173
+```
+
+The API is exposed at:
+
+```text
+http://localhost:8787
+```
+
+The admin workspace is password-gated. The default local password is:
+
+```text
+ICPH2026
+```
+
+For any shared or deployed environment, set a different password before
+starting:
+
+```bash
+ICPH_ADMIN_PASSWORD='replace-this' docker compose up --build
+```
+
+Generated form workspaces and submissions are persisted on the host at:
+
+```text
+ICPH/output/forms/
+```
+
+Stop the containers with:
+
+```bash
+docker compose down
+```
+
+By default, the browser calls the API on the same hostname as the web app, port
+`8787`. If you need to override that, set the API URL explicitly:
+
+```bash
+VITE_FORM_BUILDER_API='http://your-hostname:8787' docker compose up --build
+```
 
 ## Active Flow
 
@@ -35,11 +94,16 @@ agent. Admins can manually add a missed entity from the Terminology tab. The UI
 warns if any typed words are not present in the question text or options, but
 the admin may still confirm and review that entity.
 
-## Required Runtime Environments
+## Local Development Without Docker
+
+Use this path only if you want to run the Node app and Python tooling directly
+on your machine.
+
+### Required Runtime Environments
 
 Two Python environments are required.
 
-### ODK XLSForm Environment
+#### ODK XLSForm Environment
 
 Required for:
 
@@ -54,7 +118,7 @@ ODK/.venv-xlsform/bin/python
 ODK/.venv-xlsform/bin/xls2xform
 ```
 
-### ICPH Mapper Environment
+#### ICPH Mapper Environment
 
 Required for:
 
@@ -76,7 +140,7 @@ creation.
 First-time setup:
 
 ```bash
-cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH/agentic-entity-mapper
+cd ICPH/agentic-entity-mapper
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -116,7 +180,7 @@ submitted entries, mapper CSV, and generated FHIR bundles.
 ## Run Form Builder
 
 ```bash
-cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH/form-builder
+cd ICPH/form-builder
 npm install
 npm run dev
 ```
@@ -164,58 +228,12 @@ The frontend API URL can be changed at build/runtime with:
 VITE_FORM_BUILDER_API=http://localhost:8787 npm run client
 ```
 
-## Run With Docker
-
-The ICPH form-builder and mapper app can be shared as a Docker image. The image
-builds the Node app plus both Python environments expected by the server:
-
-- `ODK/.venv-xlsform` for `pyxform` and `xls2xform`
-- `agentic-entity-mapper/.venv` for mapper/preprocessing scripts
-
-Build and start:
-
-```bash
-cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH
-docker compose up --build
-```
-
-Open:
-
-```text
-http://localhost:5173
-```
-
-The API is exposed at:
-
-```text
-http://localhost:8787
-```
-
-Generated workspaces are persisted on the host in:
-
-```text
-output/forms/
-```
-
-For deployments, change the admin password before starting:
-
-```bash
-ICPH_ADMIN_PASSWORD='replace-this' docker compose up --build
-```
-
-By default, the browser calls the API on the same hostname as the web app, port
-`8787`. If you need to override that, set the API URL explicitly:
-
-```bash
-VITE_FORM_BUILDER_API='http://your-hostname:8787' docker compose up --build
-```
-
 ## Refresh ICPH Schema Metadata
 
 Run this after changing or adding a schema DOCX:
 
 ```bash
-cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH/agentic-entity-mapper
+cd ICPH/agentic-entity-mapper
 ./.venv/bin/python preprocess_icph_metaforms.py
 ```
 
@@ -228,13 +246,13 @@ To force a full rebuild:
 ## Smoke Checks
 
 ```bash
-cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH/form-builder
+cd ICPH/form-builder
 node --check server/index.js
 npm run build
 ```
 
 ```bash
-cd /Users/NIKITA/Desktop/IISc_CDPG/ICPH/agentic-entity-mapper
+cd ICPH/agentic-entity-mapper
 ./.venv/bin/python -m py_compile generic_form_fhir_agent.py preprocess_icph_metaforms.py
 ./.venv/bin/python -m unittest discover tests
 ```
