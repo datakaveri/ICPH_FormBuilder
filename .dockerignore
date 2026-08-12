@@ -24,6 +24,7 @@ form-builder/scripts/smoke_pipeline.mjs
 **/.ruff_cache/
 
 # Local ODK Central state and vendored runtime artifacts
+agentic-entity-mapper/*.zip
 ODK/.venv-xlsform/
 ODK/central/
 ODK/README-local-odk.md

@@ -26,6 +26,12 @@ Without those optional files, the app still runs. Terminology extraction reports
 missing-lookup warnings, and admins can either leave everything unmapped or add
 approved mappings manually in the Terminology tab.
 
+For client handoff, the full folder may be supplied as
+`ICPH_SchemaTerminologies.zip`. Place that ZIP in `agentic-entity-mapper/`,
+rename or move this lightweight `SchemaTerminologies/` folder out of the way,
+and unzip the file. The unzipped folder must be named exactly
+`SchemaTerminologies`.
+
 To refresh MetaForm metadata after adding DOCX files:
 
 ```bash

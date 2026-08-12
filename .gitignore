@@ -47,6 +47,7 @@ form-builder/dist/
 form-builder/scripts/smoke_pipeline.mjs
 
 # Local/demo XLSForms, MetaForms, and generated schema chunks.
+agentic-entity-mapper/*.zip
 ODK/*.xlsx
 ODK/*.csv
 ODK/Exit_Interview/

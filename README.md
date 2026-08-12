@@ -19,10 +19,53 @@ builds the Node app plus both Python environments expected by the server:
 From a fresh clone:
 
 ```bash
-git clone <repo-url>
-cd <repo>
+git clone https://github.com/nikipatil281/ICPH_health.git ICPH
+cd ICPH
 docker compose up --build
 ```
+
+Run `docker compose up --build` from the directory that contains
+`docker-compose.yml`. If Docker says `no configuration file provided: not
+found`, check your current folder:
+
+```bash
+pwd
+ls docker-compose.yml
+```
+
+If `ls` cannot find `docker-compose.yml`, `cd` into the cloned `ICPH` folder
+before running Docker Compose.
+
+## Add Client Terminology Assets
+
+The Git repository contains a lightweight `SchemaTerminologies/` folder so the
+app can run from a fresh clone. For client handoff, copy the provided
+`ICPH_SchemaTerminologies.zip` file into:
+
+```text
+agentic-entity-mapper/
+```
+
+Then replace the lightweight folder with the unzipped one. From the repository
+root:
+
+```bash
+cd agentic-entity-mapper
+mv SchemaTerminologies SchemaTerminologies.git-lite
+unzip ICPH_SchemaTerminologies.zip
+cd ..
+docker compose up --build
+```
+
+The ZIP file is named `ICPH_SchemaTerminologies.zip`, but it must unzip to a
+folder named exactly:
+
+```text
+SchemaTerminologies
+```
+
+The ZIP itself is ignored by Git and Docker. Docker uses the unzipped
+`agentic-entity-mapper/SchemaTerminologies/` folder when building the app.
 
 Open the app:
 
