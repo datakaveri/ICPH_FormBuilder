@@ -149,12 +149,38 @@ LLM-assisted extraction is temporarily down and disabled in the UI. FHIR bundle
 generation runs locally and does not call an LLM or require external model
 access; it can use admin-approved terminology mappings when available.
 
-## Offline Access
+## PWA and Offline Collection
 
-This release requires a connection to the app server. Offline form filling,
-queued submissions, and PWA installation are not included. Those need explicit
-offline data storage, conflict/retry, and participant-data protection behavior;
-they should be implemented and tested as a separate release before field use.
+The respondent experience is installable as a Progressive Web App on supported
+Android browsers. The app shell is cached, and a published form is saved on a
+device after it is opened successfully online. The cached copy includes its
+XForm, form definition, choice lists, and uploaded form media. Respondents can
+then reopen that form and submit while disconnected.
+
+Completed submissions and checkpoints are written to encrypted IndexedDB
+before upload. The browser retries them when connectivity returns, when the app
+is reopened, and through Android Background Sync where the browser supports it.
+The server uses an idempotency key so a retry after an interrupted response
+does not create a duplicate. ODK submission attachments are queued with their
+instance XML. A visible sync count and a manual **Sync now** action are shown
+while there are pending items.
+
+Answer drafts and queued submissions use AES-GCM with a non-extractable,
+per-browser key. This protects the stored database from casual inspection, but
+it is not a substitute for device security: anyone who can run the app in that
+browser profile can access its records. Use managed, screen-locked devices for
+participant data, do not clear browser site data while items are waiting to
+sync, and verify the pending-sync count is zero before retiring a device.
+Browser storage can still be removed by the user or operating system, so it is
+not a backup.
+
+For AWS, serve the app and `/api/` on the **same HTTPS origin** through the
+reverse proxy. Set `VITE_FORM_BUILDER_API` to that public HTTPS origin before
+building the Docker image (for example, `https://forms.example.org`). HTTPS is
+required for PWA installation and for camera, geolocation, and secure browser
+storage APIs. Android camera/file permissions remain controlled by the browser
+and the device. Forms must be opened online once on each device before they
+can be filled offline.
 
 ## Local Development Without Docker
 

@@ -41,6 +41,7 @@ if (
 }
 const adminPassword = configuredAdminPassword || "ICPH2026";
 const adminTokens = new Map();
+const activeSubmissionRequests = new Map();
 const adminTokenTtlMs = 12 * 60 * 60 * 1000;
 const accessCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const structuralQuestionTypes = new Set(["begin_group", "end_group", "begin_repeat", "end_repeat", "begin group", "end group", "begin repeat", "end repeat"]);
@@ -86,7 +87,16 @@ function binaryResponse(res, status, body, contentType = "application/octet-stre
 
 async function requestBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 160 * 1024 * 1024) {
+      const error = new Error("Request body exceeds the 160 MB server limit.");
+      error.statusCode = 413;
+      throw error;
+    }
+    chunks.push(chunk);
+  }
   const text = Buffer.concat(chunks).toString("utf8");
   return text ? JSON.parse(text) : {};
 }
@@ -1214,6 +1224,12 @@ async function loadPublicFormXml(value) {
 async function loadPublicAttachment(value, fileName) {
   const found = await findWorkspaceByRespondentCode(value);
   return loadAttachment(found.workspaceId, fileName);
+}
+
+async function loadPublicAttachmentList(value) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const data = await listAttachments(found.workspaceId);
+  return { ok: true, accessCode: found.code, attachments: data.attachments };
 }
 
 async function submitPublicEntry(value, payload) {
@@ -2851,12 +2867,32 @@ async function deleteEntries(workspaceId, payload) {
   };
 }
 
-async function submitEntry(workspaceId, payload) {
+function runIdempotentSubmission(workspaceId, payload, submit) {
+  const clientSubmissionId = String(payload.clientSubmissionId || "").trim().slice(0, 120);
+  if (!clientSubmissionId) return submit();
+  const key = `${cleanWorkspaceId(workspaceId)}:${clientSubmissionId}`;
+  const active = activeSubmissionRequests.get(key);
+  if (active) return active;
+  const pending = submit().finally(() => {
+    if (activeSubmissionRequests.get(key) === pending) activeSubmissionRequests.delete(key);
+  });
+  activeSubmissionRequests.set(key, pending);
+  return pending;
+}
+
+function submitEntry(workspaceId, payload) {
+  return runIdempotentSubmission(workspaceId, payload, () => submitEntryUnlocked(workspaceId, payload));
+}
+
+async function submitEntryUnlocked(workspaceId, payload) {
   const loaded = await loadDraft(workspaceId);
   const submittedAt = isoStamp();
   const answers = payload.answers || {};
   const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
   const existing = await readEntries(workspaceId);
+  const clientSubmissionId = String(payload.clientSubmissionId || "").trim().slice(0, 120);
+  const previousSubmission = clientSubmissionId && existing.find((item) => item.clientSubmissionId === clientSubmissionId);
+  if (previousSubmission) return { ok: true, workspaceId, entry: previousSubmission, entries: existing, duplicateRetry: true };
   const requestedEntryId = String(payload.entryId || "").trim();
   await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
   if (requestedEntryId) {
@@ -2869,6 +2905,7 @@ async function submitEntry(workspaceId, payload) {
     const updatedAt = isoStamp();
     const entry = {
       ...existing[index],
+      ...(clientSubmissionId ? { clientSubmissionId } : {}),
       updatedAt,
       instanceName: entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt),
       answers
@@ -2883,6 +2920,7 @@ async function submitEntry(workspaceId, payload) {
   }
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
+    ...(clientSubmissionId ? { clientSubmissionId } : {}),
     submittedAt,
     instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
     answers
@@ -2895,7 +2933,11 @@ async function submitEntry(workspaceId, payload) {
   return { ok: true, workspaceId, entry, entries, entriesPath, csvPath };
 }
 
-async function submitOdkEntry(workspaceId, payload) {
+function submitOdkEntry(workspaceId, payload) {
+  return runIdempotentSubmission(workspaceId, payload, () => submitOdkEntryUnlocked(workspaceId, payload));
+}
+
+async function submitOdkEntryUnlocked(workspaceId, payload) {
   const loaded = await loadDraft(workspaceId);
   const outputDir = loaded.outputDir;
   const instanceXml = String(payload.instanceXml || "").trim();
@@ -2903,6 +2945,9 @@ async function submitOdkEntry(workspaceId, payload) {
   const submittedAt = isoStamp();
   const answers = extractSimpleAnswersFromXml(instanceXml);
   const existing = await readEntries(workspaceId);
+  const clientSubmissionId = String(payload.clientSubmissionId || "").trim().slice(0, 120);
+  const previousSubmission = clientSubmissionId && existing.find((item) => item.clientSubmissionId === clientSubmissionId);
+  if (previousSubmission) return { ok: true, workspaceId, entry: previousSubmission, entries: existing, duplicateRetry: true };
   const requestedEntryId = String(payload.entryId || "").trim();
   await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
   if (requestedEntryId) {
@@ -2914,6 +2959,7 @@ async function submitOdkEntry(workspaceId, payload) {
     }
     const entry = {
       ...existing[index],
+      ...(clientSubmissionId ? { clientSubmissionId } : {}),
       updatedAt: isoStamp(),
       source: "odk-web-forms",
       payloadType: payload?.payloadType || "monolithic",
@@ -2922,6 +2968,8 @@ async function submitOdkEntry(workspaceId, payload) {
       answers,
       instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt)
     };
+    const attachments = await persistSubmissionAttachments(outputDir, entry.id, payload.attachments);
+    if (attachments.length) entry.attachments = [...(entry.attachments || []), ...attachments];
     const entries = [...existing];
     entries[index] = entry;
     const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
@@ -2931,6 +2979,7 @@ async function submitOdkEntry(workspaceId, payload) {
   }
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
+    ...(clientSubmissionId ? { clientSubmissionId } : {}),
     submittedAt,
     source: "odk-web-forms",
     payloadType: payload.payloadType || "monolithic",
@@ -2939,11 +2988,60 @@ async function submitOdkEntry(workspaceId, payload) {
     answers,
     instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, submittedAt)
   };
+  const attachments = await persistSubmissionAttachments(outputDir, entry.id, payload.attachments);
+  if (attachments.length) entry.attachments = attachments;
   const entries = [...existing, entry];
   const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
   const instancePath = path.join(outputDir, "data", `${entry.id}.xml`);
   await writeFile(instancePath, instanceXml + "\n", "utf8");
   return { ok: true, workspaceId, entry, entries, entriesPath, instancePath, csvPath };
+}
+
+async function persistSubmissionAttachments(outputDir, entryId, attachments = []) {
+  if (!Array.isArray(attachments) || !attachments.length) return [];
+  const directory = path.join(outputDir, "data", "submission_attachments", cleanAttachmentName(entryId));
+  const prepared = attachments.map((attachment) => {
+    const fileName = cleanAttachmentName(attachment?.fileName || attachment?.filename);
+    const data = Buffer.from(String(attachment?.dataBase64 || ""), "base64");
+    return { fileName, data, contentType: String(attachment?.contentType || "application/octet-stream") };
+  }).filter((attachment) => attachment.data.length);
+  const totalBytes = prepared.reduce((total, attachment) => total + attachment.data.length, 0);
+  if (totalBytes > 100 * 1024 * 1024) {
+    const error = new Error("Submission attachments exceed the 100 MB total limit.");
+    error.statusCode = 413;
+    throw error;
+  }
+  if (!prepared.length) return [];
+  await mkdir(directory, { recursive: true });
+  for (const attachment of prepared) {
+    await writeFile(path.join(directory, attachment.fileName), attachment.data);
+  }
+  return prepared.map((attachment) => ({
+    fileName: attachment.fileName,
+    contentType: attachment.contentType,
+    sizeBytes: attachment.data.length
+  }));
+}
+
+async function loadSubmissionAttachment(workspaceId, entryId, fileName) {
+  const cleanId = cleanWorkspaceId(workspaceId);
+  const entryKey = String(entryId || "").trim();
+  const entry = (await readEntries(cleanId)).find((item) => item.id === entryKey);
+  if (!entry) {
+    const error = new Error("Submission not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const safeFileName = cleanAttachmentName(fileName);
+  const saved = (entry.attachments || []).find((item) => item.fileName === safeFileName);
+  if (!saved) {
+    const error = new Error("Submission attachment not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const outputDir = path.join(outputRoot, cleanId);
+  const data = await readFile(path.join(outputDir, "data", "submission_attachments", cleanAttachmentName(entryKey), safeFileName));
+  return { data, contentType: saved.contentType || "application/octet-stream" };
 }
 
 function patientIdFromBundle(bundle, fallback) {
@@ -3221,12 +3319,25 @@ const server = createServer(async (req, res) => {
     const publicEntriesMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries$/);
     const publicCheckpointMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/checkpoint$/);
     const publicOdkSubmissionMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/odk-submissions$/);
+    const publicAttachmentListMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments$/);
     const publicAttachmentFileMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments\/([^/]+)$/);
+    const publicSubmissionAttachmentMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries\/([^/]+)\/attachments\/([^/]+)$/);
     if (req.method === "GET" && pathname === "/api/public/forms") {
       return jsonResponse(res, 200, await listPublicForms());
     }
     if (req.method === "GET" && publicFormMatch) {
       return jsonResponse(res, 200, await loadPublicForm(decodeURIComponent(publicFormMatch[1])));
+    }
+    if (req.method === "GET" && publicAttachmentListMatch) {
+      return jsonResponse(res, 200, await loadPublicAttachmentList(decodeURIComponent(publicAttachmentListMatch[1])));
+    }
+    if (req.method === "GET" && publicSubmissionAttachmentMatch) {
+      const attachment = await loadSubmissionAttachment(
+        (await findWorkspaceByRespondentCode(decodeURIComponent(publicSubmissionAttachmentMatch[1]))).workspaceId,
+        decodeURIComponent(publicSubmissionAttachmentMatch[2]),
+        decodeURIComponent(publicSubmissionAttachmentMatch[3])
+      );
+      return binaryResponse(res, 200, attachment.data, attachment.contentType);
     }
     if (req.method === "GET" && publicXmlMatch) {
       return jsonResponse(res, 200, await loadPublicFormXml(decodeURIComponent(publicXmlMatch[1])));
@@ -3308,6 +3419,7 @@ const server = createServer(async (req, res) => {
     }
     const formMatch = pathname.match(/^\/api\/forms\/([^/]+)$/);
     const entriesMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries$/);
+    const submissionAttachmentMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries\/([^/]+)\/attachments\/([^/]+)$/);
     const participantsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants$/);
     const participantAssignMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants\/assign$/);
     const participantActivateMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants\/activate$/);
@@ -3332,6 +3444,14 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && entriesMatch) {
       return jsonResponse(res, 200, { ok: true, entries: await readEntries(decodeURIComponent(entriesMatch[1])) });
+    }
+    if (req.method === "GET" && submissionAttachmentMatch) {
+      const attachment = await loadSubmissionAttachment(
+        decodeURIComponent(submissionAttachmentMatch[1]),
+        decodeURIComponent(submissionAttachmentMatch[2]),
+        decodeURIComponent(submissionAttachmentMatch[3])
+      );
+      return binaryResponse(res, 200, attachment.data, attachment.contentType);
     }
     if (req.method === "GET" && participantsMatch) {
       return jsonResponse(res, 200, await listParticipantAssignments(decodeURIComponent(participantsMatch[1])));

@@ -320,6 +320,14 @@ button:disabled {
   gap: 14px;
 }
 
+.offline-form-choice select {
+  width: 100%;
+}
+
+.pwa-install-button {
+  margin-top: 12px;
+}
+
 .access-panel .respondent-access-flow {
   display: grid;
   gap: 14px;
@@ -4497,6 +4505,43 @@ button:disabled {
   align-items: center;
   justify-content: flex-end;
   flex-wrap: wrap;
+}
+
+.offline-sync-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.offline-sync-indicator > span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+}
+
+.offline-sync-indicator.online > span:first-child {
+  border-color: #b9dfcc;
+  color: #176b49;
+  background: #f2faf5;
+}
+
+.offline-sync-indicator.offline > span:first-child {
+  border-color: #f0d0a5;
+  color: #8a5100;
+  background: #fff8ed;
+}
+
+.offline-sync-indicator button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 
 .fill-header h1 {

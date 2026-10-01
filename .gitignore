@@ -80,3 +80,6 @@ ODK/central/*/tmp/
 
 # Local Git metadata backups created while consolidating this repository
 .git-unlinked-backups/
+
+# Local handoff notes
+/DOCKER_REQUIREMENTS.md

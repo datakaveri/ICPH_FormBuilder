@@ -54,9 +54,13 @@ const DEFAULT_API_BASE = typeof window === "undefined"
   : `${window.location.protocol}//${window.location.hostname}:8787`;
 const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
 const ADMIN_TOKEN_KEY = "icph_admin_token";
+const OFFLINE_DATABASE_NAME = "icph-offline-v1";
+const OFFLINE_DATABASE_VERSION = 1;
 let runtimeAdminToken = "";
 let runtimeAdminPassword = "";
 let odkWebFormsLoader = null;
+let offlineDatabasePromise = null;
+let submissionSyncPromise = null;
 
 // crypto.randomUUID() is unavailable in some browsers when the app is opened
 // over plain HTTP on a LAN. Keep the form builder usable outside localhost.
@@ -1234,6 +1238,179 @@ function postJson(path, payload) {
   });
 }
 
+function openOfflineDatabase() {
+  if (!globalThis.indexedDB) return Promise.reject(new Error("Offline storage is unavailable in this browser."));
+  if (!offlineDatabasePromise) {
+    offlineDatabasePromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(OFFLINE_DATABASE_NAME, OFFLINE_DATABASE_VERSION);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains("formPackages")) database.createObjectStore("formPackages", { keyPath: "accessCode" });
+        if (!database.objectStoreNames.contains("offlineDrafts")) database.createObjectStore("offlineDrafts", { keyPath: "id" });
+        if (!database.objectStoreNames.contains("submissionQueue")) database.createObjectStore("submissionQueue", { keyPath: "id" });
+        if (!database.objectStoreNames.contains("meta")) database.createObjectStore("meta", { keyPath: "key" });
+      };
+      request.onsuccess = () => {
+        request.result.onversionchange = () => {
+          request.result.close();
+          offlineDatabasePromise = null;
+        };
+        resolve(request.result);
+      };
+      request.onerror = () => {
+        offlineDatabasePromise = null;
+        reject(request.error || new Error("Could not open offline storage."));
+      };
+    });
+  }
+  return offlineDatabasePromise;
+}
+
+function offlineStoreRequest(storeName, mode, action) {
+  return openOfflineDatabase().then((database) => new Promise((resolve, reject) => {
+    const transaction = database.transaction(storeName, mode);
+    const request = action(transaction.objectStore(storeName));
+    let result;
+    request.onsuccess = () => { result = request.result; };
+    request.onerror = () => reject(request.error);
+    transaction.oncomplete = () => resolve(result);
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error || new Error("Offline storage transaction was aborted."));
+  }));
+}
+
+async function offlineCryptoKey() {
+  const stored = await offlineStoreRequest("meta", "readonly", (store) => store.get("deviceKey"));
+  if (stored?.value) return stored.value;
+  if (!globalThis.crypto?.subtle) throw new Error("Secure offline storage requires a supported HTTPS browser.");
+  const value = await globalThis.crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  try {
+    await offlineStoreRequest("meta", "readwrite", (store) => store.add({ key: "deviceKey", value }));
+    return value;
+  } catch {
+    const winner = await offlineStoreRequest("meta", "readonly", (store) => store.get("deviceKey"));
+    if (winner?.value) return winner.value;
+    throw new Error("Could not initialize encrypted offline storage.");
+  }
+}
+
+async function saveEncryptedOfflineRecord(storeName, record) {
+  const key = await offlineCryptoKey();
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  const bytes = new TextEncoder().encode(JSON.stringify(record));
+  const ciphertext = await globalThis.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes);
+  await offlineStoreRequest(storeName, "readwrite", (store) => store.put({
+    id: record.id,
+    createdAt: record.createdAt || Date.now(),
+    iv,
+    ciphertext
+  }));
+}
+
+async function readEncryptedOfflineRecord(storeName, item) {
+  const key = await offlineCryptoKey();
+  const plaintext = await globalThis.crypto.subtle.decrypt({ name: "AES-GCM", iv: item.iv }, key, item.ciphertext);
+  return JSON.parse(new TextDecoder().decode(plaintext));
+}
+
+async function readEncryptedOfflineRecords(storeName) {
+  const stored = await offlineStoreRequest(storeName, "readonly", (store) => store.getAll());
+  const records = await Promise.all(stored.map(async (item) => {
+    try { return await readEncryptedOfflineRecord(storeName, item); } catch { return null; }
+  }));
+  return records.filter(Boolean).sort((left, right) => (left.createdAt || 0) - (right.createdAt || 0));
+}
+
+async function loadOfflineFormPackage(accessCode) {
+  return offlineStoreRequest("formPackages", "readonly", (store) => store.get(normalizeAccessCodeInput(accessCode)));
+}
+
+async function listOfflineFormPackages() {
+  const packages = await offlineStoreRequest("formPackages", "readonly", (store) => store.getAll());
+  return packages.map((item) => {
+    const form = item.form || item.draft || {};
+    const identifier = form.participantIdentifierVariable || form.primaryIdentifierVariable || "";
+    return {
+      accessCode: item.accessCode,
+      title: item.title || form.title,
+      formId: item.formId || form.formId,
+      cachedAt: item.cachedAt,
+      primaryIdentifierVariable: identifier,
+      participantIdentifierVariable: identifier,
+      displayFields: entryCsvQuestions(form).map((question) => {
+        const name = question.name;
+        return { name, label: question?.label || name };
+      }),
+      entries: [],
+      offlineAvailable: true
+    };
+  });
+}
+
+async function saveOfflineFormPackage(formPackage) {
+  await offlineStoreRequest("formPackages", "readwrite", (store) => store.put(formPackage));
+  try { await navigator.storage?.persist?.(); } catch {}
+}
+
+function offlineDraftId(accessCode, workspaceId = "", entryId = "") {
+  return `${normalizeAccessCodeInput(accessCode) || workspaceRouteId(workspaceId)}:${entryId || "active"}`;
+}
+
+async function saveOfflineFirst(path, payload) {
+  const id = crypto.randomUUID();
+  try {
+    await offlineStoreRequest("meta", "readwrite", (store) => store.put({ key: "apiBase", value: API_BASE }));
+    await saveEncryptedOfflineRecord("submissionQueue", {
+      id,
+      path,
+      payload,
+      createdAt: Date.now()
+    });
+  } catch (error) {
+    if (!navigator.onLine) throw error;
+    await postJson(path, { ...payload, clientSubmissionId: id });
+    return { id, queued: false, error: "", pendingCount: await getPendingSubmissionCount() };
+  }
+  try {
+    const registration = await navigator.serviceWorker?.ready;
+    await registration?.sync?.register?.("icph-submit-queue");
+  } catch {}
+  const result = await syncPendingSubmissions(id);
+  return { id, queued: !result.syncedIds.includes(id), error: result.errors[id] || "", pendingCount: result.pendingCount };
+}
+
+async function syncPendingSubmissions(onlyId = "") {
+  if (!navigator.onLine) return { syncedIds: [], errors: {}, pendingCount: await getPendingSubmissionCount() };
+  if (submissionSyncPromise) {
+    const ongoingResult = await submissionSyncPromise;
+    if (!onlyId || ongoingResult.syncedIds.includes(onlyId) || !navigator.onLine) return ongoingResult;
+    return syncPendingSubmissions(onlyId);
+  }
+  submissionSyncPromise = (async () => {
+    const records = await readEncryptedOfflineRecords("submissionQueue");
+    const syncedIds = [];
+    const errors = {};
+    for (const record of records) {
+      if (onlyId && record.id !== onlyId) continue;
+      try {
+        await postJson(record.path, { ...record.payload, clientSubmissionId: record.id });
+        await offlineStoreRequest("submissionQueue", "readwrite", (store) => store.delete(record.id));
+        syncedIds.push(record.id);
+      } catch (error) {
+        errors[record.id] = error.message || String(error);
+        if (!error.status || error.status >= 500) break;
+      }
+    }
+    return { syncedIds, errors, pendingCount: await getPendingSubmissionCount() };
+  })().finally(() => { submissionSyncPromise = null; });
+  return submissionSyncPromise;
+}
+
+async function getPendingSubmissionCount() {
+  try { return (await offlineStoreRequest("submissionQueue", "readonly", (store) => store.count())) || 0; }
+  catch { return 0; }
+}
+
 function notifyCollectionChanged() {
   try {
     window.localStorage.setItem("icph_collection_changed_at", String(Date.now()));
@@ -1270,10 +1447,11 @@ function attachmentUrl(workspaceId, href, accessCode = "") {
   return `${API_BASE}${base}/attachments/${encodeURIComponent(fileName)}`;
 }
 
-function mediaSource(value, workspaceId = "", accessCode = "") {
+function mediaSource(value, workspaceId = "", accessCode = "", cachedAttachments = {}) {
   const source = String(value || "").trim();
   if (!source) return "";
   if (/^(data:|blob:|https?:\/\/)/i.test(source)) return source;
+  if (accessCode && cachedAttachments[resourceFileKey(source)]) return cachedAttachments[resourceFileKey(source)];
   return attachmentUrl(workspaceId, source, accessCode);
 }
 
@@ -2423,6 +2601,16 @@ function stagePlaceholder(stage, workspace, entries, fhirBundles) {
 
 function App() {
   const path = window.location.pathname;
+  useEffect(() => {
+    if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("/service-worker.js")
+      .then((registration) => {
+        const configure = (worker) => worker?.postMessage({ type: "icph:configure", apiBase: API_BASE });
+        configure(registration.active || registration.waiting || registration.installing);
+        navigator.serviceWorker.ready.then((readyRegistration) => configure(readyRegistration.active));
+      })
+      .catch((error) => console.warn("ICPH offline app setup failed:", error));
+  }, []);
   if (path.startsWith("/folder-visualization/")) {
     return <FolderVisualizationPage folderId={decodeURIComponent(path.replace("/folder-visualization/", "").split("/")[0] || "")} />;
   }
@@ -2992,6 +3180,7 @@ function RespondentPortal({ initialCode = "" }) {
           <BrandLogos variant="access" />
         </div>
         <RespondentAccessPanel initialCode={initialCode} onOpen={openSession} />
+        <PwaInstallButton />
         {status.message ? (
           <div className={`status-line ${status.kind}`}>
             <AlertCircle size={16} />
@@ -3000,6 +3189,32 @@ function RespondentPortal({ initialCode = "" }) {
         ) : null}
       </main>
     </div>
+  );
+}
+
+function PwaInstallButton() {
+  const [installPrompt, setInstallPrompt] = useState(null);
+  useEffect(() => {
+    const capturePrompt = (event) => {
+      event.preventDefault();
+      setInstallPrompt(event);
+    };
+    const clearPrompt = () => setInstallPrompt(null);
+    window.addEventListener("beforeinstallprompt", capturePrompt);
+    window.addEventListener("appinstalled", clearPrompt);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", capturePrompt);
+      window.removeEventListener("appinstalled", clearPrompt);
+    };
+  }, []);
+  if (!installPrompt) return null;
+  return (
+    <button className="secondary small pwa-install-button" type="button" onClick={async () => {
+      await installPrompt.prompt();
+      setInstallPrompt(null);
+    }}>
+      <Download size={16} /> Install app
+    </button>
   );
 }
 
@@ -3034,7 +3249,16 @@ function FieldAgentPortal() {
         : nextForms[0]?.respondentAccessCode || "");
       setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
     } catch (error) {
-      setStatus({ kind: "error", message: error.message || String(error) });
+      const savedForms = await listOfflineFormPackages().catch(() => []);
+      if (savedForms.length) {
+        setForms(savedForms.map((item) => ({ ...item, respondentAccessCode: item.accessCode })));
+        setSelectedCode((current) => savedForms.some((item) => item.accessCode === current)
+          ? current
+          : savedForms[0]?.accessCode || "");
+        setStatus({ kind: "ok", message: "Offline. Saved forms are available; entries will load when you reconnect." });
+      } else {
+        setStatus({ kind: "error", message: error.message || String(error) });
+      }
     }
   }
 
@@ -3244,12 +3468,21 @@ function RespondentAccessPanel({ initialCode = "", onOpen }) {
   const [code, setCode] = useState(normalizeAccessCodeInput(initialCode));
   const [resumeIdentifierValue, setResumeIdentifierValue] = useState("");
   const [formInfo, setFormInfo] = useState(null);
+  const [offlineForms, setOfflineForms] = useState([]);
   const [status, setStatus] = useState({ kind: "idle", message: "" });
   const normalizedCode = normalizeAccessCodeInput(code);
   const primaryIdentifierVariable = formInfo?.draft?.participantIdentifierVariable || formInfo?.draft?.primaryIdentifierVariable || "";
   const primaryIdentifierQuestion = primaryIdentifierQuestionText(formInfo?.draft);
   const canFresh = normalizedCode.length > 0 && status.kind !== "busy";
   const canResume = normalizedCode.length > 0 && resumeIdentifierValue.trim() && status.kind !== "busy";
+
+  useEffect(() => {
+    let cancelled = false;
+    listOfflineFormPackages().then((items) => {
+      if (!cancelled) setOfflineForms(items);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -3311,7 +3544,22 @@ function RespondentAccessPanel({ initialCode = "", onOpen }) {
         checkpoint: data.checkpoint
       });
     } catch (error) {
-      setStatus({ kind: "error", message: error.message || String(error) });
+      try {
+        const offlinePackage = await loadOfflineFormPackage(normalizedCode);
+        const draft = offlinePackage?.draft || {};
+        const identifier = draft.participantIdentifierVariable || draft.primaryIdentifierVariable || "";
+        const localDraft = await readEncryptedOfflineRecords("offlineDrafts");
+        const saved = localDraft.find((item) => item.id === offlineDraftId(normalizedCode) && String(item.answers?.[identifier] || "").trim() === resumeIdentifierValue.trim());
+        if (!saved) throw error;
+        onOpen({
+          accessCode: normalizedCode,
+          mode: "resume",
+          primaryIdentifierValue: resumeIdentifierValue.trim(),
+          checkpoint: { answers: saved.answers }
+        });
+      } catch (offlineError) {
+        setStatus({ kind: "error", message: offlineError.message || error.message || String(error) });
+      }
     }
   }
 
@@ -3356,6 +3604,15 @@ function RespondentAccessPanel({ initialCode = "", onOpen }) {
               placeholder="A1B2C"
             />
           </label>
+          {offlineForms.length ? (
+            <label className="field offline-form-choice">
+              <span>Available on this device</span>
+              <select value={offlineForms.some((item) => item.accessCode === normalizedCode) ? normalizedCode : ""} onChange={(event) => setCode(event.target.value)}>
+                <option value="">Choose a saved form</option>
+                {offlineForms.map((item) => <option key={item.accessCode} value={item.accessCode}>{item.title || item.formId || item.accessCode} ({item.accessCode})</option>)}
+              </select>
+            </label>
+          ) : null}
           <button className="secondary" disabled={!canFresh} type="submit">
             <Forward size={16} /> Fill Form
           </button>
@@ -8289,7 +8546,7 @@ function ParticipantAssignmentPanel({ form, workspaceId, folderParticipantIdenti
   );
 }
 
-function PreviewField({ question, value = "", onChange = () => {}, forceDisabled = false, languageMode = "default", choiceOptions = [], workspaceId = "", accessCode = "" }) {
+function PreviewField({ question, value = "", onChange = () => {}, forceDisabled = false, languageMode = "default", choiceOptions = [], workspaceId = "", accessCode = "", cachedAttachments = {} }) {
   const disabled = Boolean(forceDisabled || question.readOnly || question.calculation);
   const calculated = Boolean(question.calculation);
   const label = localizedQuestion(question, "label", languageMode);
@@ -8297,7 +8554,7 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
   const hintNode = hint ? <small className="preview-hint">{hint}</small> : null;
   const options = question.options?.length ? question.options : choiceOptions;
   const renderMedia = (mediaType, source, className = "") => {
-    const src = mediaSource(source, workspaceId, accessCode);
+    const src = mediaSource(source, workspaceId, accessCode, cachedAttachments);
     if (!src) return null;
     if (mediaType === "image") return <img className={`respondent-media ${className}`} src={src} alt="" />;
     if (mediaType === "audio") return <audio className={`respondent-media ${className}`} controls src={src} />;
@@ -8825,7 +9082,7 @@ function CurrentLocationReferenceMap() {
   );
 }
 
-function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted, onError, mapPicker = false, onMapSelected, mapPickerSelectRef = null }) {
+function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted, onError, mapPicker = false, onMapSelected, mapPickerSelectRef = null, offlineCapable = false, cachedAttachmentUrls = {} }) {
   const mountRef = useRef(null);
   const submittedRef = useRef(onSubmitted);
   const errorRef = useRef(onError);
@@ -8872,11 +9129,27 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
         return;
       }
       instanceXml = injectTimerValuesIntoXml(instanceXml, finalizeTimersRef.current());
-      await postJson(`${apiBase}/odk-submissions`, {
+      const attachmentFiles = new Map();
+      for (const item of dataItems) {
+        if (typeof item?.entries !== "function") continue;
+        for (const [fileName, file] of item.entries()) {
+          if (fileName === "xml_submission_file" || !(file instanceof Blob)) continue;
+          attachmentFiles.set(file.name || fileName, file);
+        }
+      }
+      const attachments = await Promise.all([...attachmentFiles.entries()].map(async ([fileName, file]) => ({
+        fileName,
+        contentType: file.type || "application/octet-stream",
+        dataBase64: await fileToBase64(file)
+      })));
+      const payloadBody = {
         instanceXml,
         payloadType: payload?.payloadType || "monolithic",
-        submissionMeta: payload?.submissionMeta || null
-      });
+        submissionMeta: payload?.submissionMeta || null,
+        attachments
+      };
+      if (!offlineCapable) return postJson(`${apiBase}/odk-submissions`, payloadBody).then(() => ({ queued: false, pendingCount: 0 }));
+      return saveOfflineFirst(`${apiBase}/odk-submissions`, payloadBody);
     }
 
     async function mountOdkForm() {
@@ -8896,12 +9169,14 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
               trackDevice: true,
               fetchFormAttachment: async (resource) => {
                 const fileName = String(resource?.href || resource || "").split(/[\\/]/).filter(Boolean).pop() || "";
+                const cachedUrl = cachedAttachmentUrls[resourceFileKey(fileName)];
+                if (cachedUrl) return fetch(cachedUrl);
                 return fetch(`${API_BASE}${apiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: adminAuthHeaders() });
               },
               onSubmit: (payload, done) => {
                 const completion = submitOdkPayload(payload)
-                  .then(() => {
-                    submittedRef.current?.();
+                  .then((result) => {
+                    submittedRef.current?.(result);
                     return { next: POST_SUBMIT__NEW_INSTANCE };
                   })
                   .catch((error) => {
@@ -8955,7 +9230,7 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
       if (mapPickerSelectRef) mapPickerSelectRef.current = null;
       if (app) app.unmount();
     };
-  }, [apiBase, formXml, workspaceId, mapPicker]);
+  }, [apiBase, cachedAttachmentUrls, formXml, offlineCapable, workspaceId, mapPicker]);
 
   return (
     <>
@@ -11806,6 +12081,13 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
   const [form, setForm] = useState(null);
   const [formXml, setFormXml] = useState("");
   const [answers, setAnswers] = useState({});
+  const [answersReady, setAnswersReady] = useState(false);
+  const [cachedAttachmentUrls, setCachedAttachmentUrls] = useState({});
+  const [offlineReady, setOfflineReady] = useState(false);
+  const [localDraftSaved, setLocalDraftSaved] = useState(false);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const cachedPackageRef = useRef(null);
   const [activeGroupPage, setActiveGroupPage] = useState(0);
   const [editingEntry, setEditingEntry] = useState(null);
   const [languageMode, setLanguageMode] = useState("default");
@@ -11843,34 +12125,136 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
   }, [form?.formId, entryId, checkpointAnswers]);
 
   useEffect(() => {
+    const updateOnlineState = () => setIsOnline(navigator.onLine);
+    window.addEventListener("online", updateOnlineState);
+    window.addEventListener("offline", updateOnlineState);
+    return () => {
+      window.removeEventListener("online", updateOnlineState);
+      window.removeEventListener("offline", updateOnlineState);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refreshQueue = async () => {
+      try {
+        const result = isOnline ? await syncPendingSubmissions() : null;
+        const count = result?.pendingCount ?? await getPendingSubmissionCount();
+        if (!cancelled) setPendingSyncCount(count);
+      } catch {}
+    };
+    refreshQueue();
+    window.addEventListener("focus", refreshQueue);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", refreshQueue);
+    };
+  }, [isOnline]);
+
+  useEffect(() => {
+    if (!form || !answersReady || !accessCode) return undefined;
+    const timeout = window.setTimeout(() => {
+      saveEncryptedOfflineRecord("offlineDrafts", {
+        id: offlineDraftId(accessCode, workspaceId, entryId),
+        accessCode,
+        answers,
+        updatedAt: Date.now()
+      }).then(() => setLocalDraftSaved(true)).catch(() => {});
+    }, 250);
+    return () => window.clearTimeout(timeout);
+  }, [accessCode, answers, answersReady, entryId, form, workspaceId]);
+
+  useEffect(() => () => {
+    Object.values(cachedAttachmentUrls).forEach((url) => URL.revokeObjectURL(url));
+  }, [cachedAttachmentUrls]);
+
+  useEffect(() => {
     async function loadPublishedForm() {
       try {
-        const data = await requestJson(formApiBase);
-        const draft = normalizeFormDraft(data.draft);
-        let publishedForm = draft;
-        if (data.hasXml) {
-          const xmlData = await requestJson(`${formApiBase}/xml`);
-          setFormXml(xmlData.xml || "");
-          publishedForm = parseXFormXml(xmlData.xml, draft);
-        } else {
-          setFormXml("");
-        }
-        setForm(publishedForm);
-        const externalQuestions = (publishedForm.questions || []).filter((question) => (
-          question.type === "select_one_from_file" || question.type === "select_multiple_from_file"
-        ));
-        const externalChoiceEntries = await Promise.all(externalQuestions.map(async (question) => {
-          const fileName = String(question.listName || "").trim();
-          if (!fileName) return null;
-          try {
-            const response = await fetch(`${API_BASE}${formApiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: adminAuthHeaders() });
-            if (!response.ok) return null;
-            return [question.name, parseCsvRows(await response.text())];
-          } catch {
-            return null;
+        let data;
+        let draft;
+        let publishedForm;
+        let xml = "";
+        let attachmentBlobs = [];
+        let externalChoiceData = {};
+        let loadedOffline = false;
+        let packageCached = false;
+        try {
+          data = await requestJson(formApiBase);
+          draft = normalizeFormDraft(data.draft);
+          if (data.hasXml) {
+            const xmlData = await requestJson(`${formApiBase}/xml`);
+            xml = xmlData.xml || "";
+            publishedForm = parseXFormXml(xml, draft);
+          } else {
+            publishedForm = draft;
           }
-        }));
-        setExternalChoices(Object.fromEntries(externalChoiceEntries.filter(Boolean)));
+          const attachmentList = await requestJson(`${formApiBase}/attachments`).catch(() => ({ attachments: [] }));
+          attachmentBlobs = await Promise.all((attachmentList.attachments || []).map(async (attachment) => {
+            try {
+              const response = await fetch(`${API_BASE}${formApiBase}/attachments/${encodeURIComponent(attachment.fileName)}`);
+              if (!response.ok) return null;
+              const blob = await response.blob();
+              return { fileName: attachment.fileName, contentType: blob.type || attachment.contentType || "application/octet-stream", blob };
+            } catch { return null; }
+          }));
+          const cachedByName = new Map(attachmentBlobs.filter(Boolean).map((item) => [resourceFileKey(item.fileName), item.blob]));
+          const externalQuestions = (publishedForm.questions || []).filter((question) => (
+            question.type === "select_one_from_file" || question.type === "select_multiple_from_file"
+          ));
+          for (const question of externalQuestions) {
+            const fileName = String(question.listName || "").trim();
+            const blob = cachedByName.get(resourceFileKey(fileName));
+            if (blob) externalChoiceData[question.name] = parseCsvRows(await blob.text());
+          }
+          const savedPackage = {
+            accessCode: normalizeAccessCodeInput(accessCode),
+            title: publishedForm.title || data.title || "ICPH Form",
+            formId: publishedForm.formId || data.formId || "",
+            draft,
+            form: publishedForm,
+            xml,
+            externalChoices: externalChoiceData,
+            attachments: attachmentBlobs.filter(Boolean),
+            cachedAt: Date.now()
+          };
+          try {
+            await saveOfflineFormPackage(savedPackage);
+            await offlineCryptoKey();
+            packageCached = true;
+          } catch {}
+          cachedPackageRef.current = savedPackage;
+        } catch (networkError) {
+          if (networkError.status && networkError.status < 500) throw networkError;
+          const savedPackage = accessCode ? await loadOfflineFormPackage(accessCode) : null;
+          if (!savedPackage) {
+            if (!navigator.onLine) throw new Error("This form is not saved on this device yet. Open it once while online to make it available offline.");
+            throw networkError;
+          }
+          try {
+            await offlineCryptoKey();
+          } catch {
+            throw new Error("Encrypted offline storage is unavailable on this device.");
+          }
+          loadedOffline = true;
+          packageCached = true;
+          cachedPackageRef.current = savedPackage;
+          data = { draft: savedPackage.draft, hasXml: Boolean(savedPackage.xml), title: savedPackage.title };
+          draft = normalizeFormDraft(savedPackage.draft);
+          publishedForm = savedPackage.form || (savedPackage.xml ? parseXFormXml(savedPackage.xml, draft) : draft);
+          xml = savedPackage.xml || "";
+          attachmentBlobs = savedPackage.attachments || [];
+          externalChoiceData = savedPackage.externalChoices || {};
+        }
+        setFormXml(xml);
+        setForm(publishedForm);
+        setExternalChoices(externalChoiceData);
+        const attachmentUrls = {};
+        for (const attachment of attachmentBlobs) {
+          if (attachment?.blob) attachmentUrls[resourceFileKey(attachment.fileName)] = URL.createObjectURL(attachment.blob);
+        }
+        setCachedAttachmentUrls(attachmentUrls);
+        setOfflineReady(Boolean(accessCode && packageCached));
         const defaults = {};
         for (const question of publishedForm.questions || []) {
           if (question.defaultValue && question.defaultValue !== "now()") defaults[question.name] = question.defaultValue;
@@ -11891,6 +12275,15 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
           }
         }
         const resumedAnswers = checkpointAnswers && typeof checkpointAnswers === "object" ? checkpointAnswers : {};
+        let interruptedAnswers = {};
+        if (!entryId && !Object.keys(resumedAnswers).length && accessCode) {
+          try {
+            const drafts = await readEncryptedOfflineRecords("offlineDrafts");
+            const saved = drafts.find((item) => item.id === offlineDraftId(accessCode, workspaceId, entryId));
+            interruptedAnswers = saved?.answers || {};
+            setLocalDraftSaved(Object.keys(interruptedAnswers).length > 0);
+          } catch {}
+        }
         let entryAnswers = {};
         let entryToEdit = null;
         if (entryId) {
@@ -11907,6 +12300,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
         const seededAnswers = normalizeStoredRepeatAnswers(publishedForm, {
           ...defaults,
           ...resumedAnswers,
+          ...interruptedAnswers,
           ...entryAnswers
         });
         if (primaryIdentifierVariable && resumePrimaryIdentifierValue) {
@@ -11914,6 +12308,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
         }
         setEditingEntry(entryToEdit);
         setAnswers(seededAnswers);
+        setAnswersReady(true);
         const startLocationQuestion = publishedForm.questions?.find((question) => question.type === "start-geopoint");
         if (startLocationQuestion && navigator.geolocation && !seededAnswers[startLocationQuestion.name]) {
           navigator.geolocation.getCurrentPosition((position) => {
@@ -11925,17 +12320,28 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
           }, () => {});
         }
         setSubmissionSuccess(false);
-        setStatus({ kind: "ok", message: entryToEdit ? "Editing submitted entry." : checkpointAnswers ? "Loaded saved checkpoint." : "Ready" });
+        setStatus(packageCached
+          ? { kind: "ok", message: loadedOffline ? "Offline form ready." : entryToEdit ? "Editing submitted entry." : checkpointAnswers ? "Loaded saved checkpoint." : "Ready" }
+          : { kind: "error", message: "Loaded online, but this device could not save an offline copy." });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
     loadPublishedForm();
-  }, [checkpointAnswers, entryId, formApiBase, resumePrimaryIdentifierValue]);
+  }, [accessCode, checkpointAnswers, entryId, formApiBase, resumePrimaryIdentifierValue, workspaceId]);
 
   function setAnswer(name, value) {
     setSubmissionSuccess(false);
     setAnswers((current) => ({ ...current, [name]: value }));
+  }
+
+  async function retryPendingSync() {
+    const result = await syncPendingSubmissions();
+    setPendingSyncCount(result.pendingCount);
+    const failedMessage = Object.values(result.errors)[0];
+    setStatus(failedMessage
+      ? { kind: "error", message: `Some saved responses need attention: ${failedMessage}` }
+      : { kind: "ok", message: result.pendingCount ? `${result.pendingCount} item${result.pendingCount === 1 ? "" : "s"} still waiting to sync.` : "All saved responses are synced." });
   }
 
   function advanceGroupPage() {
@@ -11965,11 +12371,27 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
       for (const [name, value] of Object.entries(validation.answers)) {
         if (visibleNames.has(name)) submissionAnswers[name] = value;
       }
-      await postJson(`${formApiBase}/entries`, { entryId: editingEntry?.id || entryId || "", answers: submissionAnswers });
+      const submissionPayload = {
+        entryId: editingEntry?.id || entryId || "",
+        answers: submissionAnswers
+      };
+      let result;
+      if (accessCode) {
+        result = await saveOfflineFirst(`${formApiBase}/entries`, submissionPayload);
+      } else {
+        await postJson(`${formApiBase}/entries`, submissionPayload);
+        result = { queued: false, pendingCount: 0 };
+      }
       notifyCollectionChanged();
-	      setStatus({ kind: "ok", message: "Ready" });
-	      setSubmissionSuccess(true);
-	      if (!editingEntry && !entryId) setAnswers({});
+      setPendingSyncCount(result.pendingCount);
+      setStatus(result.error
+        ? { kind: "error", message: `Saved on this device; sync needs attention: ${result.error}` }
+        : result.queued
+          ? { kind: "ok", message: "Saved on this device. It will sync when the connection is available." }
+          : { kind: "ok", message: "Submitted and synced." });
+      setSubmissionSuccess(true);
+      setLocalDraftSaved(false);
+      if (!editingEntry && !entryId) setAnswers({});
     } catch (error) {
       setStatus({ kind: "error", message: error.message || String(error) });
     }
@@ -11997,12 +12419,17 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
       for (const [name, value] of Object.entries(calculatedAnswers)) {
         if (visibleNames.has(name) || name === primaryIdentifierVariable) checkpointData[name] = value;
       }
-      await postJson(`${formApiBase}/checkpoint`, {
+      const result = await saveOfflineFirst(`${formApiBase}/checkpoint`, {
         primaryIdentifierValue: checkpointIdentifierValue,
         answers: checkpointData
       });
       notifyCollectionChanged();
-      setStatus({ kind: "ok", message: "Checkpoint saved." });
+      setPendingSyncCount(result.pendingCount);
+      setStatus(result.error
+        ? { kind: "error", message: `Checkpoint saved on this device; sync needs attention: ${result.error}` }
+        : result.queued
+          ? { kind: "ok", message: "Checkpoint saved on this device. It will sync when the connection is available." }
+          : { kind: "ok", message: "Checkpoint saved and synced." });
     } catch (error) {
       setStatus({ kind: "error", message: error.message || String(error) });
     }
@@ -12054,6 +12481,15 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
             {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
             <span>{status.message}</span>
           </div>
+          {accessCode ? (
+            <div className={`offline-sync-indicator ${isOnline ? "online" : "offline"}`} aria-live="polite">
+              <span>{isOnline ? "Online" : "Offline"}</span>
+              {pendingSyncCount ? <span>{pendingSyncCount} item{pendingSyncCount === 1 ? "" : "s"} waiting to sync</span> : null}
+              {offlineReady ? <span>Form saved on this device</span> : null}
+              {localDraftSaved ? <span>Draft saved on this device</span> : null}
+              {pendingSyncCount && isOnline ? <button className="secondary small" type="button" onClick={retryPendingSync}><RefreshCw size={14} /> Sync now</button> : null}
+            </div>
+          ) : null}
         </div>
 	      </header>
 	      <main className={`fill-card ${useOdkViewer ? "odk-fill-card" : ""}`}>
@@ -12069,13 +12505,20 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
 	          <OdkWebFormIsland
 	            form={form}
 	            formXml={formXml}
-	            workspaceId={workspaceId}
-	            formApiBase={formApiBase}
-	            onSubmitted={() => {
-	              notifyCollectionChanged();
-	              setStatus({ kind: "ok", message: "Submitted successfully." });
-	              setSubmissionSuccess(true);
-	            }}
+            workspaceId={workspaceId}
+            formApiBase={formApiBase}
+            offlineCapable={Boolean(accessCode)}
+            cachedAttachmentUrls={cachedAttachmentUrls}
+            onSubmitted={(result) => {
+              notifyCollectionChanged();
+              setPendingSyncCount(result?.pendingCount ?? pendingSyncCount);
+              setStatus(result?.error
+                ? { kind: "error", message: `Saved on this device; sync needs attention: ${result.error}` }
+                : result?.queued
+                  ? { kind: "ok", message: "Saved on this device. It will sync when the connection is available." }
+                  : { kind: "ok", message: "Submitted and synced." });
+              setSubmissionSuccess(true);
+            }}
 	            onError={(error) => setStatus({ kind: "error", message: error?.message || String(error) })}
 	          />
 	        ) : pageQuestions.map((question, index) => {
@@ -12093,6 +12536,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
                   choiceOptions={externalChoices[question.name] || []}
                   workspaceId={workspaceId}
                   accessCode={accessCode}
+                  cachedAttachments={cachedAttachmentUrls}
                 />
               </React.Fragment>
             );
