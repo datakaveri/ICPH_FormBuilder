@@ -1,6 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  BrowserMultiFormatOneDReader,
+  BrowserMultiFormatReader,
+  BrowserQRCodeReader
+} from "@zxing/browser";
+import { BarcodeFormat, DecodeHintType } from "@zxing/library";
+import {
   AlertCircle,
   Calendar,
   Check,
@@ -24,18 +30,24 @@ import {
   Import,
   ListChecks,
   MapPin,
+  Maximize2,
+  Network,
   Plus,
   RefreshCw,
   Save,
+  ScanLine,
   Search,
   Settings,
   TextCursorInput,
   Upload,
   Trash2,
+  ZoomIn,
+  ZoomOut,
   X
 } from "lucide-react";
 import "./styles.css";
 import cdpgLogo from "./assets/cdpg-logo.png";
+import icphLogo from "./assets/icph-logo.png";
 
 const DEFAULT_API_BASE = typeof window === "undefined"
   ? "http://localhost:8787"
@@ -45,6 +57,29 @@ const ADMIN_TOKEN_KEY = "icph_admin_token";
 let runtimeAdminToken = "";
 let runtimeAdminPassword = "";
 let odkWebFormsLoader = null;
+
+// crypto.randomUUID() is unavailable in some browsers when the app is opened
+// over plain HTTP on a LAN. Keep the form builder usable outside localhost.
+const crypto = {
+  randomUUID() {
+    if (typeof globalThis.crypto?.randomUUID === "function") {
+      return globalThis.crypto.randomUUID();
+    }
+    const bytes = new Uint8Array(16);
+    if (typeof globalThis.crypto?.getRandomValues === "function") {
+      globalThis.crypto.getRandomValues(bytes);
+    } else {
+      for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+};
+const RESPONDENT_CODE_MODE_RANDOM = "random";
+const RESPONDENT_CODE_MODE_CUSTOM = "custom";
+const RESPONDENT_CODE_MAX_LENGTH = 10;
 
 function loadOdkWebForms() {
   if (!odkWebFormsLoader) {
@@ -84,6 +119,16 @@ function saveAdminPassword(password) {
   runtimeAdminPassword = password || "";
 }
 
+function BrandLogos({ variant = "topbar" }) {
+  const logoClass = variant === "access" ? "access-logo" : "topbar-logo";
+  return (
+    <div className={`${variant === "access" ? "access-logo-pair" : "topbar-logo-pair"}`}>
+      <img className={logoClass} src={icphLogo} alt="ICPH" />
+      <img className={logoClass} src={cdpgLogo} alt="CDPG" />
+    </div>
+  );
+}
+
 function adminAuthHeaders() {
   const token = getAdminToken();
   return {
@@ -93,7 +138,7 @@ function adminAuthHeaders() {
 }
 
 function normalizeAccessCodeInput(value) {
-  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5);
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, RESPONDENT_CODE_MAX_LENGTH);
 }
 
 const QUESTION_TYPES = [
@@ -113,10 +158,10 @@ const QUESTION_TYPES = [
   { type: "end_group", label: "End Group", icon: ClipboardList },
   { type: "begin_repeat", label: "Begin Repeat", icon: ClipboardList },
   { type: "end_repeat", label: "End Repeat", icon: ClipboardList },
-  { type: "geopoint", label: "Location Point", icon: MapPin },
-  { type: "geotrace", label: "Location Trace", icon: MapPin },
-  { type: "geoshape", label: "Location Shape", icon: MapPin },
-  { type: "start-geopoint", label: "Start Location", icon: MapPin },
+  { type: "geopoint", label: "Point location (GPS)", icon: MapPin },
+  { type: "geotrace", label: "Route / line (GPS)", icon: MapPin },
+  { type: "geoshape", label: "Area / polygon (GPS)", icon: MapPin },
+  { type: "start-geopoint", label: "Automatically captured start location", icon: MapPin },
   { type: "image", label: "Image", icon: Image },
   { type: "audio", label: "Audio", icon: Upload },
   { type: "background-audio", label: "Background Audio", icon: Upload },
@@ -273,10 +318,10 @@ function newQuestion(type, index) {
   const isEndStructural = type === "end_group" || type === "end_repeat";
   const structuralLabel = STRUCTURAL_TYPE_HELP[type]?.title;
   const locationDefaults = {
-    geopoint: { label: "Choose a location point", appearance: "placement-map", parameters: "" },
-    geotrace: { label: "Draw or capture a route", appearance: "" },
-    geoshape: { label: "Draw or capture an area", appearance: "" },
-    "start-geopoint": { label: "Capture start location automatically", appearance: "" }
+    geopoint: { label: "Point location", appearance: "placement-map", parameters: "" },
+    geotrace: { label: "Route or line", appearance: "" },
+    geoshape: { label: "Area or polygon", appearance: "" },
+    "start-geopoint": { label: "Start location", appearance: "" }
   };
   const locationDefault = locationDefaults[type] || {};
   const base = {
@@ -309,7 +354,11 @@ function newQuestion(type, index) {
     extraColumns: {},
     logicBuilders: {},
     timerConfig: normalizeTimerConfig(),
-    readOnly: type === "calculate"
+    readOnly: type === "calculate",
+    demographicData: false,
+    prefixWithParentIdentifier: false,
+    demographicParentIdentifierVariable: "",
+    demographicGeneratedId: false
   };
   if (type === "select_one" || type === "select_multiple" || type === "rank") {
     base.listName = `q${index + 1}_choices`;
@@ -328,6 +377,44 @@ function newQuestion(type, index) {
     base.listName = "choices.csv";
   }
   return base;
+}
+
+function demographicMemberIdQuestion(name = "member_id") {
+  return {
+    id: crypto.randomUUID(),
+    type: "text",
+    name,
+    label: "ID",
+    hint: "Generated identifier for this demographic entry.",
+    required: false,
+    readOnly: true,
+    calculation: "once(concat('P-', uuid(12), ''))",
+    defaultValue: "",
+    relevant: "",
+    constraint: "",
+    constraintMessage: "",
+    requiredMessage: "",
+    guidanceHint: "",
+    note: "",
+    options: [],
+    extraColumns: {},
+    logicBuilders: {},
+    demographicGeneratedId: true,
+    demographicAutoGenerated: true
+  };
+}
+
+function isDemographicGeneratedIdLocked(questions = [], questionId) {
+  const index = questions.findIndex((question) => question.id === questionId);
+  if (index < 0) return false;
+  const target = questions[index];
+  if (!target.demographicGeneratedId || target.demographicAutoGenerated === false || /_copy(?:_\d+)?$/.test(String(target.name || ""))) return false;
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const question = questions[cursor];
+    if (question.type === "end_repeat") return false;
+    if (question.type === "begin_repeat") return Boolean(question.demographicData);
+  }
+  return false;
 }
 
 function questionTypeLabel(type) {
@@ -403,6 +490,12 @@ function defaultForm() {
     publicKey: "",
     submissionUrl: "",
     allowChoiceDuplicates: "",
+    allowResponseEdits: false,
+    limitOneResponsePerIdentifier: true,
+    participantIdentifierVariable: "",
+    terminologyUseLlm: false,
+    multilingualEnabled: false,
+    multilingualLanguage: "",
     entities: [],
     questions: []
   };
@@ -427,6 +520,9 @@ function formBuildSnapshot(form = {}) {
     submissionUrl: form.submissionUrl || "",
     allowChoiceDuplicates: form.allowChoiceDuplicates || "",
     primaryIdentifierVariable: form.primaryIdentifierVariable || "",
+    terminologyUseLlm: false,
+    multilingualEnabled: Boolean(form.multilingualEnabled),
+    multilingualLanguage: form.multilingualLanguage || "",
     entities: form.entities || [],
     questions: form.questions || []
   };
@@ -582,6 +678,23 @@ function defaultValueIssue(question = {}) {
   return "";
 }
 
+function rangeParametersIssue(question = {}) {
+  if (question.type !== "range") return "";
+  const tickIntervalRaw = parameterValue(question.parameters, "tick_interval", "");
+  if (!String(tickIntervalRaw).trim()) return "";
+  const step = Number(parameterValue(question.parameters, "step", "1"));
+  const tickInterval = Number(tickIntervalRaw);
+  if (!Number.isFinite(tickInterval) || tickInterval <= 0) {
+    return `${question.name || "Range question"}: tick_interval must be a positive number.`;
+  }
+  if (!Number.isFinite(step) || step <= 0) return "";
+  const multiple = tickInterval / step;
+  if (Math.abs(multiple - Math.round(multiple)) > 1e-9) {
+    return `${question.name || "Range question"}: tick_interval (${tickIntervalRaw}) must be a multiple of step (${step}).`;
+  }
+  return "";
+}
+
 function primaryIdentifierIssue(form = {}) {
   const selected = String(form.primaryIdentifierVariable || "").trim();
   if (!selected) return "";
@@ -621,6 +734,74 @@ function primaryIdentifierCandidatesForForm(form = {}) {
   return primaryIdentifierCandidateRows(form)
     .filter((row) => row.eligible)
     .map(({ name, type, label }) => ({ name, type, label }));
+}
+
+function demographicRepeatIssue(form = {}, primaryIdentifierVariable = "") {
+  const primary = String(primaryIdentifierVariable || "").trim();
+  if (!primary) return "";
+  const questions = form.questions || [];
+  const primaryIndex = questions.findIndex((question) => question.name === primary);
+  for (let index = 0; index < questions.length; index += 1) {
+    const repeat = questions[index];
+    if (repeat.type !== "begin_repeat" || !repeat.demographicData || !repeat.prefixWithParentIdentifier) continue;
+    if (primaryIndex < 0) return `The demographic repeat "${repeat.name || repeat.label || "repeat"}" needs the selected primary identifier before it in the form.`;
+    if (primaryIndex > index) {
+      return `Move the primary identifier question "${primary}" before demographic repeat "${repeat.name || repeat.label || "repeat"}" so generated member IDs can use it.`;
+    }
+  }
+  return "";
+}
+
+function randomParticipantIdParts(expression) {
+  const match = String(expression || "").trim().match(/^once\(concat\('((?:\\'|[^'])*)', uuid\((\d+)\), '((?:\\'|[^'])*)'\)\)$/);
+  if (!match) return null;
+  return {
+    prefix: match[1].replace(/\\'/g, "'"),
+    length: Math.max(1, Math.min(128, Number(match[2]) || 12)),
+    suffix: match[3].replace(/\\'/g, "'")
+  };
+}
+
+function randomParticipantIdExpression(parts, parentVariable = "") {
+  const escape = (value) => expressionLiteral(value);
+  const parent = String(parentVariable || "").trim();
+  const prefix = escape(parts?.prefix ?? "P-");
+  const suffix = escape(parts?.suffix ?? "");
+  const random = `'${prefix}', uuid(${parts?.length || 12}), '${suffix}'`;
+  return parent
+    ? `once(concat(\${${parent}}, '-', ${random}))`
+    : `once(concat(${random}))`;
+}
+
+function resolveDemographicRepeats(form = {}, primaryIdentifierVariable = "") {
+  const primary = String(primaryIdentifierVariable || "").trim();
+  if (!primary) return form;
+  const questions = (form.questions || []).map((question) => ({ ...question }));
+  for (let index = 0; index < questions.length; index += 1) {
+    const repeat = questions[index];
+    if (repeat.type !== "begin_repeat" || !repeat.demographicData) continue;
+    const endIndex = findRepeatEnd(questions, index);
+    const generated = questions.slice(index + 1, endIndex).find((question) => question.demographicGeneratedId);
+    if (!generated) continue;
+    generated.readOnly = true;
+    generated.required = false;
+    const existingCalculation = String(generated.calculation || "").trim();
+    const isDefaultCalculation = !existingCalculation
+      || existingCalculation === "once(uuid())"
+      || existingCalculation === "once(concat('P-', uuid(12), ''))";
+    if (repeat.prefixWithParentIdentifier) {
+      const randomParts = randomParticipantIdParts(existingCalculation);
+      if (randomParts) {
+        generated.calculation = randomParticipantIdExpression(randomParts, primary);
+      } else if (isDefaultCalculation) {
+        generated.calculation = randomParticipantIdExpression({ prefix: "", length: 12, suffix: "" }, primary);
+      }
+    } else if (isDefaultCalculation) {
+      generated.calculation = "once(concat('P-', uuid(12), ''))";
+    }
+    repeat.demographicParentIdentifierVariable = primary;
+  }
+  return { ...form, questions };
 }
 
 function validateStructuralPairing(questions = []) {
@@ -673,10 +854,18 @@ function validateForm(form) {
   if ((form.questions || []).length && !form.primaryIdentifierVariable && !primaryIdentifierCandidatesForForm(form).length) {
     issues.push("Add at least one named respondent answer question outside repeats so it can be used as the Primary Identifier Variable before publishing. Passive rows such as note, calculate, timer, and device metadata cannot identify a respondent.");
   }
+  if (form.multilingualEnabled && !secondaryLanguageName(form)) {
+    issues.push("Enter the second language name before finishing Build.");
+  }
   const seenNames = new Set();
   for (const [index, question] of (form.questions || []).entries()) {
     const label = question.label || `Question ${index + 1}`;
     const isEndStructural = END_STRUCTURAL_TYPES.has(question.type);
+    if (question.type === "begin_repeat" && question.demographicData) {
+      const endIndex = findRepeatEnd(form.questions || [], index);
+      const hasGeneratedId = (form.questions || []).slice(index + 1, endIndex).some((item) => item.demographicGeneratedId);
+      if (!hasGeneratedId) issues.push(`${question.name || label}: demographic repeats need a generated ID question.`);
+    }
     if (!isEndStructural && !question.name?.trim()) issues.push(`${label}: name is required.`);
     if (question.name?.trim()) {
       const normalized = slug(question.name);
@@ -685,6 +874,28 @@ function validateForm(form) {
       seenNames.add(question.name);
     }
     if (!isEndStructural && !question.label?.trim()) issues.push(`${question.name}: label is required.`);
+    if (form.multilingualEnabled && secondaryLanguageName(form)) {
+      const respondentTextKeys = [
+        ["label", "main display text"],
+        ["hint", "hint"],
+        ["constraintMessage", "answering condition message"],
+        ["requiredMessage", "required message"],
+        ["note", "designer note"],
+        ["guidanceHint", "guidance hint"]
+      ];
+      for (const [key, labelText] of respondentTextKeys) {
+        if (String(question[key] || "").trim() && !String(translatedValue(question, key) || "").trim()) {
+          issues.push(`${question.name}: add ${secondaryLanguageName(form)} ${labelText}.`);
+        }
+      }
+      if (question.type === "select_one" || question.type === "select_multiple" || question.type === "rank") {
+        for (const option of question.options || []) {
+          if (String(option.label || "").trim() && !String(translatedValue(option, "label") || "").trim()) {
+            issues.push(`${question.name}: add ${secondaryLanguageName(form)} text for option "${option.label || option.name}".`);
+          }
+        }
+      }
+    }
     if (question.type === "calculate" && !question.calculation?.trim()) {
       issues.push(`${question.name}: calculate questions need a calculation expression.`);
     }
@@ -693,6 +904,8 @@ function validateForm(form) {
     }
     const defaultIssue = defaultValueIssue(question);
     if (defaultIssue) issues.push(defaultIssue);
+    const rangeIssue = rangeParametersIssue(question);
+    if (rangeIssue) issues.push(rangeIssue);
     issues.push(...relevantLogicIssues(form, question, label));
     if (question.type === "select_one" || question.type === "select_multiple" || question.type === "rank") {
       if (!question.listName?.trim()) issues.push(`${question.name}: list name is required.`);
@@ -707,6 +920,13 @@ function validateForm(form) {
         )
       );
       const appearanceTokens = String(question.appearance || "").toLowerCase().split(/\s+/).filter(Boolean);
+      if (appearanceTokens.includes("map")) {
+        for (const option of options) {
+          if (!String(option.geometry || "").trim()) {
+            issues.push(`${question.name}: map appearance requires a map point or geometry for option "${option.label || option.name}".`);
+          }
+        }
+      }
       if (hasChoiceMedia && appearanceTokens.some((token) => token === "minimal" || token === "autocomplete")) {
         issues.push(`${question.name}: option media will not render in dropdown/autocomplete appearance. Remove minimal/autocomplete appearance to show image answer options.`);
       }
@@ -774,15 +994,22 @@ function evaluateXlsExpression(expression, answers = {}, currentValue = "") {
   const js = transformXlsExpression(raw);
   const get = (name) => answers[name] ?? "";
   const ifFn = (condition, whenTrue, whenFalse) => (condition ? whenTrue : whenFalse);
+  const uuid = (length) => {
+    const generated = crypto.randomUUID();
+    return length ? generated.replace(/-/g, "").slice(0, Number(length)) : generated;
+  };
+  const once = (value) => value;
   try {
-    return Function("get", "current", "selected", "decimalDateTime", "xlsDate", "today", "ifFn", `return (${js});`)(
+    return Function("get", "current", "selected", "decimalDateTime", "xlsDate", "today", "ifFn", "uuid", "once", `return (${js});`)(
       get,
       currentValue,
       selected,
       decimalDateTime,
       xlsDate,
       todayString,
-      ifFn
+      ifFn,
+      uuid,
+      once
     );
   } catch {
     return false;
@@ -800,10 +1027,33 @@ function computeCalculatedAnswers(form, answers) {
     let changed = false;
     for (const question of form.questions || []) {
       if (!question.calculation?.trim()) continue;
+      if (/^once\s*\(/i.test(question.calculation) && next[question.name]) continue;
       const value = evaluateXlsExpression(question.calculation, next);
       const normalized = value === null || value === undefined || Number.isNaN(value) ? "" : String(value);
       if (next[question.name] !== normalized) {
         next = { ...next, [question.name]: normalized };
+        changed = true;
+      }
+    }
+    for (const question of expandRepeatQuestions(form, next)) {
+      if (question.demographicGeneratedId && question.answerKey && !next[question.answerKey]) {
+        const parentVariable = question.demographicParentIdentifierVariable || form.primaryIdentifierVariable || "";
+        const parentValue = parentVariable ? String(next[parentVariable] || "").trim() : "";
+        const memberNumber = String(question.repeatIndex || 1).padStart(3, "0");
+        const generated = question.prefixWithParentIdentifier && parentValue
+          ? `${parentValue}-M${memberNumber}`
+          : `${question.demographicRepeatName || "member"}-M${memberNumber}`;
+        next = { ...next, [question.answerKey]: generated };
+        changed = true;
+        continue;
+      }
+      if (!question.calculation?.trim() || !question.answerKey) continue;
+      if (/^once\s*\(/i.test(question.calculation) && next[question.answerKey]) continue;
+      const scopedAnswers = { ...next, [question.name]: next[question.answerKey] || "" };
+      const value = evaluateXlsExpression(question.calculation, scopedAnswers);
+      const normalized = value === null || value === undefined || Number.isNaN(value) ? "" : String(value);
+      if (next[question.answerKey] !== normalized) {
+        next = { ...next, [question.answerKey]: normalized };
         changed = true;
       }
     }
@@ -812,29 +1062,140 @@ function computeCalculatedAnswers(form, answers) {
   return next;
 }
 
+function indexedAnswerKey(name, repeatPath = []) {
+  return `${name}${repeatPath.map((index) => `__repeat_${index}`).join("")}`;
+}
+
+function repeatCountValue(question, answers, repeatPath = []) {
+  const expression = String(question.repeatCount || question.repeat_count || "").trim();
+  if (!expression) return 1;
+  const reference = parseFieldReference(expression);
+  const referenceKey = reference ? indexedAnswerKey(reference, repeatPath) : "";
+  const scopedAnswers = reference ? { ...answers, [reference]: answers[referenceKey] ?? "" } : answers;
+  const rawValue = reference ? scopedAnswers[reference] : /^\d+$/.test(expression) ? expression : evaluateXlsExpression(expression, scopedAnswers);
+  const count = Number(rawValue);
+  return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 1;
+}
+
+function findRepeatEnd(questions, startIndex) {
+  let depth = 0;
+  for (let index = startIndex; index < questions.length; index += 1) {
+    const type = questions[index]?.type;
+    if (type === "begin_repeat") depth += 1;
+    if (type === "end_repeat") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return questions.length;
+}
+
+function expandRepeatQuestions(form, answers = {}) {
+  const questions = form?.questions || [];
+  const expanded = [];
+  function appendRange(start, end, repeatPath = [], repeatMeta = []) {
+    for (let index = start; index < end; index += 1) {
+      const question = questions[index];
+      if (question.type === "end_group" || question.type === "end_repeat") continue;
+      if (question.type === "begin_repeat") {
+        const endIndex = findRepeatEnd(questions, index);
+        const count = repeatCountValue(question, answers, repeatPath);
+        for (let repeatIndex = 1; repeatIndex <= count; repeatIndex += 1) {
+          appendRange(index + 1, endIndex, [...repeatPath, repeatIndex], [
+            ...repeatMeta,
+            {
+              index: repeatIndex,
+              count,
+              label: question.label || question.name || "Repeat",
+              demographicData: Boolean(question.demographicData),
+              prefixWithParentIdentifier: Boolean(question.prefixWithParentIdentifier),
+              demographicParentIdentifierVariable: question.demographicParentIdentifierVariable || "",
+              demographicRepeatName: question.name || "member"
+            }
+          ]);
+        }
+        index = endIndex;
+        continue;
+      }
+      const answerKey = question.name && repeatPath.length ? indexedAnswerKey(question.name, repeatPath) : question.name || "";
+      const lastRepeat = repeatMeta[repeatMeta.length - 1];
+      expanded.push({
+        ...question,
+        id: repeatPath.length ? `${question.id || question.name}::repeat:${repeatPath.join(".")}` : question.id,
+        answerKey,
+        repeatIndex: lastRepeat?.index || 0,
+        repeatPath,
+        repeatCount: lastRepeat?.count || 0,
+        repeatLabel: lastRepeat?.label || "Repeat",
+        demographicData: Boolean(lastRepeat?.demographicData),
+        prefixWithParentIdentifier: Boolean(lastRepeat?.prefixWithParentIdentifier),
+        demographicParentIdentifierVariable: lastRepeat?.demographicParentIdentifierVariable || "",
+        demographicRepeatName: lastRepeat?.demographicRepeatName || "member"
+      });
+    }
+  }
+  appendRange(0, questions.length);
+  return expanded;
+}
+
+function questionAnswerKey(question) {
+  return question?.answerKey || question?.name || "";
+}
+
+function questionScopedAnswers(question, answers) {
+  if (!question?.answerKey || !question.name) return answers;
+  return { ...answers, [question.name]: answers[question.answerKey] || "" };
+}
+
+function normalizeStoredRepeatAnswers(form, answers = {}) {
+  const next = { ...answers };
+  for (const question of expandRepeatQuestions(form, next)) {
+    if (!question.answerKey || !Array.isArray(next[question.name]) || next[question.answerKey] !== undefined) continue;
+    next[question.answerKey] = next[question.name][Math.max(0, (question.repeatIndex || 1) - 1)] ?? "";
+  }
+  return next;
+}
+
 function visibleQuestions(form, answers) {
   const calculated = computeCalculatedAnswers(form, answers);
-  return (form.questions || []).filter((question) => (
-    !STRUCTURAL_TYPES.has(question.type) &&
+  return expandRepeatQuestions(form, calculated).filter((question) => (
+    question.type !== "end_group" &&
+    question.type !== "end_repeat" &&
     !NON_DISPLAY_TYPES.has(question.type) &&
-    isQuestionVisible(question, calculated)
+    isQuestionVisible(question, questionScopedAnswers(question, calculated))
   ));
 }
 
-function validateAnswers(form, answers) {
+function groupedQuestionPages(questions = []) {
+  const pages = [];
+  let currentPage = [];
+  for (const question of questions) {
+    if (question.type === "begin_group" && currentPage.length) {
+      pages.push(currentPage);
+      currentPage = [];
+    }
+    currentPage.push(question);
+  }
+  if (currentPage.length) pages.push(currentPage);
+  return pages;
+}
+
+function validateAnswers(form, answers, questionSubset = null) {
   const calculated = computeCalculatedAnswers(form, answers);
   const errors = [];
-  for (const question of visibleQuestions(form, calculated)) {
+  for (const question of questionSubset || visibleQuestions(form, calculated)) {
     if (question.type === "note" || question.type === "calculate") continue;
-    const value = calculated[question.name] ?? "";
+    const scopedAnswers = questionScopedAnswers(question, calculated);
+    const answerKey = questionAnswerKey(question);
+    const value = calculated[answerKey] ?? "";
     const requiredByExpression = question.requiredExpression?.trim()
-      ? Boolean(evaluateXlsExpression(question.requiredExpression, calculated, value))
+      ? Boolean(evaluateXlsExpression(question.requiredExpression, scopedAnswers, value))
       : false;
     if ((question.required || requiredByExpression) && String(value).trim() === "") {
-      errors.push(`${question.label || question.name} is required.`);
+      errors.push(`${question.label || question.name}${question.repeatIndex ? ` (repeat ${question.repeatIndex})` : ""} is required.`);
     }
     if (String(value).trim() && question.constraint?.trim()) {
-      const ok = Boolean(evaluateXlsExpression(question.constraint, calculated, value));
+      const ok = Boolean(evaluateXlsExpression(question.constraint, scopedAnswers, value));
       if (!ok) errors.push(question.constraintMessage || `${question.label || question.name} does not satisfy its constraint.`);
     }
   }
@@ -873,8 +1234,23 @@ function postJson(path, payload) {
   });
 }
 
-function deleteJson(path) {
-  return requestJson(path, { method: "DELETE" });
+function notifyCollectionChanged() {
+  try {
+    window.localStorage.setItem("icph_collection_changed_at", String(Date.now()));
+  } catch {}
+  try {
+    window.opener?.postMessage({ type: "icph:collection-changed" }, window.location.origin);
+  } catch {}
+}
+
+function deleteJson(path, payload = undefined) {
+  return requestJson(path, {
+    method: "DELETE",
+    ...(payload === undefined ? {} : {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+  });
 }
 
 function fileToBase64(file) {
@@ -886,9 +1262,28 @@ function fileToBase64(file) {
   });
 }
 
-function attachmentUrl(workspaceId, href) {
+function attachmentUrl(workspaceId, href, accessCode = "") {
   const fileName = String(href || "").split(/[\\/]/).filter(Boolean).pop() || "";
-  return `${API_BASE}/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}/attachments/${encodeURIComponent(fileName)}`;
+  const base = accessCode
+    ? `/api/public/forms/${encodeURIComponent(normalizeAccessCodeInput(accessCode))}`
+    : `/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}`;
+  return `${API_BASE}${base}/attachments/${encodeURIComponent(fileName)}`;
+}
+
+function mediaSource(value, workspaceId = "", accessCode = "") {
+  const source = String(value || "").trim();
+  if (!source) return "";
+  if (/^(data:|blob:|https?:\/\/)/i.test(source)) return source;
+  return attachmentUrl(workspaceId, source, accessCode);
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
 
 function resourceFileName(value) {
@@ -1026,14 +1421,26 @@ function normalizeFormDraft(draft) {
   const base = defaultForm();
   const source = draft && typeof draft === "object" ? draft : {};
   const questions = Array.isArray(source.questions) ? source.questions : [];
+  const questionNames = new Set(questions.map((question) => String(question?.name || "").trim()).filter(Boolean));
+  const sourcePrimaryIdentifier = String(source.primaryIdentifierVariable || "").trim();
+  const sourceParticipantIdentifier = String(source.participantIdentifierVariable || "").trim();
+  const effectivePrimaryIdentifier = questionNames.has(sourcePrimaryIdentifier)
+    ? sourcePrimaryIdentifier
+    : questionNames.has(sourceParticipantIdentifier)
+      ? sourceParticipantIdentifier
+      : sourcePrimaryIdentifier;
   return {
     ...base,
     ...source,
-    questions: questions.map((question, index) => ({
+    terminologyUseLlm: false,
+    primaryIdentifierVariable: effectivePrimaryIdentifier,
+    questions: questions.map((question, index) => {
+      const isEndStructural = END_STRUCTURAL_TYPES.has(question.type);
+      return ({
       id: question.id || `question_${index + 1}_${slug(question.name || question.label || "field")}`,
       type: question.type || "text",
-      name: question.name || `q${index + 1}`,
-      label: question.label || question.name || `Question ${index + 1}`,
+      name: isEndStructural ? "" : question.name || `q${index + 1}`,
+      label: isEndStructural ? "" : question.label || question.name || `Question ${index + 1}`,
       hint: question.hint || "",
       required: booleanColumnTrue(question.required),
       relevant: question.relevant || "",
@@ -1056,10 +1463,18 @@ function normalizeFormDraft(draft) {
       guidanceHint: question.guidanceHint || question.guidance_hint || "",
       saveTo: question.saveTo || question.save_to || "",
       bigImage: question.bigImage || question["big-image"] || "",
+      translations: question.translations && typeof question.translations === "object" ? question.translations : {},
       extraColumns: question.extraColumns && typeof question.extraColumns === "object" ? question.extraColumns : {},
       logicBuilders: question.logicBuilders && typeof question.logicBuilders === "object" ? question.logicBuilders : {},
       timerConfig: normalizeTimerConfig(question.timerConfig),
       readOnly: booleanColumnTrue(question.readOnly),
+      demographicData: Boolean(question.demographicData),
+      prefixWithParentIdentifier: Boolean(question.prefixWithParentIdentifier),
+      demographicParentIdentifierVariable: question.demographicParentIdentifierVariable || "",
+      demographicGeneratedId: Boolean(question.demographicGeneratedId),
+      demographicAutoGenerated: question.demographicAutoGenerated !== false && !/_copy(?:_\d+)?$/.test(String(question.name || "")),
+      identifierLocked: Boolean(question.identifierLocked),
+      folderSharedIdentifier: question.folderSharedIdentifier || "",
       listName: question.listName || "",
       options: Array.isArray(question.options)
         ? question.options.map((option, optionIndex) => ({
@@ -1071,10 +1486,12 @@ function normalizeFormDraft(draft) {
             video: String(option.video || ""),
             bigImage: String(option.bigImage || option["big-image"] || ""),
             geometry: String(option.geometry || ""),
+            translations: option.translations && typeof option.translations === "object" ? option.translations : {},
             extraColumns: option.extraColumns && typeof option.extraColumns === "object" ? option.extraColumns : {}
           }))
         : []
-    }))
+      });
+    })
   };
 }
 
@@ -1188,8 +1605,10 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
   const body = all.find((node) => xmlLocalName(node) === "body") || doc.documentElement;
   const controlNames = new Set(["input", "select1", "select", "upload", "trigger"]);
   const controls = [...body.getElementsByTagName("*")].filter((node) => controlNames.has(xmlLocalName(node)));
-  const questions = controls.map((control, index) => {
+  const fallbackQuestionByName = new Map((fallbackDraft.questions || []).map((question) => [question.name, question]));
+  const xmlQuestions = controls.map((control, index) => {
     const name = leafNameFromPath(control.getAttribute("ref") || control.getAttribute("nodeset")) || `q${index + 1}`;
+    const fallbackQuestion = fallbackQuestionByName.get(name) || {};
     const bind = binds.get(name) || {};
     const requiredExpression = booleanColumnExpression(bind.required);
     const readOnlyExpression = booleanColumnExpression(bind.readOnly);
@@ -1203,7 +1622,10 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
           : controlType === "trigger"
             ? "acknowledge"
             : xformInputType(bind.type);
-    const options = type === "select_one" || type === "select_multiple" ? parseXFormChoices(control, choiceInstances) : [];
+    const options = type === "select_one" || type === "select_multiple" ? parseXFormChoices(control, choiceInstances).map((option) => {
+      const fallbackOption = (fallbackQuestion.options || []).find((item) => String(item.name || "") === String(option.name || ""));
+      return fallbackOption ? { ...option, translations: fallbackOption.translations || {} } : option;
+    }) : [];
     return {
       id: `xml_${index + 1}_${name}`,
       type,
@@ -1221,18 +1643,38 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
       readOnlyExpression,
       readOnly: isTrueExpression(bind.readOnly),
       listName: "",
-      options
+      options,
+      translations: fallbackQuestion.translations || {},
+      requiredMessage: fallbackQuestion.requiredMessage || "",
+      guidanceHint: fallbackQuestion.guidanceHint || "",
+      note: fallbackQuestion.note || ""
     };
   });
 
-  const hiddenTimerQuestions = (fallbackDraft.questions || []).filter((question) => question.type === "timer");
+  const xmlQuestionByName = new Map(xmlQuestions.map((question) => [question.name, question]));
+  const fallbackQuestions = Array.isArray(fallbackDraft.questions) ? fallbackDraft.questions : [];
+  const questions = fallbackQuestions.length
+    ? fallbackQuestions.map((fallbackQuestion) => {
+        if (STRUCTURAL_TYPES.has(fallbackQuestion.type)) return fallbackQuestion;
+        return {
+          ...fallbackQuestion,
+          ...(xmlQuestionByName.get(fallbackQuestion.name) || {}),
+          // The XForm control is intentionally generic for several ODK types
+          // (uploads, barcode, preload fields). Keep the authored XLSForm type
+          // so the browser viewer can render the right control.
+          type: fallbackQuestion.type || xmlQuestionByName.get(fallbackQuestion.name)?.type || "text"
+        };
+      })
+    : xmlQuestions;
+  const fallbackNames = new Set(questions.map((question) => question.name).filter(Boolean));
+  const additionalXmlQuestions = xmlQuestions.filter((question) => !fallbackNames.has(question.name));
 
   return normalizeFormDraft({
     ...fallbackDraft,
     title,
     formId,
     version,
-    questions: [...questions, ...hiddenTimerQuestions],
+    questions: [...questions, ...additionalXmlQuestions],
     source: "published_xml"
   });
 }
@@ -1519,6 +1961,39 @@ function displayFormText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function secondaryLanguageName(form = {}) {
+  return form.multilingualEnabled ? String(form.multilingualLanguage || "").trim() : "";
+}
+
+function translatedValue(source = {}, key, language = "secondary") {
+  return source?.translations?.[language]?.[key] || "";
+}
+
+function withTranslatedValue(source = {}, key, value, language = "secondary") {
+  return {
+    ...source,
+    translations: {
+      ...(source.translations || {}),
+      [language]: {
+        ...(source.translations?.[language] || {}),
+        [key]: value
+      }
+    }
+  };
+}
+
+function localizedQuestion(question = {}, key, languageMode = "default") {
+  return languageMode === "secondary"
+    ? translatedValue(question, key) || question[key] || ""
+    : question[key] || "";
+}
+
+function localizedOption(option = {}, key, languageMode = "default") {
+  return languageMode === "secondary"
+    ? translatedValue(option, key) || option[key] || ""
+    : option[key] || "";
+}
+
 function downloadBlob(blob, fileName) {
   const href = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -1551,8 +2026,7 @@ function csvEscape(value) {
 
 function entryCsvQuestions(form = {}) {
   const seen = new Set();
-  return dataExportQuestions(form)
-    .filter((question) => {
+  return dataExportQuestions(form).filter((question) => {
       const name = String(question?.name || "").trim();
       if (!name || seen.has(name)) return false;
       if (STRUCTURAL_TYPES.has(question.type)) return false;
@@ -1562,13 +2036,41 @@ function entryCsvQuestions(form = {}) {
     });
 }
 
+function entryDisplayOptions(form = {}) {
+  return entryCsvQuestions(form).map((question) => ({
+    name: question.name,
+    label: displayFormText(question.label || question.name) || question.name
+  }));
+}
+
+function entryExportValue(answers = {}, question = {}) {
+  const name = String(question.name || "").trim();
+  const prefix = `${name}__repeat_`;
+  const repeatValues = Object.keys(answers)
+    .filter((key) => key.startsWith(prefix))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+    .map((key) => answers[key]);
+  if (repeatValues.length) return repeatValues;
+  if (Object.prototype.hasOwnProperty.call(answers, name)) return answers[name];
+  return "";
+}
+
+function entryDisplayValue(entry, displayField = "") {
+  const field = String(displayField || "").trim();
+  if (field) {
+    const value = csvValue(entryExportValue(entry?.answers || {}, { name: field }));
+    if (String(value ?? "").trim()) return String(value);
+  }
+  return entry?.instanceName || entry?.displayName || entry?.id || "Entry";
+}
+
 function entriesToCsv(form, entries) {
   const questions = entryCsvQuestions(form);
   const headers = questions.map((question) => String(question.name || "").trim());
   const rows = [headers.map(csvEscape).join(",")];
   for (const entry of entries) {
     const answers = computeCalculatedAnswers(form, entry.answers || {});
-    rows.push(headers.map((header) => csvEscape(answers[header])).join(","));
+    rows.push(questions.map((question) => csvEscape(entryExportValue(answers, question))).join(","));
   }
   return rows.join("\n") + "\n";
 }
@@ -1758,7 +2260,7 @@ function entitySourceLegendItem(entity = {}) {
     || ENTITY_SOURCE_LEGEND.at(-1);
 }
 
-function Field({ label, value, onChange, placeholder, helpText, info, multiline = false, autoGrow = false, type = "text", disabled = false }) {
+function Field({ label, value, onChange, placeholder, helpText, info, multiline = false, autoGrow = false, type = "text", disabled = false, secondaryLabel = "", secondaryValue = "", onSecondaryChange }) {
   const textareaRef = useRef(null);
   useEffect(() => {
     if (!autoGrow || !textareaRef.current) return;
@@ -1785,15 +2287,43 @@ function Field({ label, value, onChange, placeholder, helpText, info, multiline 
       ) : (
         <input type={type} value={value || ""} placeholder={placeholder} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
       )}
+      {secondaryLabel && onSecondaryChange ? (
+        <span className="secondary-language-input">
+          <small>{secondaryLabel}</small>
+          {multiline ? (
+            <textarea
+              value={secondaryValue || ""}
+              placeholder={`${secondaryLabel} ${label}`}
+              disabled={disabled}
+              onChange={(event) => onSecondaryChange(event.target.value)}
+            />
+          ) : (
+            <input
+              type={type}
+              value={secondaryValue || ""}
+              placeholder={`${secondaryLabel} ${label}`}
+              disabled={disabled}
+              onChange={(event) => onSecondaryChange(event.target.value)}
+            />
+          )}
+        </span>
+      ) : null}
     </label>
   );
 }
 
-function Toggle({ label, checked, onChange, disabled = false }) {
+function Toggle({ label, checked, onChange, disabled = false, hideLabel = false }) {
   return (
-    <label className="toggle">
-      <input type="checkbox" checked={Boolean(checked)} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
-      <span>{label}</span>
+    <label className={`toggle ${hideLabel ? "toggle-icon-only" : ""} ${checked ? "checked" : ""}`}>
+      <input
+        type="checkbox"
+        checked={Boolean(checked)}
+        disabled={disabled}
+        aria-label={label}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span className="toggle-control" aria-hidden="true" />
+      <span className={hideLabel ? "sr-only" : ""}>{label}</span>
     </label>
   );
 }
@@ -1893,18 +2423,359 @@ function stagePlaceholder(stage, workspace, entries, fhirBundles) {
 
 function App() {
   const path = window.location.pathname;
+  if (path.startsWith("/folder-visualization/")) {
+    return <FolderVisualizationPage folderId={decodeURIComponent(path.replace("/folder-visualization/", "").split("/")[0] || "")} />;
+  }
   if (path.startsWith("/respondent")) {
     const initialCode = decodeURIComponent(path.replace(/^\/respondent\/?/, "").split("/")[0] || "");
     return <RespondentPortal initialCode={initialCode} />;
   }
+  if (path === "/field-agent") {
+    return <FieldAgentPortal />;
+  }
+  if (path.startsWith("/public-fill/")) {
+    const params = new URLSearchParams(window.location.search);
+    return <FillForm accessCode={decodeURIComponent(path.replace("/public-fill/", "").split("/")[0])} entryId={params.get("entryId") || ""} />;
+  }
   if (path.startsWith("/fill/")) {
-    return <FillForm workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])} />;
+    const params = new URLSearchParams(window.location.search);
+    return <FillForm workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])} entryId={params.get("entryId") || ""} />;
   }
   if (path.startsWith("/entry/")) {
     const parts = path.replace("/entry/", "").split("/");
     return <EntryViewer workspaceId={decodeURIComponent(parts[0] || "")} entryId={decodeURIComponent(parts[1] || "")} />;
   }
   return <AdminApp />;
+}
+
+function visibleVersionForFolderForms(forms = [], folderId = "") {
+  const groups = new Map();
+  for (const form of forms.filter((item) => item.folderId === folderId && item.hasXml && item.respondentAccessCode && !item.collectionLocked)) {
+    const key = form.versionBaseId
+      || form.formId
+      || form.title
+      || String(form.workspaceId || "").replace(/_v\d+$/i, "");
+    const group = groups.get(key) || [];
+    group.push(form);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map((versions) => {
+      const ordered = versions.slice().sort((a, b) => Number(a.versionNumber || 1) - Number(b.versionNumber || 1));
+      return ordered.filter((item) => !item.collectionLocked).at(-1) || ordered.at(-1);
+    })
+    .filter(Boolean);
+}
+
+function folderVisualizationResponseValue(entry, form, displayVariable = "") {
+  const identifier = displayVariable || form.participantIdentifierVariable || form.primaryIdentifierVariable || "";
+  const value = identifier ? entryExportValue(entry?.answers || {}, { name: identifier }) : "";
+  const formatted = csvValue(value);
+  return String(formatted || (entry?.instanceName || entry?.id || "Unnamed response"));
+}
+
+function FolderVisualizationPage({ folderId }) {
+  const [folder, setFolder] = useState(null);
+  const [forms, setForms] = useState([]);
+  const [status, setStatus] = useState({ kind: "busy", message: "Loading folder responses..." });
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [positions, setPositions] = useState({});
+  const [drag, setDrag] = useState(null);
+  const [displayFieldByWorkspace, setDisplayFieldByWorkspace] = useState({});
+  const [displayPanelForm, setDisplayPanelForm] = useState(null);
+  const graphRef = useRef(null);
+
+  async function loadVisualization() {
+    setStatus({ kind: "busy", message: "Loading folder responses..." });
+    try {
+      const [folderData, formData] = await Promise.all([
+        requestJson("/api/folders"),
+        requestJson("/api/forms")
+      ]);
+      const nextFolder = (folderData.folders || []).find((item) => item.id === folderId);
+      if (!nextFolder) throw new Error("Folder not found.");
+      const selectedForms = visibleVersionForFolderForms(formData.forms || [], folderId);
+      const enrichedForms = await Promise.all(selectedForms.map(async (form) => {
+        const [entryData, draftData] = await Promise.all([
+          requestJson(`/api/forms/${encodeURIComponent(form.workspaceId)}/entries`),
+          requestJson(`/api/forms/${encodeURIComponent(form.workspaceId)}`)
+        ]);
+        return {
+          ...form,
+          entries: entryData.entries || [],
+          draft: draftData.draft || {}
+        };
+      }));
+      setFolder(nextFolder);
+      setForms(enrichedForms);
+      setDisplayFieldByWorkspace((current) => Object.fromEntries(enrichedForms.map((form) => [
+        form.workspaceId,
+        current[form.workspaceId] || form.participantIdentifierVariable || form.primaryIdentifierVariable || form.draft?.questions?.find((question) => question.name)?.name || ""
+      ])));
+      setStatus({ kind: "ok", message: `${enrichedForms.length} form${enrichedForms.length === 1 ? "" : "s"} loaded.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  async function downloadFolderWorkbook() {
+    setStatus({ kind: "busy", message: "Preparing folder response workbook..." });
+    try {
+      const response = await fetch(`${API_BASE}/api/folders/${encodeURIComponent(folderId)}/responses.xlsx`, {
+        headers: adminAuthHeaders()
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        let message = text;
+        try { message = JSON.parse(text).error || text; } catch {}
+        throw new Error(message || "Folder workbook export failed.");
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename="?([^";]+)"?/i);
+      downloadBlob(blob, match?.[1] || safeDownloadName(`${folder?.name || "folder"}_responses.xlsx`, "folder_responses.xlsx"));
+      setStatus({ kind: "ok", message: "Folder response workbook downloaded." });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  useEffect(() => {
+    loadVisualization();
+  }, [folderId]);
+
+  const graph = useMemo(() => {
+    const coreWidth = 230;
+    const coreGap = 150;
+    const coreY = 150;
+    const childStartY = 310;
+    const childGapX = 92;
+    const childGapY = 86;
+    const coreNodes = forms.map((form, index) => ({
+      id: `form:${form.workspaceId}`,
+      type: "core",
+      form,
+      x: 170 + index * (coreWidth + coreGap),
+      y: coreY
+    }));
+    const responseNodes = [];
+    for (const core of coreNodes) {
+      const entries = core.form.entries || [];
+      const columns = Math.max(1, Math.min(5, entries.length));
+      entries.forEach((entry, index) => {
+        const column = index % columns;
+        const row = Math.floor(index / columns);
+        responseNodes.push({
+          id: `entry:${core.form.workspaceId}:${entry.id || index}`,
+          type: "response",
+          form: core.form,
+          entry,
+          x: core.x + (column - (columns - 1) / 2) * childGapX,
+          y: childStartY + row * childGapY
+        });
+      });
+    }
+    return {
+      coreNodes,
+      responseNodes,
+      width: Math.max(980, coreNodes.at(-1)?.x + coreWidth / 2 + 170 || 980),
+      height: Math.max(560, ...responseNodes.map((node) => node.y + 80))
+    };
+  }, [forms]);
+
+  useEffect(() => {
+    setPositions((current) => {
+      const next = { ...current };
+      for (const node of [...graph.coreNodes, ...graph.responseNodes]) {
+        if (!next[node.id]) next[node.id] = { x: node.x, y: node.y };
+      }
+      return next;
+    });
+  }, [graph]);
+
+  useEffect(() => {
+    if (!drag) return undefined;
+    function move(event) {
+      const dx = (event.clientX - drag.clientX) / zoom;
+      const dy = (event.clientY - drag.clientY) / zoom;
+      if (drag.nodeId) {
+        setPositions((current) => {
+          const next = { ...current };
+          for (const [nodeId, origin] of Object.entries(drag.relatedOrigins)) {
+            const weight = nodeId === drag.nodeId ? 1 : origin.weight;
+            next[nodeId] = { x: origin.x + dx * weight, y: origin.y + dy * weight };
+          }
+          return next;
+        });
+      } else {
+        setPan({ x: drag.origin.x + event.clientX - drag.clientX, y: drag.origin.y + event.clientY - drag.clientY });
+      }
+    }
+    function stop() { setDrag(null); }
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+  }, [drag, zoom]);
+
+  function startPan(event) {
+    if (event.target !== event.currentTarget) return;
+    setDrag({ clientX: event.clientX, clientY: event.clientY, origin: pan, nodeId: null });
+  }
+
+  function startNodeDrag(event, node) {
+    event.stopPropagation();
+    const point = positions[node.id] || node;
+    const relatedOrigins = {};
+    const connectedResponseNodes = graph.responseNodes.filter((item) => item.form.workspaceId === node.form?.workspaceId);
+    const connectedCoreNodes = graph.coreNodes.filter((item) => item.id !== node.id && (item.id === node.id || Math.abs(item.x - node.x) <= 430));
+    for (const candidate of [...connectedResponseNodes, ...connectedCoreNodes]) {
+      const candidatePoint = positions[candidate.id] || candidate;
+      if (candidate.id !== node.id) relatedOrigins[candidate.id] = { ...candidatePoint, weight: candidate.type === "response" ? 0.82 : 0.2 };
+    }
+    relatedOrigins[node.id] = { ...point, weight: 1 };
+    setDrag({ clientX: event.clientX, clientY: event.clientY, origin: point, nodeId: node.id, relatedOrigins });
+  }
+
+  function resetView() {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+    setPositions({});
+  }
+
+  const nodePosition = (node) => positions[node.id] || node;
+  const identifierLabel = folder?.participantIdentifierVariable || folder?.primaryIdentifierVariable || "shared identifier";
+  const coreNodes = graph.coreNodes;
+
+  return (
+    <div className="app-shell folder-visualization-page">
+      <header className="topbar home-topbar">
+        <div className="topbar-actions">
+          <button className="secondary topbar-home" type="button" onClick={() => window.close()}>
+            <Home size={16} /> Close
+          </button>
+        </div>
+        <div className="topbar-title">
+          <h1>{folder?.name || "Folder visualization"}</h1>
+          <p>Interactive response map for forms in this folder.</p>
+        </div>
+        <div className="topbar-brand"><BrandLogos /></div>
+      </header>
+      <main className="folder-visualization-main">
+        <div className="folder-visualization-heading">
+          <div>
+            <span className="eyebrow">Folder responses</span>
+            <h2>{folder?.name || "Loading folder..."}</h2>
+            <p>Forms are linked by <strong>{identifierLabel}</strong>. Drag nodes to explore the relationship map.</p>
+          </div>
+          <div className="folder-graph-actions">
+            <button className="primary small" type="button" onClick={downloadFolderWorkbook} disabled={status.kind === "busy"}><Download size={14} /> Download Excel</button>
+            <button className="secondary small" type="button" onClick={loadVisualization} disabled={status.kind === "busy"}><RefreshCw size={14} /> Refresh</button>
+            <button className="secondary small icon-only" type="button" onClick={() => setZoom((value) => Math.min(2.5, value + 0.15))} title="Zoom in"><ZoomIn size={16} /></button>
+            <button className="secondary small icon-only" type="button" onClick={() => setZoom((value) => Math.max(0.45, value - 0.15))} title="Zoom out"><ZoomOut size={16} /></button>
+            <button className="secondary small icon-only" type="button" onClick={resetView} title="Reset map"><Maximize2 size={16} /></button>
+          </div>
+        </div>
+        <div className="folder-graph-legend">
+          <span><i className="graph-legend-core" /> Form</span>
+          <span><i className="graph-legend-response" /> Response</span>
+          <span><Network size={14} /> Shared identifier link</span>
+          {status.message ? <span className={`graph-status ${status.kind}`}>{status.message}</span> : null}
+        </div>
+        <div className="folder-graph-viewport" ref={graphRef} onPointerDown={startPan} onWheel={(event) => { event.preventDefault(); setZoom((value) => Math.max(0.45, Math.min(2.5, value * (event.deltaY > 0 ? 0.9 : 1.1)))); }}>
+          {forms.length ? (
+            <svg className="folder-graph-svg" width={graph.width} height={graph.height} viewBox={`0 0 ${graph.width} ${graph.height}`} role="img" aria-label={`Response graph for ${folder?.name || "folder"}`}>
+              <defs>
+                <pattern id="folder-graph-grid" width="32" height="32" patternUnits="userSpaceOnUse">
+                  <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#e8edf5" strokeWidth="1" />
+                </pattern>
+                <marker id="folder-graph-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M 0 0 L 8 4 L 0 8 z" fill="#93a4bf" />
+                </marker>
+              </defs>
+              <rect width="100%" height="100%" fill="url(#folder-graph-grid)" />
+              <g transform={`translate(${pan.x} ${pan.y}) scale(${zoom})`}>
+                {coreNodes.slice(0, -1).map((node, index) => {
+                  const next = coreNodes[index + 1];
+                  const from = nodePosition(node);
+                  const to = nodePosition(next);
+                  const x1 = from.x + 115;
+                  const x2 = to.x - 115;
+                  const y = from.y;
+                  return (
+                    <g key={`link:${node.id}`}>
+                      <line className="graph-core-edge" x1={x1} y1={y} x2={x2} y2={to.y} markerEnd="url(#folder-graph-arrow)" />
+                      <text className="graph-edge-label" x={(x1 + x2) / 2} y={(y + to.y) / 2 - 8} textAnchor="middle">{identifierLabel}</text>
+                    </g>
+                  );
+                })}
+                {coreNodes.map((node) => {
+                  const point = nodePosition(node);
+                  return (graph.responseNodes.filter((item) => item.form.workspaceId === node.form.workspaceId)).map((child) => {
+                    const childPoint = nodePosition(child);
+                    const bend = Math.max(26, Math.abs(childPoint.x - point.x) * 0.28);
+                    return <path className="graph-response-edge" key={`edge:${child.id}`} d={`M ${point.x} ${point.y + 46} C ${point.x} ${point.y + 46 + bend}, ${childPoint.x} ${childPoint.y - bend}, ${childPoint.x} ${childPoint.y - 28}`} />;
+                  });
+                })}
+                {coreNodes.map((node) => {
+                  const point = nodePosition(node);
+                  const demographic = Boolean(node.form.draft?.questions?.some((question) => question.type === "begin_repeat" && question.demographicData));
+                  return (
+                    <g className="graph-core-node" key={node.id} transform={`translate(${point.x - 115} ${point.y - 46})`} onPointerDown={(event) => startNodeDrag(event, node)}>
+                      <rect width="230" height="92" rx="18" />
+                      <text className="graph-core-title" x="18" y="32">{String(node.form.title || "Untitled form").length > 22 ? `${String(node.form.title || "Untitled form").slice(0, 21)}…` : (node.form.title || "Untitled form")}</text>
+                      <text className="graph-core-subtitle" x="18" y="57">v{node.form.versionNumber || 1} · {node.form.entries?.length || 0} responses{demographic ? " · DEMOGRAPHIC" : ""}</text>
+                      <text className="graph-display-link" x="18" y="79" onPointerDown={(event) => event.stopPropagation()} onClick={() => setDisplayPanelForm(node.form)}>display variable</text>
+                    </g>
+                  );
+                })}
+                {graph.responseNodes.map((node) => {
+                  const point = nodePosition(node);
+                  const label = folderVisualizationResponseValue(node.entry, node.form, displayFieldByWorkspace[node.form.workspaceId]);
+                  return (
+                    <g className="graph-response-node" key={node.id} transform={`translate(${point.x} ${point.y})`} onPointerDown={(event) => startNodeDrag(event, node)}>
+                      <circle r="28" />
+                      <text x="0" y="4" textAnchor="middle" textLength="42" lengthAdjust="spacingAndGlyphs">{label.length > 8 ? `${label.slice(0, 7)}…` : label}</text>
+                      <title>{label}</title>
+                    </g>
+                  );
+                })}
+              </g>
+            </svg>
+          ) : (
+            <div className="folder-graph-empty"><Network size={34} /><p>No forms or responses are available in this folder yet.</p></div>
+          )}
+        </div>
+        {displayPanelForm ? (
+          <aside className="folder-display-drawer" aria-label="Choose display variable">
+            <div className="folder-display-drawer-head">
+              <div>
+                <span className="eyebrow">Response labels</span>
+                <h3>Display variable</h3>
+                <p>{displayPanelForm.title || "Selected form"}</p>
+              </div>
+              <button className="icon-button small" type="button" onClick={() => setDisplayPanelForm(null)} aria-label="Close display variable panel"><X size={16} /></button>
+            </div>
+            <label className="field">
+              <span>Question used for response circles</span>
+              <select
+                value={displayFieldByWorkspace[displayPanelForm.workspaceId] || ""}
+                onChange={(event) => setDisplayFieldByWorkspace((current) => ({ ...current, [displayPanelForm.workspaceId]: event.target.value }))}
+              >
+                {entryCsvQuestions(displayPanelForm.draft).map((question) => (
+                  <option key={question.id || question.name} value={question.name}>{displayFormText(question.label || question.name) || question.name} ({question.name})</option>
+                ))}
+              </select>
+            </label>
+            <p className="folder-display-drawer-note">Changing this only changes the labels shown in this visualization. Form data is not modified.</p>
+          </aside>
+        ) : null}
+      </main>
+    </div>
+  );
 }
 
 function AdminApp() {
@@ -1934,10 +2805,9 @@ function AdminApp() {
 function AccessLanding({ message = "", onAuthenticated }) {
   const [activeRole, setActiveRole] = useState("");
   const [password, setPassword] = useState("");
-  const [respondentCode, setRespondentCode] = useState("");
+  const [respondentSession, setRespondentSession] = useState(null);
   const [status, setStatus] = useState({ kind: message ? "ok" : "idle", message });
   const canAdminLogin = password.trim().length > 0 && status.kind !== "busy";
-  const canOpenRespondent = respondentCode.length === 5;
 
   function selectRole(role) {
     setActiveRole((current) => (current === role ? "" : role));
@@ -1963,14 +2833,25 @@ function AccessLanding({ message = "", onAuthenticated }) {
     }
   }
 
-  function submitRespondentCode(event) {
-    event.preventDefault();
-    const code = normalizeAccessCodeInput(respondentCode);
-    if (code.length !== 5) {
-      setStatus({ kind: "error", message: "Enter the 5-character respondent form code." });
-      return;
-    }
-    window.location.assign(`/respondent/${encodeURIComponent(code)}`);
+  function openRespondentSession(session) {
+    setRespondentSession(session);
+    setStatus({ kind: "idle", message: "" });
+    window.history.replaceState(null, "", `/respondent/${encodeURIComponent(session.accessCode)}`);
+  }
+
+  if (respondentSession) {
+    return (
+      <FillForm
+        accessCode={respondentSession.accessCode}
+        checkpointAnswers={respondentSession.checkpoint?.answers || null}
+        resumePrimaryIdentifierValue={respondentSession.primaryIdentifierValue || ""}
+        onBackToRespondent={() => {
+          setRespondentSession(null);
+          setStatus({ kind: "idle", message: "" });
+          window.history.replaceState(null, "", "/");
+        }}
+      />
+    );
   }
 
   return (
@@ -1981,7 +2862,7 @@ function AccessLanding({ message = "", onAuthenticated }) {
             <h1>ICPH Forms</h1>
             <p>Choose how you want to continue.</p>
           </div>
-          <img className="access-logo" src={cdpgLogo} alt="CDPG" />
+          <BrandLogos variant="access" />
         </div>
 
         <div className="access-role-tabs" aria-label="Choose access type">
@@ -2001,6 +2882,15 @@ function AccessLanding({ message = "", onAuthenticated }) {
             onClick={() => selectRole("respondent")}
           >
             <span>Respondent</span>
+            <ChevronDown size={18} />
+          </button>
+          <button
+            className={`access-role-button ${activeRole === "field-agent" ? "active" : ""}`}
+            aria-expanded={activeRole === "field-agent"}
+            type="button"
+            onClick={() => selectRole("field-agent")}
+          >
+            <span>Field Agent</span>
             <ChevronDown size={18} />
           </button>
         </div>
@@ -2030,34 +2920,24 @@ function AccessLanding({ message = "", onAuthenticated }) {
           ) : null}
 
           {activeRole === "respondent" ? (
-            <form className="access-panel access-panel-open respondent-panel" onSubmit={submitRespondentCode}>
+            <RespondentAccessPanel onOpen={openRespondentSession} />
+          ) : null}
+
+          {activeRole === "field-agent" ? (
+            <div className="access-panel access-panel-open">
               <div>
-                <h2>Respondent</h2>
-                <p>Enter the 5-character form code shared by the study team.</p>
+                <h2>Field Agent</h2>
+                <p>Review published forms and submitted entries.</p>
               </div>
-              <label className="field">
-                <span>Form code</span>
-                <input
-                  className="access-code-input"
-                  value={respondentCode}
-                  inputMode="text"
-                  autoCapitalize="characters"
-                  autoComplete="off"
-                  maxLength={5}
-                  onChange={(event) => setRespondentCode(normalizeAccessCodeInput(event.target.value))}
-                  placeholder="A1B2C"
-                  autoFocus
-                />
-              </label>
-              <button className="secondary" disabled={!canOpenRespondent} type="submit">
-                <Forward size={16} /> Fill Form
+              <button className="primary" type="button" onClick={() => window.location.assign("/field-agent")}>
+                <Forward size={16} /> Enter
               </button>
-            </form>
+            </div>
           ) : null}
 
           {!activeRole ? (
             <div className="access-empty-hint">
-              <p>Select Admin or Respondent to continue.</p>
+              <p>Select a role to continue.</p>
             </div>
           ) : null}
         </div>
@@ -2074,27 +2954,31 @@ function AccessLanding({ message = "", onAuthenticated }) {
 }
 
 function RespondentPortal({ initialCode = "" }) {
-  const [code, setCode] = useState(normalizeAccessCodeInput(initialCode));
+  const [session, setSession] = useState(() => {
+    const code = normalizeAccessCodeInput(initialCode);
+    return code.length ? { accessCode: code, mode: "fresh" } : null;
+  });
   const [status, setStatus] = useState({ kind: "idle", message: "" });
 
-  function submitCode(event) {
-    event.preventDefault();
-    const normalized = normalizeAccessCodeInput(code);
-    if (normalized.length !== 5) {
-      setStatus({ kind: "error", message: "Enter the 5-character respondent form code." });
-      return;
-    }
-    setCode(normalized);
+  function openSession(nextSession) {
+    setSession(nextSession);
     setStatus({ kind: "idle", message: "" });
-    window.history.replaceState(null, "", `/respondent/${encodeURIComponent(normalized)}`);
+    window.history.replaceState(null, "", `/respondent/${encodeURIComponent(nextSession.accessCode)}`);
   }
 
-  if (code.length === 5) {
-    return <FillForm accessCode={code} onBackToRespondent={() => {
-      setCode("");
-      setStatus({ kind: "idle", message: "" });
-      window.history.replaceState(null, "", "/respondent");
-    }} />;
+  if (session?.accessCode) {
+    return (
+      <FillForm
+        accessCode={session.accessCode}
+        checkpointAnswers={session.checkpoint?.answers || null}
+        resumePrimaryIdentifierValue={session.primaryIdentifierValue || ""}
+        onBackToRespondent={() => {
+          setSession(null);
+          setStatus({ kind: "idle", message: "" });
+          window.history.replaceState(null, "", "/respondent");
+        }}
+      />
+    );
   }
 
   return (
@@ -2105,27 +2989,9 @@ function RespondentPortal({ initialCode = "" }) {
             <h1>ICPH Form</h1>
             <p>Enter the form code shared by the study team.</p>
           </div>
-          <img className="access-logo" src={cdpgLogo} alt="CDPG" />
+          <BrandLogos variant="access" />
         </div>
-        <form className="respondent-code-form" onSubmit={submitCode}>
-          <label className="field">
-            <span>Form code</span>
-            <input
-              className="access-code-input"
-              value={code}
-              inputMode="text"
-              autoCapitalize="characters"
-              autoComplete="off"
-              maxLength={5}
-              autoFocus
-              onChange={(event) => setCode(normalizeAccessCodeInput(event.target.value))}
-              placeholder="A1B2C"
-            />
-          </label>
-          <button className="primary" disabled={code.length !== 5} type="submit">
-            <Forward size={16} /> Continue
-          </button>
-        </form>
+        <RespondentAccessPanel initialCode={initialCode} onOpen={openSession} />
         {status.message ? (
           <div className={`status-line ${status.kind}`}>
             <AlertCircle size={16} />
@@ -2137,15 +3003,424 @@ function RespondentPortal({ initialCode = "" }) {
   );
 }
 
+function FieldAgentPortal() {
+  const [forms, setForms] = useState([]);
+  const [selectedCode, setSelectedCode] = useState("");
+  const [displayFieldByCode, setDisplayFieldByCode] = useState({});
+  const [selectedEntryIds, setSelectedEntryIds] = useState([]);
+  const [status, setStatus] = useState({ kind: "busy", message: "Loading published forms..." });
+  const selectedForm = forms.find((item) => item.respondentAccessCode === selectedCode) || forms[0] || null;
+  const fieldAgentEntryIds = useMemo(
+    () => (selectedForm?.entries || []).map((entry) => String(entry.id || "")).filter(Boolean),
+    [selectedForm?.entries]
+  );
+  const fieldAgentSelectedSet = useMemo(() => new Set(selectedEntryIds), [selectedEntryIds]);
+  const fieldAgentDisplayOptions = selectedForm?.displayFields || [];
+  const fieldAgentDisplayField = displayFieldByCode[selectedForm?.respondentAccessCode]
+    || selectedForm?.participantIdentifierVariable
+    || selectedForm?.primaryIdentifierVariable
+    || fieldAgentDisplayOptions[0]?.name
+    || "";
+  const fieldAgentAllSelected = fieldAgentEntryIds.length > 0 && selectedEntryIds.length === fieldAgentEntryIds.length;
+
+  async function loadPublishedForms() {
+    setStatus({ kind: "busy", message: "Loading published forms..." });
+    try {
+      const data = await requestJson("/api/public/forms");
+      const nextForms = data.forms || [];
+      setForms(nextForms);
+      setSelectedCode((current) => nextForms.some((item) => item.respondentAccessCode === current)
+        ? current
+        : nextForms[0]?.respondentAccessCode || "");
+      setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  useEffect(() => {
+    loadPublishedForms();
+  }, []);
+
+  useEffect(() => {
+    setSelectedEntryIds([]);
+  }, [selectedForm?.respondentAccessCode]);
+
+  useEffect(() => {
+    function handleCollectionSignal(event) {
+      if (event?.type === "storage" && event.key !== "icph_collection_changed_at") return;
+      if (event?.type === "message" && event.data?.type !== "icph:collection-changed") return;
+      loadPublishedForms();
+    }
+    window.addEventListener("storage", handleCollectionSignal);
+    window.addEventListener("message", handleCollectionSignal);
+    window.addEventListener("focus", handleCollectionSignal);
+    return () => {
+      window.removeEventListener("storage", handleCollectionSignal);
+      window.removeEventListener("message", handleCollectionSignal);
+      window.removeEventListener("focus", handleCollectionSignal);
+    };
+  }, []);
+
+  function openFillForm(form, entryId = "") {
+    const code = normalizeAccessCodeInput(form?.respondentAccessCode);
+    if (!code) return;
+    const query = entryId ? `?entryId=${encodeURIComponent(entryId)}` : "";
+    window.open(`/public-fill/${encodeURIComponent(code)}${query}`, "_blank");
+  }
+
+  function toggleFieldAgentEntry(entryId, checked) {
+    setSelectedEntryIds((current) => checked
+      ? [...new Set([...current, entryId])]
+      : current.filter((id) => id !== entryId));
+  }
+
+  async function deleteFieldAgentEntries(entryIds) {
+    const ids = (Array.isArray(entryIds) ? entryIds : [entryIds]).filter(Boolean);
+    const code = normalizeAccessCodeInput(selectedForm?.respondentAccessCode);
+    if (!ids.length || !code) return;
+    const confirmed = window.confirm(`Delete ${ids.length} entr${ids.length === 1 ? "y" : "ies"}? This cannot be undone.`);
+    if (!confirmed) return;
+    setStatus({ kind: "busy", message: "Deleting entries..." });
+    try {
+      await deleteJson(`/api/public/forms/${encodeURIComponent(code)}/entries`, { entryIds: ids });
+      setSelectedEntryIds([]);
+      notifyCollectionChanged();
+      await loadPublishedForms();
+      setStatus({ kind: "ok", message: `Deleted ${ids.length} entr${ids.length === 1 ? "y" : "ies"}.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <header className="topbar field-agent-topbar">
+        <div className="topbar-actions">
+          <button className="secondary topbar-home" onClick={() => window.location.assign("/")}>
+            <Home size={18} /> Home
+          </button>
+        </div>
+        <div className="topbar-title">
+          <h1>Field Agent</h1>
+          <p>Published form collection</p>
+        </div>
+        <div className="topbar-brand">
+          <BrandLogos />
+        </div>
+      </header>
+      <main className="field-agent-layout">
+        <aside className="field-agent-sidebar">
+          <div className="section-head compact">
+            <h2>Forms</h2>
+            <button className="secondary small" onClick={loadPublishedForms}>
+              <RefreshCw size={14} /> Refresh
+            </button>
+          </div>
+          <div className="field-agent-form-list">
+            {forms.map((formItem) => (
+              <button
+                key={formItem.respondentAccessCode}
+                className={`field-agent-form-button ${selectedForm?.respondentAccessCode === formItem.respondentAccessCode ? "active" : ""}`}
+                onClick={() => setSelectedCode(formItem.respondentAccessCode)}
+                type="button"
+              >
+                <span>{formItem.title}</span>
+                <strong>{formItem.respondentAccessCode}</strong>
+                <small>{formItem.entryCount || 0} entries</small>
+              </button>
+            ))}
+          </div>
+        </aside>
+        <section className="field-agent-main">
+          {selectedForm ? (
+            <>
+              <div className="field-agent-title-row">
+                <div>
+                  <h2>{selectedForm.title}</h2>
+                  <p>{selectedForm.formId || selectedForm.workspaceId}</p>
+                </div>
+                <button className="primary" onClick={() => openFillForm(selectedForm)}>
+                  <ExternalLink size={16} /> Fill Form
+                </button>
+                {fieldAgentDisplayOptions.length ? (
+                  <label className="display-field-select">
+                    <span>Display</span>
+                    <select
+                      value={fieldAgentDisplayField}
+                      onChange={(event) => setDisplayFieldByCode((current) => ({
+                        ...current,
+                        [selectedForm.respondentAccessCode]: event.target.value
+                      }))}
+                    >
+                      {fieldAgentDisplayOptions.map((option) => (
+                        <option key={option.name} value={option.name}>{displayFormText(option.label || option.name) || option.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+              </div>
+              <div className="panel entries-panel field-agent-entries">
+                <div className="section-head">
+                  <h2>Entries</h2>
+                  <span>{selectedForm.entries?.length || 0} submissions</span>
+                </div>
+                {selectedForm.entries?.length ? (
+                  <div className="entries-table">
+                    <label className="bulk-check-row">
+                      <input
+                        type="checkbox"
+                        checked={fieldAgentAllSelected}
+                        onChange={(event) => setSelectedEntryIds(event.target.checked ? fieldAgentEntryIds : [])}
+                      />
+                      <span>{selectedEntryIds.length}/{selectedForm.entries.length} selected</span>
+                      <button className="secondary small danger-action" disabled={!selectedEntryIds.length || status.kind === "busy"} onClick={() => deleteFieldAgentEntries(selectedEntryIds)}>
+                        <Trash2 size={14} /> Delete
+                      </button>
+                    </label>
+                    {selectedForm.entries.slice().reverse().map((entry) => (
+                      <div className="entry-row field-agent-entry-row" key={entry.id}>
+                        <label className="row-check">
+                          <input
+                            type="checkbox"
+                            checked={fieldAgentSelectedSet.has(String(entry.id || ""))}
+                            onChange={(event) => toggleFieldAgentEntry(String(entry.id || ""), event.target.checked)}
+                          />
+                          <span className="sr-only">Select entry {entryDisplayValue(entry, fieldAgentDisplayField)}</span>
+                        </label>
+                        <div>
+                          <span>{entryDisplayValue(entry, fieldAgentDisplayField)}</span>
+                          <small>
+                            {new Date(entry.submittedAt).toLocaleString()}
+                            {entry.updatedAt ? ` · updated ${new Date(entry.updatedAt).toLocaleString()}` : ""}
+                          </small>
+                        </div>
+                        <div className="entry-actions">
+                          {selectedForm.responseSettings?.allowResponseEdits ? (
+                            <button className="secondary small icon-text-button" onClick={() => openFillForm(selectedForm, entry.id)} title="Edit entry">
+                              <TextCursorInput size={14} /> Edit
+                            </button>
+                          ) : null}
+                          <button className="secondary small danger-action" disabled={status.kind === "busy"} onClick={() => deleteFieldAgentEntries([entry.id])}>
+                            <Trash2 size={14} /> Delete
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="muted">No submissions yet.</p>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="panel empty-state tall">
+              <ClipboardList size={36} />
+              <p>No published forms yet.</p>
+            </div>
+          )}
+        </section>
+      </main>
+      <footer className="builder-footer home-footer" aria-label="Page status">
+        <div className={`footer-status ${status.kind}`}>
+          {status.kind === "ok" ? <Check size={16} /> : status.kind === "busy" ? <RefreshCw size={16} /> : <AlertCircle size={16} />}
+          <span>{status.message || "Ready."}</span>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+function primaryIdentifierQuestionText(form = {}) {
+  const variable = String(form?.participantIdentifierVariable || form?.primaryIdentifierVariable || "").trim();
+  if (!variable) return "";
+  const question = (form.questions || []).find((item) => item.name === variable);
+  const label = displayFormText(question?.label || question?.hint || "");
+  return label || "Primary identifier question";
+}
+
+function RespondentAccessPanel({ initialCode = "", onOpen }) {
+  const [mode, setMode] = useState("fresh");
+  const [code, setCode] = useState(normalizeAccessCodeInput(initialCode));
+  const [resumeIdentifierValue, setResumeIdentifierValue] = useState("");
+  const [formInfo, setFormInfo] = useState(null);
+  const [status, setStatus] = useState({ kind: "idle", message: "" });
+  const normalizedCode = normalizeAccessCodeInput(code);
+  const primaryIdentifierVariable = formInfo?.draft?.participantIdentifierVariable || formInfo?.draft?.primaryIdentifierVariable || "";
+  const primaryIdentifierQuestion = primaryIdentifierQuestionText(formInfo?.draft);
+  const canFresh = normalizedCode.length > 0 && status.kind !== "busy";
+  const canResume = normalizedCode.length > 0 && resumeIdentifierValue.trim() && status.kind !== "busy";
+
+  useEffect(() => {
+    let cancelled = false;
+    setFormInfo(null);
+    setResumeIdentifierValue("");
+    if (mode !== "resume" || !normalizedCode.length) return undefined;
+    setStatus({ kind: "busy", message: "Loading form details..." });
+    requestJson(`/api/public/forms/${encodeURIComponent(normalizedCode)}`)
+      .then((data) => {
+        if (cancelled) return;
+        setFormInfo(data);
+        const identifier = data?.draft?.participantIdentifierVariable || data?.draft?.primaryIdentifierVariable || "";
+        const identifierQuestion = primaryIdentifierQuestionText(data?.draft);
+        setStatus({
+          kind: identifier ? "ok" : "error",
+          message: identifier ? `Enter ${identifierQuestion} to continue.` : "This form does not have a primary identifier variable."
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setStatus({ kind: "error", message: error.message || String(error) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, normalizedCode]);
+
+  function chooseMode(nextMode) {
+    setMode(nextMode);
+    setStatus({ kind: "idle", message: "" });
+    setFormInfo(null);
+    setResumeIdentifierValue("");
+  }
+
+  function openFresh(event) {
+    event.preventDefault();
+    if (!canFresh) return;
+    onOpen({ accessCode: normalizedCode, mode: "fresh" });
+  }
+
+  async function openCheckpoint(event) {
+    event.preventDefault();
+    if (!canResume) return;
+    setStatus({ kind: "busy", message: "Finding saved checkpoint..." });
+    try {
+      const data = await requestJson(`/api/public/forms/${encodeURIComponent(normalizedCode)}/checkpoint`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ primaryIdentifierValue: resumeIdentifierValue })
+      });
+      if (!data.checkpoint) {
+        setStatus({ kind: "error", message: "No saved checkpoint was found for that identifier." });
+        return;
+      }
+      onOpen({
+        accessCode: normalizedCode,
+        mode: "resume",
+        primaryIdentifierValue: data.primaryIdentifierValue,
+        checkpoint: data.checkpoint
+      });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  return (
+    <div className="access-panel access-panel-open respondent-panel respondent-access-flow">
+      <div className="access-role-tabs respondent-mode-tabs" aria-label="Choose respondent action">
+        <button
+          className={`access-role-button ${mode === "fresh" ? "active" : ""}`}
+          type="button"
+          onClick={() => chooseMode("fresh")}
+        >
+          <span>Fill a fresh form</span>
+          <FileText size={18} />
+        </button>
+        <button
+          className={`access-role-button ${mode === "resume" ? "active" : ""}`}
+          type="button"
+          onClick={() => chooseMode("resume")}
+        >
+          <span>Continue old form</span>
+          <RefreshCw size={18} />
+        </button>
+      </div>
+
+      {mode === "fresh" ? (
+        <form className="respondent-code-form" onSubmit={openFresh}>
+          <div>
+            <h2>Respondent</h2>
+            <p>Enter the form code shared by the study team.</p>
+          </div>
+          <label className="field">
+            <span>Form code</span>
+            <input
+              className="access-code-input"
+              value={code}
+              inputMode="text"
+              autoCapitalize="characters"
+              autoComplete="off"
+              maxLength={RESPONDENT_CODE_MAX_LENGTH}
+              autoFocus
+              onChange={(event) => setCode(normalizeAccessCodeInput(event.target.value))}
+              placeholder="A1B2C"
+            />
+          </label>
+          <button className="secondary" disabled={!canFresh} type="submit">
+            <Forward size={16} /> Fill Form
+          </button>
+        </form>
+      ) : (
+        <form className="respondent-code-form" onSubmit={openCheckpoint}>
+          <div>
+            <h2>Respondent</h2>
+            <p>Enter the form code, then identify the saved checkpoint.</p>
+          </div>
+          <label className="field">
+            <span>Form code</span>
+            <input
+              className="access-code-input"
+              value={code}
+              inputMode="text"
+              autoCapitalize="characters"
+              autoComplete="off"
+              maxLength={RESPONDENT_CODE_MAX_LENGTH}
+              autoFocus
+              onChange={(event) => setCode(normalizeAccessCodeInput(event.target.value))}
+              placeholder="A1B2C"
+            />
+          </label>
+          <label className="field">
+            <span>{primaryIdentifierQuestion || "Primary identifier question"}</span>
+            <input
+              value={resumeIdentifierValue}
+              disabled={!normalizedCode.length || status.kind === "busy" || !primaryIdentifierVariable}
+              onChange={(event) => setResumeIdentifierValue(event.target.value)}
+              placeholder={primaryIdentifierQuestion ? "Enter your answer" : "Enter form code first"}
+            />
+          </label>
+          <button className="secondary" disabled={!canResume || !primaryIdentifierVariable} type="submit">
+            <Forward size={16} /> Continue Form
+          </button>
+        </form>
+      )}
+
+      {status.message ? (
+        <div className={`status-line ${status.kind}`}>
+          {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
+          <span>{status.message}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function DashboardApp({ onLogout }) {
   const [view, setView] = useState("home");
   const [forms, setForms] = useState([]);
+  const [folders, setFolders] = useState([]);
   const [schemaDocuments, setSchemaDocuments] = useState([]);
   const [schemaSummary, setSchemaSummary] = useState(null);
   const [pendingXlsxImport, setPendingXlsxImport] = useState(null);
+  const [folderFormPrompt, setFolderFormPrompt] = useState(null);
   const [newFormPromptOpen, setNewFormPromptOpen] = useState(false);
   const [publishIdentifierPrompt, setPublishIdentifierPrompt] = useState(false);
   const [publishConfirmationAccepted, setPublishConfirmationAccepted] = useState(false);
+  const [respondentCodeMode, setRespondentCodeMode] = useState(RESPONDENT_CODE_MODE_RANDOM);
+  const [customRespondentCode, setCustomRespondentCode] = useState("");
+  const [allowResponseEdits, setAllowResponseEdits] = useState(false);
+  const [limitOneResponsePerIdentifier, setLimitOneResponsePerIdentifier] = useState(true);
+  const [participantIdentifierVariable, setParticipantIdentifierVariable] = useState("");
   const [confirmationDialog, setConfirmationDialog] = useState(null);
   const confirmationResolverRef = useRef(null);
   const [form, setForm] = useState(defaultForm());
@@ -2161,6 +3436,18 @@ function DashboardApp({ onLogout }) {
 
   const selectedQuestion = (form.questions || []).find((question) => question.id === selectedId) || null;
   const issues = useMemo(() => validateForm(form), [form]);
+  const currentFolder = useMemo(
+    () => folders.find((folder) => folder.id === form.folderId) || null,
+    [folders, form.folderId]
+  );
+  const folderBarcodeQuestion = useMemo(
+    () => (form.questions || []).find((question) => question?.type === "barcode" && String(question.name || "").trim()) || null,
+    [form.questions]
+  );
+  const folderPrimaryIdentifier = currentFolder?.primaryIdentifierVariable
+    || forms.find((item) => item.folderId === form.folderId && item.primaryIdentifierVariable)?.primaryIdentifierVariable
+    || "";
+  const needsFolderPrimaryAcknowledgement = Boolean(form.folderId && !folderPrimaryIdentifier);
   const attachmentNames = useMemo(() => attachments.map((attachment) => attachment.fileName), [attachments]);
 	  const resourceRequirements = useMemo(() => formResourceRequirements(form, attachmentNames), [form, attachmentNames]);
 	  const reviewIssue = useMemo(() => terminologyPublishIssue(terminology), [terminology]);
@@ -2178,6 +3465,53 @@ function DashboardApp({ onLogout }) {
   async function refreshForms() {
     const data = await requestJson("/api/forms");
     setForms(data.forms || []);
+  }
+
+  async function refreshFolders() {
+    const data = await requestJson("/api/folders");
+    setFolders(data.folders || []);
+  }
+
+  async function createFolder() {
+    const name = window.prompt("Folder name");
+    if (!name?.trim()) return;
+    try {
+      const data = await postJson("/api/folders", { name: name.trim() });
+      setFolders(data.folders || []);
+      setStatus({ kind: "ok", message: `Created folder: ${name.trim()}` });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
+  async function deleteFolder(folderId, name) {
+    const confirmed = await requestConfirmation({
+      title: "Delete Folder?",
+      message: `Delete "${name || folderId}" and every form inside it? This permanently removes the folder's forms, entries, XLSForms, XML, and FHIR bundles.`,
+      confirmLabel: "Delete",
+      confirmIcon: "trash",
+      danger: true
+    });
+    if (!confirmed) return;
+    setStatus({ kind: "busy", message: "Deleting folder and its forms..." });
+    try {
+      const data = await deleteJson(`/api/folders/${encodeURIComponent(folderId)}`);
+      if (data.deletedWorkspaceIds?.some((id) => workspaceRouteId(workspace?.workspaceId) === workspaceRouteId(id))) {
+        setWorkspace(null);
+        setForm(defaultForm());
+        setEntries([]);
+        setAttachments([]);
+        setFhirBundles([]);
+        setTerminology({ status: "not_started", questions: [] });
+        setSelectedId(null);
+        setView("home");
+      }
+      setFolders(data.folders || []);
+      await refreshForms();
+      setStatus({ kind: "ok", message: `Deleted folder: ${name || folderId}` });
+    } catch (error) {
+      handleRequestError(error);
+    }
   }
 
   async function refreshSchemaDocuments() {
@@ -2241,8 +3575,65 @@ function DashboardApp({ onLogout }) {
 
   useEffect(() => {
     refreshForms().catch(handleRequestError);
+    refreshFolders().catch(handleRequestError);
     refreshSchemaDocuments().catch(handleRequestError);
   }, []);
+
+  useEffect(() => {
+    if (workspace?.respondentAccessCode) {
+      const savedMode = form.respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM
+        ? RESPONDENT_CODE_MODE_CUSTOM
+        : RESPONDENT_CODE_MODE_RANDOM;
+      setRespondentCodeMode(savedMode);
+      setCustomRespondentCode(normalizeAccessCodeInput(workspace.respondentAccessCode));
+    } else {
+      setRespondentCodeMode(RESPONDENT_CODE_MODE_RANDOM);
+      setCustomRespondentCode("");
+    }
+  }, [form.respondentCodeMode, workspace?.workspaceId, workspace?.respondentAccessCode]);
+
+  useEffect(() => {
+    setAllowResponseEdits(Boolean(form.allowResponseEdits));
+    setLimitOneResponsePerIdentifier(form.limitOneResponsePerIdentifier !== false);
+    setParticipantIdentifierVariable(
+      form.participantIdentifierVariable
+      || (currentFolder?.participantIdentifierMode === "barcode" ? folderBarcodeQuestion?.name : "")
+      || form.primaryIdentifierVariable
+      || ""
+    );
+  }, [form.allowResponseEdits, form.limitOneResponsePerIdentifier, form.participantIdentifierVariable, form.primaryIdentifierVariable, currentFolder?.participantIdentifierMode, folderBarcodeQuestion?.name, workspace?.workspaceId]);
+
+  async function updateResponseSettings(nextSettings) {
+    const merged = {
+      allowResponseEdits,
+      limitOneResponsePerIdentifier,
+      participantIdentifierVariable: participantIdentifierVariable || form.primaryIdentifierVariable || "",
+      ...nextSettings
+    };
+    setAllowResponseEdits(Boolean(merged.allowResponseEdits));
+    setLimitOneResponsePerIdentifier(merged.limitOneResponsePerIdentifier !== false);
+    setParticipantIdentifierVariable(merged.participantIdentifierVariable || form.primaryIdentifierVariable || "");
+    setForm((current) => ({ ...current, ...merged }));
+    if (!workspace?.workspaceId || !hasPublishedForm(workspace)) return;
+    setStatus({ kind: "busy", message: "Saving response settings..." });
+    try {
+      const data = await requestJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspace.workspaceId))}/response-settings`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(merged)
+      });
+      setWorkspace((current) => ({ ...current, ...data }));
+      setForm(normalizeFormDraft(data.draft));
+      await refreshForms();
+      setStatus({ kind: "ok", message: "Response settings saved." });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
+  function updateTerminologyLlm() {
+    setForm((current) => ({ ...current, terminologyUseLlm: false }));
+  }
 
   function focusMissingResources(missing = missingResourceRequirements) {
     const first = missing[0];
@@ -2314,10 +3705,29 @@ function DashboardApp({ onLogout }) {
   }
 
   function updateQuestion(id, patch) {
-    setForm((current) => ({
-      ...current,
-      questions: current.questions.map((question) => (question.id === id ? { ...question, ...patch } : question))
-    }));
+    setForm((current) => {
+      const target = current.questions.find((question) => question.id === id);
+      const nextQuestions = current.questions.map((question) => (question.id === id ? { ...question, ...patch } : question));
+      if (!target || target.type !== "begin_repeat" || !Object.prototype.hasOwnProperty.call(patch, "demographicData")) {
+        return { ...current, questions: nextQuestions };
+      }
+      const nextTarget = nextQuestions.find((question) => question.id === id);
+      const targetIndex = nextQuestions.findIndex((question) => question.id === id);
+      const next = [...nextQuestions];
+      const childIndex = targetIndex + 1;
+      const endIndex = findRepeatEnd(next, targetIndex);
+      const existingGeneratedIndex = next.findIndex((question, index) => index > targetIndex && index < endIndex && question.demographicGeneratedId);
+      if (nextTarget.demographicData && existingGeneratedIndex < 0) {
+        const names = new Set(next.map((question) => question.name).filter(Boolean));
+        let name = "member_id";
+        let suffix = 2;
+        while (names.has(name)) name = `member_id_${suffix++}`;
+        next.splice(childIndex, 0, demographicMemberIdQuestion(name));
+      } else if (!nextTarget.demographicData && existingGeneratedIndex >= 0) {
+        next.splice(existingGeneratedIndex, 1);
+      }
+      return { ...current, questions: next };
+    });
   }
 
   function addQuestion(type) {
@@ -2328,6 +3738,15 @@ function DashboardApp({ onLogout }) {
   }
 
   function removeQuestion(id) {
+    const question = form.questions.find((item) => item.id === id);
+    if (question?.identifierLocked) {
+      setStatus({ kind: "error", message: "This shared folder identifier is locked and cannot be deleted." });
+      return;
+    }
+    if (question?.demographicGeneratedId && isDemographicGeneratedIdLocked(form.questions, id)) {
+      setStatus({ kind: "error", message: "Turn off Demographic data before deleting its generated ID question." });
+      return;
+    }
     const label = questionNumberLabel(form, id);
     setForm((current) => ({ ...current, questions: current.questions.filter((question) => question.id !== id) }));
     setSelectedId((current) => (current === id ? null : current));
@@ -2335,12 +3754,22 @@ function DashboardApp({ onLogout }) {
   }
 
   function duplicateQuestion(question) {
+    if (question.identifierLocked) {
+      setStatus({ kind: "error", message: "This shared folder identifier is locked and cannot be duplicated." });
+      return;
+    }
+    if (question.demographicGeneratedId) {
+      setStatus({ kind: "error", message: "The generated demographic ID question cannot be duplicated." });
+      return;
+    }
     const sourceLabel = questionNumberLabel(form, question.id);
     const nextNumber = form.questions.length + 1;
     const copy = {
       ...question,
       id: crypto.randomUUID(),
       name: slug(`${question.name}_copy`),
+      demographicGeneratedId: question.demographicGeneratedId ? false : question.demographicGeneratedId,
+      demographicAutoGenerated: false,
       options: question.options?.map((option) => ({ ...option, id: crypto.randomUUID() }))
     };
     setForm((current) => ({ ...current, questions: [...current.questions, copy] }));
@@ -2350,6 +3779,12 @@ function DashboardApp({ onLogout }) {
 
   function moveQuestion(targetId) {
     if (!draggedId || draggedId === targetId) return;
+    const draggedQuestion = (form.questions || []).find((question) => question.id === draggedId);
+    const targetQuestion = (form.questions || []).find((question) => question.id === targetId);
+    if (draggedQuestion?.identifierLocked || targetQuestion?.identifierLocked) {
+      setStatus({ kind: "error", message: "Shared folder identifiers stay in a fixed position." });
+      return;
+    }
     const fromIndex = (form.questions || []).findIndex((question) => question.id === draggedId);
     const toIndex = (form.questions || []).findIndex((question) => question.id === targetId);
     setForm((current) => {
@@ -2374,17 +3809,19 @@ function DashboardApp({ onLogout }) {
   }
 
   async function createWorkspace(linkage = {}) {
+    const safeLinkage = linkage && typeof linkage === "object" && !linkage.nativeEvent ? linkage : {};
     setStatus({ kind: "busy", message: "Creating form workspace..." });
     try {
       const data = await postJson("/api/forms/new", {
         title: "Untitled ICPH Form",
         formId: "icph_form",
         version: "1",
-        linkedMetaFormFileName: linkage.linkedMetaFormFileName,
-        primaryIdentifierVariable: linkage.primaryIdentifierVariable,
-        metaFormFormIndex: linkage.metaFormFormIndex,
-        metaFormFormTitle: linkage.metaFormFormTitle,
-        primaryIdentifierAcknowledged: linkage.primaryIdentifierAcknowledged
+        linkedMetaFormFileName: safeLinkage.linkedMetaFormFileName,
+        primaryIdentifierVariable: safeLinkage.primaryIdentifierVariable,
+        metaFormFormIndex: safeLinkage.metaFormFormIndex,
+        metaFormFormTitle: safeLinkage.metaFormFormTitle,
+        folderId: safeLinkage.folderId,
+        primaryIdentifierAcknowledged: safeLinkage.primaryIdentifierAcknowledged
       });
       setNewFormPromptOpen(false);
       setWorkspace(data);
@@ -2534,7 +3971,7 @@ function DashboardApp({ onLogout }) {
 	    }
     if (!alreadyPublished && !options.publishConfirmed) {
       const confirmed = await requestConfirmation({
-        title: "Move to Publish?",
+        title: "Publish?",
         message: "After this point, the terminology review will be locked and vocabulary mappings cannot be edited. The form will move into local collection.",
         details: form.previousVersionWorkspaceId
           ? [
@@ -2542,13 +3979,26 @@ function DashboardApp({ onLogout }) {
               ...(copiedVersionChanges.length ? copiedVersionChanges : ["No detected build changes"]).slice(0, 12)
             ]
           : [],
-        confirmLabel: "Move to Publish",
+        confirmLabel: "Publish",
         confirmIcon: "forward"
       });
       if (!confirmed) return;
     }
     const explicitPrimaryIdentifier = typeof primaryIdentifierVariable === "string" ? primaryIdentifierVariable : "";
     const selectedPrimaryIdentifier = String(explicitPrimaryIdentifier || form.primaryIdentifierVariable || "").trim();
+    const folderUsesBarcodeIdentifier = currentFolder?.participantIdentifierMode === "barcode";
+    if (form.folderId && folderPrimaryIdentifier && selectedPrimaryIdentifier && selectedPrimaryIdentifier !== folderPrimaryIdentifier && !folderUsesBarcodeIdentifier) {
+      setStatus({ kind: "error", message: `Forms in this folder must use the shared primary identifier variable "${folderPrimaryIdentifier}".` });
+      return;
+    }
+    const selectedRespondentCode = respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM
+      ? normalizeAccessCodeInput(customRespondentCode)
+      : "";
+    if (!alreadyPublished && respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM && !selectedRespondentCode.length) {
+      setActiveStage("publish");
+      setStatus({ kind: "error", message: "Enter a custom respondent form code before publishing." });
+      return;
+    }
     const linkedToMetaForm = Boolean(form.metaFormLink?.fileName);
     const identifierCandidates = primaryIdentifierCandidates();
     if (!alreadyPublished && !selectedPrimaryIdentifier) {
@@ -2580,14 +4030,34 @@ function DashboardApp({ onLogout }) {
         return;
       }
     }
+    const demographicIssue = demographicRepeatIssue(form, selectedPrimaryIdentifier);
+    if (demographicIssue) {
+      setActiveStage("build");
+      setStatus({ kind: "error", message: demographicIssue });
+      return;
+    }
+    const resolvedDemographicForm = resolveDemographicRepeats(form, selectedPrimaryIdentifier);
 	    const formForExport = selectedPrimaryIdentifier
 	      ? {
-	          ...form,
+	          ...resolvedDemographicForm,
 	          primaryIdentifierVariable: selectedPrimaryIdentifier,
 	          instanceName: instanceNameForPrimaryIdentifier(selectedPrimaryIdentifier),
-	          versionChangeSummary: copiedVersionChanges
+	          versionChangeSummary: copiedVersionChanges,
+	          respondentCodeMode,
+	          allowResponseEdits,
+	          limitOneResponsePerIdentifier,
+	          ...(selectedRespondentCode ? { respondentAccessCode: selectedRespondentCode } : {}),
+	          ...(options.primaryIdentifierAcknowledged ? { primaryIdentifierAcknowledged: true } : {})
 	        }
-	      : { ...form, versionChangeSummary: copiedVersionChanges };
+	      : {
+	          ...resolvedDemographicForm,
+	          versionChangeSummary: copiedVersionChanges,
+	          respondentCodeMode,
+	          allowResponseEdits,
+	          limitOneResponsePerIdentifier,
+	          ...(selectedRespondentCode ? { respondentAccessCode: selectedRespondentCode } : {}),
+	          ...(options.primaryIdentifierAcknowledged ? { primaryIdentifierAcknowledged: true } : {})
+	        };
     setStatus({ kind: "busy", message: "Writing XLSForm and converting XML..." });
     try {
       const data = await postJson("/api/forms/export", { workspaceId: workspaceRouteId(workspace.workspaceId), form: formForExport });
@@ -2652,9 +4122,9 @@ function DashboardApp({ onLogout }) {
 	        : "Starting terminology extraction..."
 	    });
 	    try {
-	      const data = await postJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspace.workspaceId))}/terminology`, {
-	        questionIds: selectedQuestionIds
-	      });
+      const data = await postJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspace.workspaceId))}/terminology`, {
+        questionIds: selectedQuestionIds,
+      });
 	      setTerminology(data);
       setWorkspace((current) => ({ ...current, hasTerminology: true, terminologyStatus: data.status, terminologyPath: data.terminologyPath || current?.terminologyPath || null }));
       setActiveStage("terminology");
@@ -2873,7 +4343,8 @@ function DashboardApp({ onLogout }) {
       });
       const savedTerminology = saved?.questions ? saved : nextTerminology;
       setTerminology(savedTerminology);
-      await exportXlsForm("", { publishConfirmed: true, terminologyOverride: savedTerminology });
+      setActiveStage("publish");
+      setStatus({ kind: "ok", message: "Terminology marked unmapped. Choose the respondent code settings, then move to Publish." });
     } catch (error) {
       handleRequestError(error);
     }
@@ -2965,7 +4436,7 @@ function DashboardApp({ onLogout }) {
     return { terminology: nextTerminology, question: savedQuestion, entityIndex: savedEntityIndex >= 0 ? savedEntityIndex : addedEntityIndex };
   }
 
-  async function importXlsx(event) {
+  async function importXlsx(event, folderId = "") {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
@@ -2979,7 +4450,12 @@ function DashboardApp({ onLogout }) {
         title: data.title,
         formId: data.formId,
         variables: data.variables || [],
-        variableCount: data.variableCount || 0
+        variableCount: data.variableCount || 0,
+        folderId: String(folderId || "").trim() || "",
+        folderName: folders.find((folder) => folder.id === folderId)?.name || "",
+        folderPrimaryIdentifier: folders.find((folder) => folder.id === folderId)?.primaryIdentifierVariable
+          || forms.find((item) => item.folderId === folderId && item.hasXml && item.primaryIdentifierVariable)?.primaryIdentifierVariable
+          || ""
       });
       setStatus({
         kind: "ok",
@@ -3002,7 +4478,8 @@ function DashboardApp({ onLogout }) {
         metaFormFormIndex: linkage.metaFormFormIndex,
         metaFormFormTitle: linkage.metaFormFormTitle,
         primaryIdentifierAcknowledged: linkage.primaryIdentifierAcknowledged,
-        addMissingPrimaryIdentifier: linkage.addMissingPrimaryIdentifier
+        addMissingPrimaryIdentifier: linkage.addMissingPrimaryIdentifier,
+        folderId: pendingXlsxImport.folderId
       });
       setPendingXlsxImport(null);
 	      const importedForm = normalizeFormDraft({
@@ -3071,9 +4548,12 @@ function DashboardApp({ onLogout }) {
   }
 
   async function deleteSchemaDocument(fileName) {
+    const linkedWorkspaceIds = forms
+      .filter((item) => item.metaFormLink?.fileName === fileName)
+      .map((item) => item.workspaceId);
     const confirmed = await requestConfirmation({
       title: "Delete MetaForm?",
-      message: `Delete schema metadata document "${fileName}"? This removes the uploaded DOCX and its processed Markdown/chunks. Existing FHIR bundles will not be changed.`,
+      message: `Delete schema metadata document "${fileName}"? This removes the uploaded DOCX, processed Markdown/chunks, and ${linkedWorkspaceIds.length} linked form${linkedWorkspaceIds.length === 1 ? "" : "s"}, including their entries, XLSForms, XML, and FHIR bundles.`,
       confirmLabel: "Delete",
       confirmIcon: "trash",
       danger: true
@@ -3084,7 +4564,18 @@ function DashboardApp({ onLogout }) {
       const data = await deleteJson(`/api/schema-documents/${encodeURIComponent(fileName)}`);
       setSchemaDocuments(data.documents || []);
       setSchemaSummary(data);
-      setStatus({ kind: "ok", message: `Deleted schema metadata document: ${fileName}` });
+      if (data.deletedWorkspaceIds?.some((id) => workspaceRouteId(workspace?.workspaceId) === workspaceRouteId(id))) {
+        setWorkspace(null);
+        setForm(defaultForm());
+        setEntries([]);
+        setAttachments([]);
+        setFhirBundles([]);
+        setTerminology({ status: "not_started", questions: [] });
+        setSelectedId(null);
+        setView("home");
+      }
+      await refreshForms();
+      setStatus({ kind: "ok", message: `Deleted MetaForm and ${data.deletedWorkspaceIds?.length || 0} linked form(s): ${fileName}` });
     } catch (error) {
       handleRequestError(error);
     }
@@ -3120,14 +4611,74 @@ function DashboardApp({ onLogout }) {
     }
   }
 
+  async function toggleCollectionAccess(workspaceId, locked) {
+    const id = workspaceRouteId(workspaceId);
+    setStatus({ kind: "busy", message: locked ? "Locking public access..." : "Unlocking public access..." });
+    try {
+      await requestJson(`/api/forms/${encodeURIComponent(id)}/collection-access`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ collectionLocked: locked })
+      });
+      await refreshForms();
+      setStatus({ kind: "ok", message: locked ? "Form hidden from respondents and field agents." : "Form available to respondents and field agents." });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
   function backHome() {
     setView("home");
     setSelectedId(null);
     refreshForms().catch(() => {});
   }
 
-  function fillForm(workspaceId) {
-    window.open(`/fill/${encodeURIComponent(workspaceRouteId(workspaceId))}`, "_blank", "noopener,noreferrer");
+  function fillForm(workspaceId, entryId = "") {
+    const query = entryId ? `?entryId=${encodeURIComponent(entryId)}` : "";
+    window.open(`/fill/${encodeURIComponent(workspaceRouteId(workspaceId))}${query}`, "_blank", "noopener,noreferrer");
+  }
+
+  async function downloadOdkXls(workspaceId) {
+    const id = workspaceRouteId(workspaceId || workspace?.workspaceId);
+    if (!id) {
+      setStatus({ kind: "error", message: "Open a published form before downloading ODK XLS." });
+      return;
+    }
+    setStatus({ kind: "busy", message: "Downloading ODK XLS..." });
+    try {
+      const response = await fetch(`${API_BASE}/api/forms/${encodeURIComponent(id)}/xlsx`, {
+        headers: adminAuthHeaders()
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "ODK XLS download failed.");
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("content-disposition") || "";
+      const match = disposition.match(/filename="([^"]+)"/);
+      downloadBlob(blob, match?.[1] || safeDownloadName(`${form.formId || form.title || "odk_form"}.xlsx`, "odk_form.xlsx"));
+      setStatus({ kind: "ok", message: "ODK XLS downloaded." });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
+  async function deleteFormEntries(entryIds) {
+    if (!workspace?.workspaceId) return;
+    const ids = (Array.isArray(entryIds) ? entryIds : [entryIds]).filter(Boolean);
+    if (!ids.length) return;
+    const confirmed = window.confirm(`Delete ${ids.length} entr${ids.length === 1 ? "y" : "ies"}? This cannot be undone.`);
+    if (!confirmed) return;
+    setStatus({ kind: "busy", message: "Deleting entries..." });
+    try {
+      const data = await deleteJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspace.workspaceId))}/entries`, { entryIds: ids });
+      setEntries(data.entries || []);
+      await refreshForms();
+      notifyCollectionChanged();
+      setStatus({ kind: "ok", message: `Deleted ${data.deletedCount || ids.length} entr${ids.length === 1 ? "y" : "ies"}.` });
+    } catch (error) {
+      handleRequestError(error);
+    }
   }
 
   async function uploadWorkspaceAttachments(workspaceId, event) {
@@ -3223,6 +4774,35 @@ function DashboardApp({ onLogout }) {
     }
   }
 
+  async function uploadOptionMedia(questionId, optionId, fieldName, event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    const id = workspaceRouteId(workspace?.workspaceId);
+    if (!id || !file || !questionId || !optionId || !fieldName) {
+      setStatus({ kind: "error", message: "Open a form workspace before uploading option media." });
+      return;
+    }
+    setStatus({ kind: "busy", message: `Uploading ${file.name}...` });
+    try {
+      const dataBase64 = await fileToBase64(file);
+      const data = await postJson(`/api/forms/${encodeURIComponent(id)}/attachments`, {
+        filename: file.name,
+        dataBase64
+      });
+      updateQuestion(questionId, {
+        options: (form.questions.find((item) => item.id === questionId)?.options || []).map((option) => (
+          option.id === optionId ? { ...option, [fieldName]: file.name } : option
+        ))
+      });
+      setAttachments(data.attachments || []);
+      setWorkspace((current) => ({ ...current, ...data }));
+      await refreshForms();
+      setStatus({ kind: "ok", message: `Uploaded ${file.name} and linked it to the choice.` });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
   async function deleteWorkspaceAttachment(workspaceId, fileName) {
     const id = workspaceRouteId(workspaceId);
     if (!id || !fileName) return;
@@ -3257,10 +4837,20 @@ function DashboardApp({ onLogout }) {
       {view === "home" ? (
         <HomePage
           forms={forms}
+          folders={folders}
           schemaDocuments={schemaDocuments}
           schemaSummary={schemaSummary}
           status={status}
-          createWorkspace={() => setNewFormPromptOpen(true)}
+          createWorkspace={(folderId = "") => folderId
+            ? setFolderFormPrompt({ folderId, folderName: folders.find((folder) => folder.id === folderId)?.name || "this folder" })
+            : setNewFormPromptOpen(true)}
+          uploadXlsxToFolder={(folderId, event) => {
+            setFolderFormPrompt(null);
+            importXlsx(event, folderId);
+          }}
+          openNewFormModal={() => setNewFormPromptOpen(true)}
+          createFolder={createFolder}
+          deleteFolder={deleteFolder}
           importXlsx={importXlsx}
           uploadSchemaDocument={uploadSchemaDocument}
           processSchemaDocuments={processSchemaDocuments}
@@ -3268,6 +4858,7 @@ function DashboardApp({ onLogout }) {
           openWorkspace={openWorkspace}
           fillForm={fillForm}
           deleteWorkspace={deleteWorkspace}
+          toggleCollectionAccess={toggleCollectionAccess}
           onLogout={onLogout}
           pendingXlsxImport={pendingXlsxImport}
           confirmXlsxImport={confirmXlsxImport}
@@ -3275,9 +4866,15 @@ function DashboardApp({ onLogout }) {
           newFormPromptOpen={newFormPromptOpen}
           confirmNewForm={createWorkspace}
           cancelNewForm={() => setNewFormPromptOpen(false)}
+          folderFormPrompt={folderFormPrompt}
+          cancelFolderForm={() => setFolderFormPrompt(null)}
+          createEmptyFolderForm={(folderId) => {
+            setFolderFormPrompt(null);
+            createWorkspace({ folderId });
+          }}
         />
       ) : (
-        <BuilderPage
+	          <BuilderPage
           form={form}
           workspace={workspace}
           entries={entries}
@@ -3306,6 +4903,7 @@ function DashboardApp({ onLogout }) {
           finishBuild={finishBuild}
           exportXlsForm={exportXlsForm}
 	          runTerminologyExtraction={runTerminologyExtraction}
+	          updateTerminologyLlm={updateTerminologyLlm}
 	          replaceTerminologyMapping={replaceTerminologyMapping}
 	          addTerminologyEntity={addTerminologyEntity}
 	          reviewIssue={reviewIssue}
@@ -3314,14 +4912,29 @@ function DashboardApp({ onLogout }) {
 	          createNewVersion={createNewVersion}
 	          leaveAllTerminologyUnmappedAndPublish={leaveAllTerminologyUnmappedAndPublish}
 	          passToMapper={passToMapper}
+          downloadOdkXls={downloadOdkXls}
           backHome={backHome}
           fillForm={fillForm}
           uploadWorkspaceAttachments={uploadWorkspaceAttachments}
           uploadWorkspaceResource={uploadWorkspaceResource}
           uploadQuestionMedia={uploadQuestionMedia}
+          uploadOptionMedia={uploadOptionMedia}
           deleteWorkspaceAttachment={deleteWorkspaceAttachment}
           viewEntry={viewEntry}
+          deleteEntries={deleteFormEntries}
           refreshEntries={refreshCurrentEntries}
+          respondentCodeMode={respondentCodeMode}
+          setRespondentCodeMode={setRespondentCodeMode}
+          customRespondentCode={customRespondentCode}
+          setCustomRespondentCode={setCustomRespondentCode}
+          allowResponseEdits={allowResponseEdits}
+          setAllowResponseEdits={(value) => updateResponseSettings({ allowResponseEdits: value })}
+          limitOneResponsePerIdentifier={limitOneResponsePerIdentifier}
+          setLimitOneResponsePerIdentifier={(value) => updateResponseSettings({ limitOneResponsePerIdentifier: value })}
+          participantIdentifierVariable={participantIdentifierVariable}
+          setParticipantIdentifierVariable={(value) => updateResponseSettings({ participantIdentifierVariable: value })}
+          folderParticipantIdentifierVariable={currentFolder?.participantIdentifierVariable || ""}
+          onParticipantIdentifierActivated={refreshFolders}
           onLogout={onLogout}
         />
       )}
@@ -3330,15 +4943,17 @@ function DashboardApp({ onLogout }) {
           form={form}
           status={status}
           candidates={primaryIdentifierCandidates()}
+          folderName={currentFolder?.name || "this folder"}
+          requiresFolderAcknowledgement={needsFolderPrimaryAcknowledgement}
           onCancel={() => {
             setPublishIdentifierPrompt(false);
             setPublishConfirmationAccepted(false);
           }}
-          onPublish={(primaryIdentifierVariable) => {
+          onPublish={(primaryIdentifierVariable, primaryIdentifierAcknowledged) => {
             const publishConfirmed = publishConfirmationAccepted;
             setPublishIdentifierPrompt(false);
             setPublishConfirmationAccepted(false);
-            exportXlsForm(primaryIdentifierVariable, { publishConfirmed });
+            exportXlsForm(primaryIdentifierVariable, { publishConfirmed, primaryIdentifierAcknowledged });
           }}
         />
       ) : null}
@@ -3355,10 +4970,12 @@ function DashboardApp({ onLogout }) {
 
 function HomePage({
   forms,
+  folders,
   schemaDocuments,
   schemaSummary,
   status,
   createWorkspace,
+  openNewFormModal,
   importXlsx,
   uploadSchemaDocument,
   processSchemaDocuments,
@@ -3366,14 +4983,21 @@ function HomePage({
   openWorkspace,
   fillForm,
   deleteWorkspace,
+  deleteFolder,
+  toggleCollectionAccess,
   onLogout,
   pendingXlsxImport,
   confirmXlsxImport,
   cancelXlsxImport,
-  newFormPromptOpen,
-  confirmNewForm,
-  cancelNewForm
-	}) {
+	  newFormPromptOpen,
+	  confirmNewForm,
+		  cancelNewForm,
+		  createFolder,
+		  folderFormPrompt,
+		  cancelFolderForm,
+		  createEmptyFolderForm,
+		  uploadXlsxToFolder
+}) {
 	  const homeRef = useRef(null);
 	  const [connectors, setConnectors] = useState([]);
 	  const [selectedVersionByGroup, setSelectedVersionByGroup] = useState({});
@@ -3432,6 +5056,24 @@ function HomePage({
           path: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`
         });
       }
+      const folderRows = new Map(
+        [...root.querySelectorAll("[data-folder-id]")]
+          .filter((node) => node.classList.contains("folder-row"))
+          .map((node) => [node.dataset.folderId, node])
+      );
+      for (const xlsRow of root.querySelectorAll("[data-folder-form-id]")) {
+        const folderRow = folderRows.get(xlsRow.dataset.folderFormId);
+        if (!folderRow) continue;
+        const source = folderRow.getBoundingClientRect();
+        const target = xlsRow.getBoundingClientRect();
+        const x1 = source.right - rootRect.left;
+        const y1 = source.top + source.height / 2 - rootRect.top;
+        const x2 = target.left - rootRect.left;
+        const y2 = target.top + target.height / 2 - rootRect.top;
+        if (x2 <= x1 + 24) continue;
+        const bend = Math.max(28, (x2 - x1) / 2);
+        next.push({ id: `${xlsRow.dataset.workspaceId}-folder`, path: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}` });
+      }
       setConnectors(next);
     }
 
@@ -3448,7 +5090,7 @@ function HomePage({
       window.removeEventListener("resize", measureConnectors);
       window.removeEventListener("scroll", measureConnectors, true);
     };
-	  }, [forms, schemaDocuments, selectedVersionByGroup]);
+	  }, [forms, folders, schemaDocuments, selectedVersionByGroup]);
 
   return (
     <>
@@ -3463,7 +5105,7 @@ function HomePage({
           <p>Connect MetaForms with generated XLSForms for context and tracking.</p>
         </div>
         <div className="topbar-brand">
-          <img className="topbar-logo" src={cdpgLogo} alt="CDPG" />
+          <BrandLogos />
         </div>
       </header>
 
@@ -3476,6 +5118,7 @@ function HomePage({
           </svg>
         ) : null}
         <section className="home-column metaforms-column">
+          <FoldersPanel folders={folders} forms={forms} createFolder={createFolder} deleteFolder={deleteFolder} createWorkspace={createWorkspace} openWorkspace={openWorkspace} />
           <SchemaDocumentsPanel
             documents={schemaDocuments}
             summary={schemaSummary}
@@ -3484,6 +5127,8 @@ function HomePage({
             processSchemaDocuments={processSchemaDocuments}
             deleteSchemaDocument={deleteSchemaDocument}
             linkedFormsByMetaForm={linkedFormsByMetaForm}
+            openWorkspace={openWorkspace}
+            fillForm={fillForm}
           />
         </section>
 
@@ -3495,7 +5140,7 @@ function HomePage({
               <XlsFormsNote />
             </div>
             <div className="home-column-actions">
-              <button className="primary small" onClick={createWorkspace}>
+              <button className="primary small" onClick={openNewFormModal}>
                 <Plus size={14} /> New
               </button>
               <label className="secondary small file-action">
@@ -3519,6 +5164,7 @@ function HomePage({
 	                  key={item.workspaceId}
                   data-workspace-id={item.workspaceId}
                   data-linked-metaform={item.metaFormLink?.fileName || undefined}
+                  data-folder-form-id={item.folderId || undefined}
                 >
                   <div className="card-head">
                     <div className="card-head-main">
@@ -3557,11 +5203,14 @@ function HomePage({
                     <div className="form-linkage">
                       <span>MetaForm: <strong>{item.metaFormLink.fileName}</strong></span>
                       <span>Primary ID: <strong>{item.primaryIdentifierVariable || "Not selected"}</strong></span>
+                      {item.participantIdentifierVariable && item.participantIdentifierVariable !== item.primaryIdentifierVariable ? (
+                        <span>Participant ID: <strong>{item.participantIdentifierVariable}</strong></span>
+                      ) : null}
                     </div>
                   ) : item.primaryIdentifierVariable ? (
-                    <div className="form-linkage custom">
-                      <span>Custom form</span>
-                      <span>Primary ID: <strong>{item.primaryIdentifierVariable}</strong></span>
+                    <div className="form-identity-strip">
+                      <span>{item.participantIdentifierVariable && item.participantIdentifierVariable !== item.primaryIdentifierVariable ? "Participant ID" : "Primary ID"}: <strong>{item.participantIdentifierVariable || item.primaryIdentifierVariable}</strong></span>
+                      <span>Form code: <strong>{item.respondentAccessCode || "—"}</strong></span>
                     </div>
                   ) : (
                     <div className="form-linkage unlinked">
@@ -3569,10 +5218,16 @@ function HomePage({
                       <span>Not linked to a MetaForm</span>
                     </div>
                   )}
-                  {item.respondentAccessCode ? (
+                  {item.respondentAccessCode && item.metaFormLink?.fileName ? (
                     <div className="respondent-code-row">
-                      <span>Respondent form code</span>
+                      <span>{item.collectionLocked ? "Locked respondent form code" : "Respondent form code"}</span>
                       <strong>{item.respondentAccessCode}</strong>
+                    </div>
+                  ) : null}
+                  {item.collectionLocked ? (
+                    <div className="form-linkage unlinked">
+                      <X size={15} />
+                      <span>Hidden from respondents and field agents</span>
                     </div>
                   ) : null}
                   <p className="mono">{item.outputDir}</p>
@@ -3583,6 +5238,11 @@ function HomePage({
                     {item.hasXml ? (
                       <button className="primary" onClick={() => fillForm(item.workspaceId)}>
                         <ExternalLink size={16} /> Fill Form
+                      </button>
+                    ) : null}
+                    {item.hasXml ? (
+                      <button className="secondary" onClick={() => toggleCollectionAccess(item.workspaceId, !item.collectionLocked)}>
+                        {item.collectionLocked ? <Check size={16} /> : <X size={16} />} {item.collectionLocked ? "Unlock Access" : "Lock Access"}
                       </button>
                     ) : null}
                     <button className="secondary danger-action" onClick={() => deleteWorkspace(item.workspaceId, item.title)}>
@@ -3603,13 +5263,21 @@ function HomePage({
         </div>
       </footer>
       {pendingXlsxImport ? (
-        <XlsImportLinkModal
+          <XlsImportLinkModal
           pending={pendingXlsxImport}
           documents={schemaDocuments}
           forms={forms}
           status={status}
           onCancel={cancelXlsxImport}
           onImport={confirmXlsxImport}
+        />
+      ) : null}
+      {folderFormPrompt ? (
+        <FolderFormModal
+          folderName={folderFormPrompt.folderName}
+          onCancel={cancelFolderForm}
+          onCreateEmpty={() => createEmptyFolderForm(folderFormPrompt.folderId)}
+          onUpload={(event) => uploadXlsxToFolder(folderFormPrompt.folderId, event)}
         />
       ) : null}
       {newFormPromptOpen ? (
@@ -3634,7 +5302,7 @@ function XlsFormsNote() {
       </button>
       {open ? (
         <span className="xls-note-popover" role="note">
-          <span>Browser filling may not fully support barcode, background-audio, and audit inputs.</span>
+          <span>Published forms use the ODK Web Forms renderer for repeats, groups, barcode, media, external choices, location, calculations, and audit fields.</span>
           <span>XLSForm import reads workbook sheets such as survey, choices, settings, and entities. Upload companion files from Builder before publishing.</span>
           <span>FHIR bundles use the XLSForm/form builder definition and submitted answers. MetaForms are kept for context and later grouping.</span>
           <span>If a form references external CSV/media/map files, open Builder and upload them there before publishing. FHIR creation uses the form and its submitted answers, not the linked MetaForm.</span>
@@ -3644,15 +5312,116 @@ function XlsFormsNote() {
   );
 }
 
-function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument, processSchemaDocuments, deleteSchemaDocument, linkedFormsByMetaForm }) {
+function FolderFormModal({ folderName, onCancel, onCreateEmpty, onUpload }) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="link-modal" role="dialog" aria-modal="true" aria-label={`Add form to ${folderName}`}>
+        <div className="modal-head">
+          <div>
+            <h2>Add Form to {folderName}</h2>
+            <p>Choose how you want to start this form.</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onCancel} aria-label="Close add form dialog">
+            <X size={15} />
+          </button>
+        </div>
+        <div className="choice-buttons folder-form-choice-buttons">
+          <button className="choice-button" type="button" onClick={onCreateEmpty}>
+            <Plus size={16} /> Create empty form
+          </button>
+          <label className="choice-button file-action" tabIndex={0}>
+            <Import size={16} /> Upload ODK XLS form
+            <input type="file" accept=".xlsx" onChange={onUpload} />
+          </label>
+        </div>
+        <p className="modal-subtle-note">The uploaded XLS form will be imported into this folder and opened in the builder for review.</p>
+        <div className="modal-actions">
+          <button className="secondary" type="button" onClick={onCancel}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FoldersPanel({ folders = [], forms = [], createFolder, deleteFolder, createWorkspace, openWorkspace }) {
+  const folderFormGroups = new Map();
+  for (const form of forms.filter((item) => item.folderId)) {
+    const groupKey = form.versionBaseId
+      || form.formId
+      || form.title
+      || String(form.workspaceId || "").replace(/_v\d+$/i, "");
+    const group = folderFormGroups.get(`${form.folderId}:${groupKey}`) || [];
+    group.push(form);
+    folderFormGroups.set(`${form.folderId}:${groupKey}`, group);
+  }
+
+  function visibleFolderForms(folderId) {
+    return [...folderFormGroups.entries()]
+      .filter(([key]) => key.startsWith(`${folderId}:`))
+      .map(([, versions]) => {
+        const ordered = versions.sort((a, b) => Number(a.versionNumber || 1) - Number(b.versionNumber || 1));
+        const unlocked = ordered.filter((item) => !item.collectionLocked);
+        return unlocked.at(-1) || ordered.at(-1);
+      })
+      .filter(Boolean);
+  }
+
+  return (
+    <section className="folders-panel">
+      <div className="home-column-head folders-heading">
+        <div><h2>Folders</h2><p>Organise forms outside MetaForms.</p></div>
+        <button className="icon-button" type="button" onClick={createFolder} aria-label="Create folder"><Plus size={18} /></button>
+      </div>
+      {!folders.length ? <p className="muted">No folders yet.</p> : (
+        <div className="folder-list">
+          {folders.map((folder) => {
+            const folderForms = visibleFolderForms(folder.id);
+            const folderPrimaryIdentifier = folder.primaryIdentifierVariable
+              || folderForms.find((form) => form.hasXml && form.primaryIdentifierVariable)?.primaryIdentifierVariable
+              || "";
+            const folderParticipantIdentifier = folder.participantIdentifierVariable
+              || folderForms.find((form) => form.participantIdentifierVariable && form.participantIdentifierVariable !== form.primaryIdentifierVariable)?.participantIdentifierVariable
+              || "";
+            return (
+              <div className="folder-row" data-folder-id={folder.id} key={folder.id}>
+                <div className="folder-row-head">
+                  <FolderOpen size={16} />
+                  <strong>{folder.name} {folderPrimaryIdentifier ? <span className="primary-identifier-inline">({folderPrimaryIdentifier})</span> : null}{folderParticipantIdentifier ? <span className="primary-identifier-inline"> (barcode: {folderParticipantIdentifier})</span> : null}</strong>
+                  <button className="icon-button small" type="button" onClick={() => window.open(`/folder-visualization/${encodeURIComponent(folder.id)}`, "_blank", "noopener,noreferrer")} aria-label={`Visualize responses in ${folder.name}`} title="Visualize folder responses"><Network size={15} /></button>
+                  <button className="icon-button small" type="button" onClick={() => createWorkspace(folder.id)} aria-label={`Create form in ${folder.name}`}><Plus size={15} /></button>
+                  <button className="icon-button small danger-action" type="button" onClick={() => deleteFolder(folder.id, folder.name)} aria-label={`Delete ${folder.name}`}><Trash2 size={15} /></button>
+                </div>
+                {folderForms.length ? (
+                  <div className="folder-form-list">
+                    {folderForms.map((form) => (
+                      <button className="folder-form-link" type="button" key={form.workspaceId} onClick={() => openWorkspace(form.workspaceId)}>
+                        <FileText size={14} /> <span>{form.title} <small>v{form.versionNumber || 1}</small></span>
+                      </button>
+                    ))}
+                  </div>
+                ) : <small className="muted">No forms in this folder.</small>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument, processSchemaDocuments, deleteSchemaDocument, linkedFormsByMetaForm, openWorkspace, fillForm }) {
   const needsProcessing = documents.some((document) => document.status !== "Processed");
+  const [collapsed, setCollapsed] = useState(false);
   return (
     <section className="schema-panel">
       <div className="home-column-head">
-        <div>
+        <button className="schema-panel-title" type="button" onClick={() => setCollapsed((current) => !current)} aria-expanded={!collapsed}>
+          <div>
           <h2>MetaForms</h2>
           <p>{documents.length} schema documents</p>
-        </div>
+          </div>
+          <ChevronDown className={collapsed ? "collapsed" : ""} size={18} aria-hidden="true" />
+        </button>
         <div className="home-column-actions">
           <label className="secondary small file-action schema-upload">
             <Upload size={14} /> Upload MetaForm
@@ -3663,6 +5432,7 @@ function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument
           </button>
         </div>
       </div>
+      {!collapsed ? <div className="schema-panel-body">
       <p className="schema-context-subtitle">
         MetaForms are retained for protocol context and linking multiple XLS forms together. They are not used during FHIR bundle creation.
       </p>
@@ -3678,11 +5448,16 @@ function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument
         <div className="schema-doc-list">
           {documents.map((document) => (
             <article className="schema-doc" key={document.fileName} data-metaform-file={document.fileName}>
+              {(() => {
+                const primaryIdentifier = document.primaryIdentifierVariable
+                  || linkedFormsByMetaForm?.get(document.fileName)?.find((item) => item.hasXml && item.primaryIdentifierVariable)?.primaryIdentifierVariable
+                  || "";
+                return (
               <div className="schema-doc-head">
                 <div className="schema-doc-main">
                   <FileText size={17} />
                   <div>
-                    <h3>{document.fileName}</h3>
+                    <h3>{document.fileName} {primaryIdentifier ? <span className="primary-identifier-inline">({primaryIdentifier})</span> : null}</h3>
                     <p>{document.status}</p>
                   </div>
                 </div>
@@ -3695,22 +5470,44 @@ function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument
                   </button>
                 </div>
               </div>
+                );
+              })()}
               <div className="schema-metrics">
                 <span>{document.formCount || 0} forms</span>
                 <span>{document.variableCount || 0} variables</span>
                 <span>{document.chunkCount || 0} chunks</span>
                 <span>{linkedFormsByMetaForm?.get(document.fileName)?.length || 0} XLS links</span>
               </div>
-              {linkedFormsByMetaForm?.get(document.fileName)?.find((item) => item.primaryIdentifierVariable) ? (
+              {document.primaryIdentifierVariable || linkedFormsByMetaForm?.get(document.fileName)?.find((item) => item.hasXml && item.primaryIdentifierVariable) ? (
                 <p className="schema-primary-hint">
-                  Primary Identifier Variable: <strong>{linkedFormsByMetaForm.get(document.fileName).find((item) => item.primaryIdentifierVariable).primaryIdentifierVariable}</strong>
+                  Primary Identifier Variable: <strong>{document.primaryIdentifierVariable || linkedFormsByMetaForm.get(document.fileName).find((item) => item.hasXml && item.primaryIdentifierVariable).primaryIdentifierVariable}</strong>
                 </p>
+              ) : null}
+              {linkedFormsByMetaForm?.get(document.fileName)?.length ? (
+                <div className="schema-linked-form-list">
+                  {linkedFormsByMetaForm.get(document.fileName).map((item) => (
+                    <div className="schema-linked-form" key={item.workspaceId}>
+                      <button className="schema-linked-form-main" type="button" onClick={() => openWorkspace(item.workspaceId)}>
+                        <FileText size={14} />
+                        <span>
+                          <strong>{item.title}</strong>
+                          <small>{item.formId || item.workspaceId} · {item.primaryIdentifierVariable || "No primary identifier"}</small>
+                        </span>
+                      </button>
+                      <StageBadge stage={item.pipelineStage} />
+                      {item.hasXml ? (
+                        <button className="icon-button small" type="button" onClick={() => fillForm(item.workspaceId)} aria-label={`Fill ${item.title}`}><ExternalLink size={14} /></button>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
               ) : null}
             </article>
           ))}
         </div>
       )}
       <p className="mono schema-path">{summary?.processedDir || "processedMD path will appear here"}</p>
+      </div> : null}
     </section>
   );
 }
@@ -3725,9 +5522,9 @@ function NewFormLinkModal({ documents, forms = [], status, onCancel, onCreate })
   const isLinked = linkedChoice === "yes";
   const selectedMetaForm = processedDocuments.find((document) => document.fileName === linkedMetaFormFileName) || null;
   const linkedForms = linkedMetaFormFileName
-    ? forms.filter((item) => item.metaFormLink?.fileName === linkedMetaFormFileName && item.primaryIdentifierVariable)
+    ? forms.filter((item) => item.metaFormLink?.fileName === linkedMetaFormFileName && item.hasXml && item.primaryIdentifierVariable)
     : [];
-  const existingPrimaryIdentifier = linkedForms[0]?.primaryIdentifierVariable || "";
+  const existingPrimaryIdentifier = linkedForms[0]?.primaryIdentifierVariable || selectedMetaForm?.primaryIdentifierVariable || "";
   const primaryIdentifierLocked = Boolean(isLinked && existingPrimaryIdentifier);
   const formOptions = selectedMetaForm
     ? selectedMetaForm.formOptions?.length
@@ -3917,13 +5714,20 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
   const [primaryIdentifierVariable, setPrimaryIdentifierVariable] = useState(variables[0]?.name || "");
   const [metaFormFormIndex, setMetaFormFormIndex] = useState("");
   const [primaryIdentifierAcknowledged, setPrimaryIdentifierAcknowledged] = useState(false);
+  const [folderPrimaryAcknowledged, setFolderPrimaryAcknowledged] = useState(false);
   const selectedMetaForm = processedDocuments.find((document) => document.fileName === linkedMetaFormFileName) || null;
   const linkedForms = linkedMetaFormFileName
-    ? forms.filter((item) => item.metaFormLink?.fileName === linkedMetaFormFileName && item.primaryIdentifierVariable)
+    ? forms.filter((item) => item.metaFormLink?.fileName === linkedMetaFormFileName && item.hasXml && item.primaryIdentifierVariable)
     : [];
-  const existingPrimaryIdentifier = linkedForms[0]?.primaryIdentifierVariable || "";
-  const primaryIdentifierLocked = Boolean(linkedMetaFormFileName && existingPrimaryIdentifier);
-  const effectivePrimaryIdentifier = primaryIdentifierLocked ? existingPrimaryIdentifier : primaryIdentifierVariable;
+  const existingPrimaryIdentifier = linkedForms[0]?.primaryIdentifierVariable || selectedMetaForm?.primaryIdentifierVariable || "";
+  const folderPrimaryIdentifier = String(pending.folderPrimaryIdentifier || "").trim();
+  const folderPrimaryLocked = Boolean(pending.folderId && folderPrimaryIdentifier);
+  const primaryIdentifierLocked = Boolean((linkedMetaFormFileName && existingPrimaryIdentifier) || folderPrimaryLocked);
+  const effectivePrimaryIdentifier = folderPrimaryLocked
+    ? folderPrimaryIdentifier
+    : primaryIdentifierLocked
+      ? existingPrimaryIdentifier
+      : primaryIdentifierVariable;
   const variableNames = new Set(variables.map((variable) => variable.name));
   const primaryIdentifierMissing = Boolean(primaryIdentifierLocked && effectivePrimaryIdentifier && !variableNames.has(effectivePrimaryIdentifier));
   const formOptions = selectedMetaForm
@@ -3940,21 +5744,25 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
     ? [{ name: effectivePrimaryIdentifier, label: "Primary identifier from linked MetaForm" }, ...variables]
     : variables;
   const needsMetaFormDetails = Boolean(linkedMetaFormFileName);
+  const needsFolderAcknowledgement = Boolean(pending.folderId && !folderPrimaryIdentifier && !linkedMetaFormFileName);
   const canImport = Boolean(
     effectivePrimaryIdentifier &&
     status.kind !== "busy" &&
     (!needsMetaFormDetails || (metaFormFormIndex && primaryIdentifierAcknowledged)) &&
+    (!needsFolderAcknowledgement || folderPrimaryAcknowledged) &&
     (!primaryIdentifierMissing || primaryIdentifierLocked)
   );
 
   useEffect(() => {
     if (!linkedMetaFormFileName) {
       setPrimaryIdentifierAcknowledged(false);
+      setFolderPrimaryAcknowledged(false);
       setMetaFormFormIndex("");
       return;
     }
     if (primaryIdentifierLocked) setPrimaryIdentifierVariable(existingPrimaryIdentifier);
     setPrimaryIdentifierAcknowledged(false);
+    setFolderPrimaryAcknowledged(false);
     setMetaFormFormIndex("");
   }, [existingPrimaryIdentifier, linkedMetaFormFileName, primaryIdentifierLocked]);
 
@@ -3973,7 +5781,7 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
 
         <div className="link-form">
           <label className="field">
-            <span>Linked MetaForm</span>
+              <span>Linked MetaForm</span>
             <select value={linkedMetaFormFileName} onChange={(event) => setLinkedMetaFormFileName(event.target.value)}>
               <option value="">No MetaForm link</option>
               {processedDocuments.map((document) => (
@@ -4027,6 +5835,19 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
           </div>
         ) : null}
 
+        {needsFolderAcknowledgement ? (
+          <label className="acknowledgement-box">
+            <input
+              type="checkbox"
+              checked={folderPrimaryAcknowledged}
+              onChange={(event) => setFolderPrimaryAcknowledged(event.target.checked)}
+            />
+            <span>
+              I acknowledge that <strong>{effectivePrimaryIdentifier || "the selected variable"}</strong> is the common Primary Identifier Variable for every form created in <strong>{pending.folderName || "this folder"}</strong>.
+            </span>
+          </label>
+        ) : null}
+
         {primaryIdentifierLocked ? (
           <p className="modal-subtle-note">
             This MetaForm already uses <strong>{existingPrimaryIdentifier}</strong> as its Primary Identifier Variable, so it is locked for this import.
@@ -4073,7 +5894,7 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
               metaFormFormIndex,
               metaFormFormTitle: selectedFormOption?.title || "",
               primaryIdentifierAcknowledged,
-              addMissingPrimaryIdentifier: primaryIdentifierMissing
+              addMissingPrimaryIdentifier: primaryIdentifierMissing || folderPrimaryLocked,
             })}
           >
             <Import size={16} /> {primaryIdentifierMissing ? "Add the Primary Identifier Variable from the MetaForm and Import XLS" : "Import XLS"}
@@ -4084,12 +5905,23 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
   );
 }
 
-function PublishIdentifierModal({ form, candidates, status, onCancel, onPublish }) {
+function PublishIdentifierModal({
+  form,
+  candidates,
+  status,
+  folderName = "this folder",
+  requiresFolderAcknowledgement = false,
+  onCancel,
+  onPublish
+}) {
   const initialPrimaryIdentifier = candidates.some((candidate) => candidate.name === form.primaryIdentifierVariable)
     ? form.primaryIdentifierVariable
     : candidates[0]?.name || "";
   const [primaryIdentifierVariable, setPrimaryIdentifierVariable] = useState(initialPrimaryIdentifier);
-  const canPublish = candidates.some((candidate) => candidate.name === primaryIdentifierVariable) && status.kind !== "busy";
+  const [folderAcknowledged, setFolderAcknowledged] = useState(false);
+  const canPublish = candidates.some((candidate) => candidate.name === primaryIdentifierVariable)
+    && status.kind !== "busy"
+    && (!requiresFolderAcknowledgement || folderAcknowledged);
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -4106,7 +5938,13 @@ function PublishIdentifierModal({ form, candidates, status, onCancel, onPublish 
 
         <label className="field">
           <span>Primary Identifier Variable</span>
-          <select value={primaryIdentifierVariable} onChange={(event) => setPrimaryIdentifierVariable(event.target.value)}>
+          <select
+            value={primaryIdentifierVariable}
+            onChange={(event) => {
+              setPrimaryIdentifierVariable(event.target.value);
+              setFolderAcknowledged(false);
+            }}
+          >
             {candidates.map((variable) => (
               <option key={variable.name} value={variable.name}>
                 {variable.name}{variable.label ? ` · ${variable.label}` : ""}
@@ -4125,7 +5963,10 @@ function PublishIdentifierModal({ form, candidates, status, onCancel, onPublish 
               <button
                 className={variable.name === primaryIdentifierVariable ? "variable-row selected" : "variable-row"}
                 key={variable.name}
-                onClick={() => setPrimaryIdentifierVariable(variable.name)}
+                onClick={() => {
+                  setPrimaryIdentifierVariable(variable.name);
+                  setFolderAcknowledged(false);
+                }}
               >
                 <span className="mono">{variable.name}</span>
                 <span>{variable.label || variable.type || "No label"}</span>
@@ -4134,13 +5975,149 @@ function PublishIdentifierModal({ form, candidates, status, onCancel, onPublish 
           </div>
         </div>
 
+        {requiresFolderAcknowledgement ? (
+          <label className="acknowledgement-box">
+            <input
+              type="checkbox"
+              checked={folderAcknowledged}
+              onChange={(event) => setFolderAcknowledged(event.target.checked)}
+            />
+            <span>
+              I acknowledge that <strong>{primaryIdentifierVariable || "the selected variable"}</strong> is the common Primary Identifier Variable for every form created in <strong>{folderName}</strong>.
+            </span>
+          </label>
+        ) : null}
+
         <div className="modal-actions">
           <button className="secondary" onClick={onCancel}>Cancel</button>
-          <button className="primary" disabled={!canPublish} onClick={() => onPublish(primaryIdentifierVariable)}>
-            <Forward size={16} /> Move to Publish
+          <button className="primary" disabled={!canPublish} onClick={() => onPublish(primaryIdentifierVariable, folderAcknowledged)}>
+            <Forward size={16} /> Publish
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function PublishSettings({
+  published,
+  status,
+  respondentAccessCode,
+  primaryIdentifierVariable,
+  participantIdentifierVariable,
+  participantIdentifierCandidates = [],
+  setParticipantIdentifierVariable,
+  respondentCodeMode,
+  setRespondentCodeMode,
+  customRespondentCode,
+  setCustomRespondentCode,
+  allowResponseEdits,
+  setAllowResponseEdits,
+  limitOneResponsePerIdentifier,
+  setLimitOneResponsePerIdentifier
+}) {
+  const fixedCode = normalizeAccessCodeInput(respondentAccessCode);
+  const customCode = normalizeAccessCodeInput(customRespondentCode);
+  const identifierLabel = participantIdentifierVariable || primaryIdentifierVariable || "participant identifier variable";
+  const participantOptions = [
+    ...(primaryIdentifierVariable ? [{ name: primaryIdentifierVariable, label: "Form primary identifier" }] : []),
+    ...participantIdentifierCandidates.filter((candidate) => candidate.name !== primaryIdentifierVariable)
+  ];
+
+  return (
+    <div className="publish-settings">
+      <section className="publish-setting-block">
+        <div className="publish-setting-heading">
+          <h3>Participant identifier</h3>
+          <p>After publishing, an admin can use a barcode as the identifier for new submissions, duplicate checks, checkpoints, and entry display.</p>
+        </div>
+        <label className="field">
+          <span>Identifier collected from respondent</span>
+          <select
+            value={participantIdentifierVariable || primaryIdentifierVariable}
+            disabled={!published || !participantOptions.length || status?.kind === "busy"}
+            onChange={(event) => setParticipantIdentifierVariable(event.target.value)}
+          >
+            {participantOptions.map((candidate) => (
+              <option key={candidate.name} value={candidate.name}>
+                {candidate.name}{candidate.label ? ` · ${candidate.label}` : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+        {published && participantIdentifierCandidates.length ? (
+          <small className="publish-muted-note">Choose the barcode question when this form should collect only the assigned participant barcode.</small>
+        ) : null}
+      </section>
+
+      <section className="publish-setting-block">
+        <div className="publish-setting-heading">
+          <h3>Code setting</h3>
+          <p>{published ? "The respondent form code is fixed for this published form." : "Choose how respondents will open this form after publish."}</p>
+        </div>
+        <div className="publish-code-tabs">
+          <button
+            className={`access-role-button ${respondentCodeMode === RESPONDENT_CODE_MODE_RANDOM ? "active" : ""}`}
+            disabled={published}
+            type="button"
+            onClick={() => setRespondentCodeMode(RESPONDENT_CODE_MODE_RANDOM)}
+          >
+            <span>Generate random code</span>
+            <RefreshCw size={18} />
+          </button>
+          <button
+            className={`access-role-button ${respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM ? "active" : ""}`}
+            disabled={published}
+            type="button"
+            onClick={() => setRespondentCodeMode(RESPONDENT_CODE_MODE_CUSTOM)}
+          >
+            <span>Create a custom code</span>
+            <TextCursorInput size={18} />
+          </button>
+        </div>
+        {published && fixedCode ? (
+          <div className="respondent-code-callout">
+            <span>Respondent form code</span>
+            <strong>{fixedCode}</strong>
+            <p>Share this code with respondents. They can enter it from the respondent page without an admin password.</p>
+          </div>
+        ) : respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM ? (
+          <label className="publish-custom-code-field">
+            <span>Custom respondent form code</span>
+            <input
+              className="access-code-input"
+              value={customCode}
+              maxLength={RESPONDENT_CODE_MAX_LENGTH}
+              placeholder="A1B2C"
+              onChange={(event) => setCustomRespondentCode(normalizeAccessCodeInput(event.target.value))}
+            />
+            <small>Use up to 10 letters or numbers. It will be locked once the form is published.</small>
+          </label>
+        ) : (
+          <p className="publish-muted-note">A unique code will be generated when publishing succeeds.</p>
+        )}
+      </section>
+
+      <section className="publish-setting-block">
+        <div className="publish-setting-heading">
+          <h3>Response settings</h3>
+          <p>These controls are enforced for new submissions and can be changed after publishing.</p>
+        </div>
+        <div className="publish-toggle-list">
+          <div className="publish-future-toggle">
+            <Toggle label="Responses can be changed after being submitted" checked={allowResponseEdits} onChange={setAllowResponseEdits} />
+            <small>When enabled, entries show an edit action and submitted records can be updated.</small>
+          </div>
+          <div className="publish-future-toggle">
+            <Toggle
+              label={`One ${identifierLabel} can submit only one response`}
+              checked={limitOneResponsePerIdentifier}
+              onChange={setLimitOneResponsePerIdentifier}
+            />
+            <small>When enabled, duplicate submissions with the same identifier are rejected.</small>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
@@ -4206,6 +6183,7 @@ function BuilderPage(props) {
     finishBuild,
     exportXlsForm,
 	    runTerminologyExtraction,
+	    updateTerminologyLlm,
 	    replaceTerminologyMapping,
 	    addTerminologyEntity,
 	    reviewIssue,
@@ -4214,14 +6192,29 @@ function BuilderPage(props) {
 	    createNewVersion,
 	    leaveAllTerminologyUnmappedAndPublish,
 	    passToMapper,
+    downloadOdkXls,
     backHome,
     fillForm,
     uploadWorkspaceAttachments,
     uploadWorkspaceResource,
     uploadQuestionMedia,
+    uploadOptionMedia,
     deleteWorkspaceAttachment,
     viewEntry,
+    deleteEntries,
     refreshEntries,
+    respondentCodeMode,
+    setRespondentCodeMode,
+    customRespondentCode,
+    setCustomRespondentCode,
+    allowResponseEdits,
+    setAllowResponseEdits,
+    limitOneResponsePerIdentifier,
+    setLimitOneResponsePerIdentifier,
+    participantIdentifierVariable,
+    setParticipantIdentifierVariable,
+    folderParticipantIdentifierVariable,
+    onParticipantIdentifierActivated,
     onLogout
   } = props;
 	  const locked = isWorkspaceLocked(workspace, form, issues);
@@ -4240,6 +6233,10 @@ function BuilderPage(props) {
   ];
   const fhirPlaceholder = stagePlaceholder("fhir", workspace, entries, fhirBundles);
   const terminologyPlaceholder = stagePlaceholder("terminology", workspace, entries, fhirBundles);
+  const participantIdentifierCandidates = useMemo(
+    () => primaryIdentifierCandidatesForForm(form).filter((candidate) => candidate.type === "barcode"),
+    [form]
+  );
   const [questionTypeToAdd, setQuestionTypeToAdd] = useState(QUESTION_TYPES[0]?.type || "text");
 
   return (
@@ -4256,7 +6253,7 @@ function BuilderPage(props) {
           <p>Build, checkpoint, export, and collect locally in one form workspace.</p>
         </div>
         <div className="topbar-brand">
-          <img className="topbar-logo" src={cdpgLogo} alt="CDPG" />
+          <BrandLogos />
         </div>
         <nav className="stage-tabs" aria-label="Form stages">
           {stages.map((stage) => (
@@ -4301,34 +6298,76 @@ function BuilderPage(props) {
         </main>
       ) : activeStage === "terminology" ? (
         <main className="publish-layout">
+          <section className="publish-stack">
+            <div className="panel publish-summary">
+              <div className="section-head">
+                <div>
+                  <StageBadge stage={currentStage} />
+                  <h2>Terminology</h2>
+                  <p>Review vocabulary mappings for the form definition.</p>
+                </div>
+                <button className="secondary" disabled={!workspace?.workspaceId || status.kind === "busy"} onClick={() => downloadOdkXls?.(workspace.workspaceId)}>
+                  <Download size={16} /> Export ODK XLS
+                </button>
+              </div>
+            </div>
           <TerminologyPanel
             form={form}
             workspace={workspace}
             terminology={terminology}
 	            status={status}
 	            runTerminologyExtraction={runTerminologyExtraction}
+	            updateTerminologyLlm={updateTerminologyLlm}
 	            replaceTerminologyMapping={replaceTerminologyMapping}
 	            addTerminologyEntity={addTerminologyEntity}
 	            reviewIssue={reviewIssue}
             locked={published}
 	          />
+          </section>
         </main>
       ) : activeStage === "publish" ? (
         <main className="publish-layout">
           <section className="publish-stack">
             <div className="panel publish-summary">
-              <StageBadge stage={currentStage} />
               <h2>Publish</h2>
-              <p>{published ? "This form is published locally. Fill it in the browser, inspect submitted entries, then generate FHIR bundles." : "Move the form to Publish after vocabulary review is complete."}</p>
-              {published && workspace?.respondentAccessCode ? (
-                <div className="respondent-code-callout">
-                  <span>Respondent form code</span>
-                  <strong>{workspace.respondentAccessCode}</strong>
-                  <p>Share this 5-character code with respondents. They can enter it from the respondent page without an admin password.</p>
+              <p>{published ? "This form is published locally. Fill it in the browser, inspect submitted entries, then generate FHIR bundles." : "Publish the form after vocabulary review is complete."}</p>
+              <PublishSettings
+                published={published}
+                status={status}
+                respondentAccessCode={workspace?.respondentAccessCode}
+                primaryIdentifierVariable={form.primaryIdentifierVariable}
+                participantIdentifierVariable={participantIdentifierVariable}
+                participantIdentifierCandidates={participantIdentifierCandidates}
+                setParticipantIdentifierVariable={(value) => updateResponseSettings({ participantIdentifierVariable: value })}
+                respondentCodeMode={respondentCodeMode}
+                setRespondentCodeMode={setRespondentCodeMode}
+                customRespondentCode={customRespondentCode}
+                setCustomRespondentCode={setCustomRespondentCode}
+                allowResponseEdits={allowResponseEdits}
+                setAllowResponseEdits={setAllowResponseEdits}
+                limitOneResponsePerIdentifier={limitOneResponsePerIdentifier}
+                setLimitOneResponsePerIdentifier={setLimitOneResponsePerIdentifier}
+              />
+              {!published ? (
+                <div className="stage-actions">
+                  <button className="primary" disabled={status.kind === "busy"} onClick={() => exportXlsForm()}>
+                    <Forward size={16} /> Publish
+                  </button>
                 </div>
               ) : null}
             </div>
-            <EntriesPanel form={form} entries={entries} workspaceId={workspace?.workspaceId} viewEntry={viewEntry} refreshEntries={refreshEntries} status={status} />
+            {published ? <ParticipantAssignmentPanel form={form} workspaceId={workspace?.workspaceId} folderParticipantIdentifierVariable={folderParticipantIdentifierVariable} onActivated={onParticipantIdentifierActivated} /> : null}
+            <EntriesPanel
+              form={form}
+              entries={entries}
+              workspaceId={workspace?.workspaceId}
+              viewEntry={viewEntry}
+              editEntry={(entryId) => fillForm(workspace.workspaceId, entryId)}
+              deleteEntries={deleteEntries}
+              refreshEntries={refreshEntries}
+              status={status}
+              allowResponseEdits={allowResponseEdits}
+            />
           </section>
         </main>
       ) : (
@@ -4342,12 +6381,29 @@ function BuilderPage(props) {
                   <option key={item.type} value={item.type}>{item.label}</option>
                 ))}
               </select>
-              <button className="primary" onClick={() => addQuestion(questionTypeToAdd)}>
+              <button className="primary" type="button" onClick={() => addQuestion(questionTypeToAdd)}>
                 <Plus size={16} /> Add Question
               </button>
             </div>
 
             <div className="side-form-meta">
+              <div className="side-settings-block">
+                <Toggle
+                  label="Multilingual text"
+                  checked={form.multilingualEnabled}
+                  disabled={locked}
+                  onChange={(value) => updateForm({ multilingualEnabled: value })}
+                />
+                {form.multilingualEnabled ? (
+                  <Field
+                    label="Second language name"
+                    value={form.multilingualLanguage}
+                    disabled={locked}
+                    placeholder="Hindi"
+                    onChange={(value) => updateForm({ multilingualLanguage: value })}
+                  />
+                ) : null}
+              </div>
               <Field
                 label="Form Title"
                 value={form.title}
@@ -4497,7 +6553,8 @@ function BuilderPage(props) {
                 question={selectedQuestion}
                 updateQuestion={updateQuestion}
                 uploadQuestionMedia={uploadQuestionMedia}
-                readOnly={locked}
+                uploadOptionMedia={uploadOptionMedia}
+                readOnly={locked || Boolean(selectedQuestion.identifierLocked)}
               />
             </div>
           </aside>
@@ -4608,9 +6665,9 @@ function BuilderFooter({
 	            <button
 	              className="primary"
 	              disabled={published ? busy : busy || !buildFinished || issues.length > 0 || Boolean(reviewIssue) || (isCopiedVersionDraft && !copiedVersionHasChanges)}
-	              onClick={() => (published ? goToPublish?.() : exportXlsForm())}
+	              onClick={() => goToPublish?.()}
 	            >
-	              <Forward size={16} /> {published ? "Publish -->" : "Move to Publish"}
+	              <Forward size={16} /> {published ? "Publish -->" : "Publish"}
 	            </button>
 	          </>
         ) : null}
@@ -4766,7 +6823,7 @@ function QuestionResourcesBox({ workspace, requirements, status, locked = false,
   );
 }
 
-function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, status }) {
+function EntriesPanel({ form, entries, workspaceId, viewEntry, editEntry, deleteEntries, refreshEntries, status, allowResponseEdits = false }) {
   const entryIds = useMemo(() => entries.map((entry) => String(entry.id || "")).filter(Boolean), [entries]);
   const entryIdKey = entryIds.join("|");
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
@@ -4774,6 +6831,15 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, s
   const selectedEntries = entries.filter((entry) => selectedEntrySet.has(String(entry.id || "")));
   const allSelected = entryIds.length > 0 && selectedEntryIds.length === entryIds.length;
   const csvHeaders = useMemo(() => entryCsvQuestions(form).map((question) => question.name), [form]);
+  const displayOptions = useMemo(() => entryDisplayOptions(form), [form]);
+  const defaultDisplayField = form?.participantIdentifierVariable || form?.primaryIdentifierVariable || displayOptions[0]?.name || "";
+  const [displayField, setDisplayField] = useState(defaultDisplayField);
+
+  useEffect(() => {
+    setDisplayField((current) => displayOptions.some((item) => item.name === current)
+      ? current
+      : defaultDisplayField);
+  }, [defaultDisplayField, displayOptions]);
 
   useEffect(() => {
     setSelectedEntryIds(entryIds);
@@ -4800,15 +6866,17 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, s
           <span>{entries.length} submissions</span>
           {entries.length ? (
             <>
-              <button className="secondary small" onClick={() => setSelectedEntryIds(entryIds)}>
-                Select all
-              </button>
-              <button className="secondary small" onClick={() => setSelectedEntryIds([])}>
-                Deselect all
-              </button>
               <button className="primary small" disabled={!selectedEntries.length || !csvHeaders.length} onClick={downloadSelectedEntries}>
                 <Download size={14} /> Download CSV
               </button>
+              <label className="display-field-select">
+                <span>Display</span>
+                <select value={displayField} onChange={(event) => setDisplayField(event.target.value)}>
+                  {displayOptions.map((option) => (
+                    <option key={option.name} value={option.name}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
             </>
           ) : null}
           <button className="secondary small" disabled={!workspaceId || status?.kind === "busy"} onClick={refreshEntries}>
@@ -4827,6 +6895,9 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, s
               onChange={(event) => setSelectedEntryIds(event.target.checked ? entryIds : [])}
             />
             <span>{selectedEntries.length}/{entries.length} selected</span>
+            <button className="secondary small danger-action" disabled={!selectedEntryIds.length || status?.kind === "busy"} onClick={() => deleteEntries?.(selectedEntryIds)}>
+              <Trash2 size={14} /> Delete
+            </button>
           </label>
           {entries.slice().reverse().map((entry) => {
             const entryId = String(entry.id || "");
@@ -4841,15 +6912,25 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, s
                 <span className="sr-only">Select entry {entry.instanceName || entry.displayName || entry.id}</span>
               </label>
               <div>
-                <span>{entry.instanceName || entry.displayName || entry.id}</span>
+                <span>{entryDisplayValue(entry, displayField)}</span>
                 <small>
                   {new Date(entry.submittedAt).toLocaleString()}
                   {entry.instanceName && entry.instanceName !== entry.id ? ` · ${entry.id}` : ""}
                 </small>
               </div>
-              <button className="secondary small" disabled={!workspaceId} onClick={() => viewEntry(workspaceId, entry.id)}>
-                <ExternalLink size={14} /> View
-              </button>
+              <div className="entry-actions">
+                {allowResponseEdits ? (
+                  <button className="secondary small" disabled={!workspaceId} onClick={() => editEntry?.(entry.id)} title="Edit entry">
+                    <TextCursorInput size={14} /> Edit
+                  </button>
+                ) : null}
+                <button className="secondary small" disabled={!workspaceId} onClick={() => viewEntry(workspaceId, entry.id)}>
+                  <ExternalLink size={14} /> View
+                </button>
+                <button className="secondary small danger-action" disabled={!workspaceId || status?.kind === "busy"} onClick={() => deleteEntries?.([entry.id])}>
+                  <Trash2 size={14} /> Delete
+                </button>
+              </div>
             </div>
           );})}
         </div>
@@ -4858,7 +6939,7 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, refreshEntries, s
   );
 }
 
-function TerminologyPanel({ form, workspace, terminology = {}, status, runTerminologyExtraction, replaceTerminologyMapping, addTerminologyEntity, reviewIssue, locked = false }) {
+function TerminologyPanel({ form, workspace, terminology = {}, status, runTerminologyExtraction, updateTerminologyLlm, replaceTerminologyMapping, addTerminologyEntity, reviewIssue, locked = false }) {
   const questions = (Array.isArray(terminology.questions) ? terminology.questions : []).filter((question) => !isStructuralQuestion(question));
   const questionsWithEntities = questions.filter((question) => Array.isArray(question.entities) && question.entities.length > 0);
   const questionsWithoutEntities = questions.filter((question) => !Array.isArray(question.entities) || question.entities.length === 0);
@@ -5078,6 +7159,19 @@ function TerminologyPanel({ form, workspace, terminology = {}, status, runTermin
           <span>{entityCount} entities</span>
           <span>{reviewStats.reviewed}/{reviewStats.total} reviewed</span>
           {questionsWithoutEntities.length ? <span>{questionsWithoutEntities.length} with no extracted entities</span> : null}
+        </div>
+	        <div className="terminology-llm-control">
+          <div>
+            <strong>LLM-assisted extraction</strong>
+            <p>LLM-assisted extraction - temporarily down</p>
+          </div>
+          <Toggle
+            label="Use LLM-assisted extraction"
+            hideLabel
+            checked={false}
+            disabled
+            onChange={() => updateTerminologyLlm?.(false)}
+          />
         </div>
 	        <div className="stage-actions">
 	          <button
@@ -5565,10 +7659,10 @@ function QuestionList({ form, resourceRequirements = [], locked, selectedId, set
             <GripVertical className="drag-handle" size={18} />
             <div className="question-index">{index + 1}</div>
             <div className="question-main">
-              <div className="question-label">{question.label || "Untitled question"}</div>
+              <div className="question-label">{question.label || questionTypeLabel(question.type)}</div>
               <div className="question-meta">
                 <span>{question.type}</span>
-                <span>{question.name}</span>
+                {question.name ? <span>{question.name}</span> : null}
                 {question.required ? <span>required</span> : null}
                 {!question.required && question.requiredExpression ? <span>conditional required</span> : null}
                 {question.readOnly || question.type === "calculate" ? <span className="state-chip readonly">read only</span> : null}
@@ -5578,10 +7672,20 @@ function QuestionList({ form, resourceRequirements = [], locked, selectedId, set
                 {resources?.missing ? <span className="resource-chip missing">{resources.missing} files needed</span> : resources?.total ? <span className="resource-chip uploaded">files ready</span> : null}
               </div>
             </div>
-            <button className="icon-button" disabled={locked} onClick={(event) => { event.stopPropagation(); duplicateQuestion(question); }}>
+            <button
+              className="icon-button"
+              disabled={locked || question.demographicGeneratedId}
+              title={question.demographicGeneratedId ? "The generated demographic ID cannot be duplicated" : "Duplicate question"}
+              onClick={(event) => { event.stopPropagation(); duplicateQuestion(question); }}
+            >
               <Copy size={16} />
             </button>
-            <button className="icon-button danger" disabled={locked} onClick={(event) => { event.stopPropagation(); removeQuestion(question.id); }}>
+            <button
+              className="icon-button danger"
+              disabled={locked || isDemographicGeneratedIdLocked(form.questions, question.id)}
+              title={isDemographicGeneratedIdLocked(form.questions, question.id) ? "Turn off Demographic data to remove the generated ID" : "Delete question"}
+              onClick={(event) => { event.stopPropagation(); removeQuestion(question.id); }}
+            >
               <Trash2 size={16} />
             </button>
           </article>
@@ -5747,31 +7851,516 @@ function PreviewPanel({ form, collapsible = false }) {
   );
 }
 
-function PreviewField({ question, value = "", onChange = () => {}, forceDisabled = false }) {
+function parseLocationPoints(value) {
+  return String(value || "")
+    .split(";")
+    .map((point) => point.trim().split(/\s+/).map(Number))
+    .filter((point) => Number.isFinite(point[0]) && Number.isFinite(point[1]))
+    .map(([lat, lon, alt = 0, accuracy = 0]) => ({ lat, lon, alt, accuracy }));
+}
+
+function formatLocationPoint(point) {
+  return [point.lat, point.lon, point.alt ?? 0, point.accuracy ?? 0].join(" ");
+}
+
+function LocationCaptureField({ question, value, onChange, disabled, label, hintNode }) {
+  const points = parseLocationPoints(value);
+  const isPoint = question.type === "geopoint";
+  const isShape = question.type === "geoshape";
+  const canDraw = !disabled;
+  const toSvgPoint = (point) => `${((point.lon + 180) / 360) * 100},${((90 - point.lat) / 180) * 100}`;
+
+  function addPointFromEvent(event) {
+    if (!canDraw) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const lon = ((event.clientX - bounds.left) / bounds.width) * 360 - 180;
+    const lat = 90 - ((event.clientY - bounds.top) / bounds.height) * 180;
+    const nextPoint = { lat: Number(lat.toFixed(6)), lon: Number(lon.toFixed(6)), alt: 0, accuracy: 0 };
+    const next = isPoint ? [nextPoint] : [...points, nextPoint];
+    onChange(next.map(formatLocationPoint).join("; "));
+  }
+
+  function captureCurrentLocation() {
+    if (!canDraw || !navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition((position) => {
+      const coords = position.coords;
+      const nextPoint = {
+        lat: Number(coords.latitude.toFixed(6)),
+        lon: Number(coords.longitude.toFixed(6)),
+        alt: Number.isFinite(coords.altitude) ? Number(coords.altitude.toFixed(2)) : 0,
+        accuracy: Number.isFinite(coords.accuracy) ? Number(coords.accuracy.toFixed(2)) : 0
+      };
+      const next = isPoint ? [nextPoint] : [...points, nextPoint];
+      onChange(next.map(formatLocationPoint).join("; "));
+    }, () => {});
+  }
+
+  const path = points.map(toSvgPoint).join(" ");
+  return (
+    <div className="preview-field location-preview-field">
+      <span>{label}</span>
+      {hintNode}
+      <div className={`location-capture location-capture-${question.type}`}>
+        <svg className="location-sketch" viewBox="0 0 100 100" role="img" aria-label="Interactive location drawing area" onClick={addPointFromEvent}>
+          <defs>
+            <pattern id={`location-grid-${question.id}`} width="10" height="10" patternUnits="userSpaceOnUse">
+              <path d="M 10 0 L 0 0 0 10" fill="none" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.35" />
+            </pattern>
+          </defs>
+          <rect width="100" height="100" fill="url(#location-grid-${question.id})" />
+          {isShape && points.length > 2 ? <polygon points={path} className="location-shape" /> : null}
+          {!isPoint && points.length > 1 ? <polyline points={path} className="location-line" /> : null}
+          {points.map((point, index) => {
+            const [x, y] = toSvgPoint(point).split(",");
+            return <circle key={`${x}-${y}-${index}`} cx={x} cy={y} r="1.8" className="location-point" />;
+          })}
+          {!points.length ? <text x="50" y="48" textAnchor="middle" className="location-empty-label">Click to place a point</text> : null}
+        </svg>
+        <div className="location-capture-actions">
+          <button type="button" className="secondary small" disabled={!canDraw || !navigator.geolocation} onClick={captureCurrentLocation}><MapPin size={14} /> Use current location</button>
+          {!isPoint && points.length ? <button type="button" className="secondary small" disabled={!canDraw} onClick={() => onChange(points.slice(0, -1).map(formatLocationPoint).join(";"))}>Undo point</button> : null}
+          {points.length ? <button type="button" className="secondary small" disabled={!canDraw} onClick={() => onChange("")}>Clear</button> : null}
+        </div>
+      </div>
+      <div className="location-coordinates">
+        {points.length ? points.map((point, index) => <code key={`${point.lat}-${point.lon}-${index}`}>{index + 1}. {point.lat}, {point.lon}</code>) : <small>{isPoint ? "Place one GPS point." : isShape ? "Add at least three points to outline an area." : "Add two or more points to draw a route."}</small>}
+      </div>
+    </div>
+  );
+}
+
+function BarcodeCaptureField({ value = "", onChange, disabled = false }) {
+  const [open, setOpen] = useState(false);
+  const [status, setStatus] = useState({ kind: "idle", message: "" });
+  const videoRef = useRef(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
+  useEffect(() => {
+    if (!open || disabled) return undefined;
+    let stopped = false;
+    let captured = false;
+    let stream = null;
+    let scanTimer = null;
+    let nativeTimer = null;
+    const oneDimensionalFormats = [
+      BarcodeFormat.UPC_A,
+      BarcodeFormat.UPC_E,
+      BarcodeFormat.EAN_8,
+      BarcodeFormat.EAN_13,
+      BarcodeFormat.CODE_128,
+      BarcodeFormat.CODE_39,
+      BarcodeFormat.CODE_93,
+      BarcodeFormat.ITF,
+      BarcodeFormat.CODABAR,
+      BarcodeFormat.RSS_14,
+      BarcodeFormat.RSS_EXPANDED
+    ];
+    const oneDimensionalReader = new BrowserMultiFormatOneDReader(new Map([
+      [DecodeHintType.POSSIBLE_FORMATS, oneDimensionalFormats]
+    ]));
+    const qrReader = new BrowserQRCodeReader();
+    let frameCanvas = null;
+    let frameContext = null;
+    let scanStartedAt = 0;
+    let showedSlowScanHint = false;
+    let nativeDetector = null;
+    try {
+      if (window.BarcodeDetector) nativeDetector = new window.BarcodeDetector();
+    } catch {
+      // ZXing still handles scanning when the native detector cannot initialize.
+    }
+    const stop = () => {
+      stopped = true;
+      window.clearTimeout(scanTimer);
+      window.clearTimeout(nativeTimer);
+      stream?.getTracks().forEach((track) => track.stop());
+      stream = null;
+      if (videoRef.current) videoRef.current.srcObject = null;
+    };
+    const capture = (text) => {
+      if (stopped || captured || !text) return;
+      captured = true;
+      onChangeRef.current(text);
+      setStatus({ kind: "ok", message: "Barcode captured." });
+      setOpen(false);
+    };
+
+    const isExpectedDecodeMiss = (error) => {
+      const name = String(error?.name || error?.constructor?.name || "");
+      return name.startsWith("NotFoundException") || name.startsWith("ChecksumException") || name.startsWith("FormatException");
+    };
+
+    const scanWithZxing = () => {
+      if (stopped || captured) return;
+      const video = videoRef.current;
+      if (video?.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+        if (!frameCanvas) {
+          frameCanvas = document.createElement("canvas");
+          frameContext = frameCanvas.getContext("2d", { willReadFrequently: true });
+        }
+        if (!frameContext) {
+          setStatus({ kind: "error", message: "This browser cannot prepare camera frames for scanning. Use Scan photo or enter the barcode manually." });
+          return;
+        }
+        frameCanvas.width = video.videoWidth;
+        frameCanvas.height = video.videoHeight;
+        frameContext.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+        const readers = [oneDimensionalReader, qrReader];
+        for (const reader of readers) {
+          try {
+            capture(reader.decodeFromCanvas(frameCanvas).getText());
+            break;
+          } catch (error) {
+            if (!isExpectedDecodeMiss(error)) {
+              setStatus({ kind: "error", message: `Scanner could not read this camera frame. Use Scan photo or enter the barcode manually.` });
+            }
+          }
+        }
+      }
+      if (!captured && !showedSlowScanHint && performance.now() - scanStartedAt > 10000) {
+        showedSlowScanHint = true;
+        setStatus({ kind: "idle", message: "No valid barcode detected. Keep the whole code and white margins visible. EAN/UPC samples also need a valid final check digit." });
+      }
+      if (!captured && !stopped) scanTimer = window.setTimeout(scanWithZxing, 180);
+    };
+
+    const scanWithNativeDetector = async () => {
+      if (stopped || captured || !nativeDetector) return;
+      const video = videoRef.current;
+      if (video?.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+        try {
+          const matches = await nativeDetector.detect(video);
+          capture(matches.find((match) => match.rawValue)?.rawValue);
+        } catch {
+          // ZXing continues decoding even if the browser detector rejects a frame.
+        }
+      }
+      if (!captured && !stopped) nativeTimer = window.setTimeout(scanWithNativeDetector, 300);
+    };
+
+    async function startScanner() {
+      if (!window.isSecureContext && window.location.hostname !== "localhost") {
+        setStatus({ kind: "error", message: "Camera scanning requires HTTPS or localhost." });
+        return;
+      }
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setStatus({ kind: "error", message: "This browser does not provide camera access." });
+        return;
+      }
+      try {
+        const video = videoRef.current;
+        if (!video) return;
+        const camera = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        if (stopped) {
+          camera.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        stream = camera;
+        video.srcObject = camera;
+        await video.play();
+        if (stopped) return;
+        setStatus({ kind: "ok", message: "Hold the barcode steady inside the camera view." });
+        scanStartedAt = performance.now();
+        scanWithZxing();
+        scanWithNativeDetector();
+      } catch (error) {
+        if (!stopped) {
+          setStatus({ kind: "error", message: error?.name === "NotAllowedError" ? "Camera permission was denied. Allow access or enter the code manually." : `Could not start the camera: ${error?.message || String(error)}` });
+          stop();
+        }
+      }
+    }
+
+    startScanner();
+    return () => {
+      stop();
+    };
+  }, [open, disabled]);
+
+  async function scanImage(file) {
+    if (!file) return;
+    setStatus({ kind: "busy", message: "Reading barcode image..." });
+    const url = URL.createObjectURL(file);
+    try {
+      const reader = new BrowserMultiFormatReader(new Map([[DecodeHintType.TRY_HARDER, true]]));
+      const result = await reader.decodeFromImageUrl(url);
+      onChangeRef.current(result.getText());
+      setOpen(false);
+      setStatus({ kind: "ok", message: "Barcode captured." });
+    } catch (error) {
+      setStatus({ kind: "error", message: `No readable barcode found in this image. ${error?.name === "NotFoundException" ? "Try a sharper, closer photo." : error?.message || ""}` });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  return (
+    <div className="barcode-capture">
+      <div className="barcode-input-row">
+        <input type="text" value={value} disabled={disabled} placeholder="Scan or enter barcode" onChange={(event) => onChange(event.target.value)} />
+        <button className="secondary small" type="button" disabled={disabled} onClick={() => { setStatus({ kind: "idle", message: "Opening camera..." }); setOpen(true); }}>
+          <ScanLine size={14} /> Scan
+        </button>
+      </div>
+      {open ? (
+        <div className="barcode-scanner" role="dialog" aria-label="Scan barcode">
+          <video ref={videoRef} className="barcode-video" muted playsInline />
+          <div className={`barcode-scanner-status ${status.kind}`}>{status.message || "Starting camera..."}</div>
+          <label className="secondary small barcode-photo-button">
+            <Image size={14} /> Scan photo
+            <input type="file" accept="image/*" onChange={(event) => { scanImage(event.target.files?.[0]); event.target.value = ""; }} />
+          </label>
+          <button className="secondary small" type="button" onClick={() => setOpen(false)}>Close scanner</button>
+        </div>
+      ) : null}
+      {!open && status.message ? <small className={`barcode-status ${status.kind}`}>{status.message}</small> : null}
+    </div>
+  );
+}
+
+function ParticipantAssignmentPanel({ form, workspaceId, folderParticipantIdentifierVariable = "", onActivated }) {
+  const [rows, setRows] = useState([]);
+  const [displayOptions, setDisplayOptions] = useState([]);
+  const [displayField, setDisplayField] = useState("");
+  const [barcodeDrafts, setBarcodeDrafts] = useState({});
+  const [barcodeVariable, setBarcodeVariable] = useState(folderParticipantIdentifierVariable || "participant_barcode");
+  const [identifierActivated, setIdentifierActivated] = useState(Boolean(folderParticipantIdentifierVariable));
+  const [collapsed, setCollapsed] = useState(false);
+  const [status, setStatus] = useState({ kind: "busy", message: "Loading demographic participants..." });
+  const hasDemographicRepeat = Boolean(form?.questions?.some((question) => question.type === "begin_repeat" && question.demographicData));
+
+  useEffect(() => {
+    setBarcodeVariable(folderParticipantIdentifierVariable || "participant_barcode");
+    setIdentifierActivated(Boolean(folderParticipantIdentifierVariable));
+  }, [folderParticipantIdentifierVariable]);
+
+  async function refreshParticipants(showStatus = true) {
+    if (!workspaceId || !hasDemographicRepeat) return;
+    if (showStatus) setStatus({ kind: "busy", message: "Refreshing participant assignments..." });
+    try {
+      const data = await requestJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}/participants`);
+      const nextRows = data.rows || [];
+      const nextOptions = data.options || [];
+      setRows(nextRows);
+      setDisplayOptions(nextOptions);
+      setDisplayField((current) => current && nextOptions.some((option) => option.name === current)
+        ? current
+        : nextOptions[0]?.name || "");
+      setBarcodeDrafts(Object.fromEntries(nextRows.map((row) => [row.id, row.barcode || ""])));
+      setStatus({
+        kind: "ok",
+        message: showStatus
+          ? (nextRows.length ? "Participant assignments refreshed." : "No demographic repeat entries found.")
+          : (nextRows.length ? "Ready to assign participant barcodes." : "No demographic repeat entries found.")
+      });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  useEffect(() => {
+    if (!workspaceId || !hasDemographicRepeat) return undefined;
+    let cancelled = false;
+    refreshParticipants(false).catch(() => {});
+    return () => { cancelled = true; };
+  }, [hasDemographicRepeat, workspaceId]);
+
+  if (!hasDemographicRepeat) return null;
+
+  async function assign(row) {
+    const barcode = String(barcodeDrafts[row.id] || "").trim();
+    if (!barcode) {
+      setStatus({ kind: "error", message: "Scan or enter a barcode before assigning it." });
+      return;
+    }
+    setStatus({ kind: "busy", message: "Saving participant barcode..." });
+    try {
+      const data = await postJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}/participants/assign`, {
+        entryId: row.entryId,
+        repeatName: row.repeatName,
+        repeatIndex: row.repeatIndex,
+        barcode,
+        participantIdentifierVariable: barcodeVariable
+      });
+      setRows(data.rows || []);
+      setStatus({ kind: "ok", message: `Barcode assigned to ${row.memberIdentifier || `member ${row.repeatIndex}`}.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  async function activateParticipantIdentifier() {
+    const assignedCount = rows.filter((row) => row.barcode).length;
+    if (!assignedCount || identifierActivated) return;
+    setStatus({ kind: "busy", message: "Updating folder participant identifier..." });
+    try {
+      const data = await postJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}/participants/activate`, {
+        participantIdentifierVariable: barcodeVariable
+      });
+      setIdentifierActivated(true);
+      setBarcodeVariable(data.participantIdentifierVariable || barcodeVariable);
+      await onActivated?.();
+      setStatus({ kind: "ok", message: `Participant identifier changed to ${data.participantIdentifierVariable || barcodeVariable}.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  function rowDisplayValue(row) {
+    const value = row.displayAnswers?.[displayField];
+    if (Array.isArray(value)) return value.filter(Boolean).join(", ") || "Not answered";
+    return String(value ?? "").trim() || row.memberIdentifier || `Member ${row.repeatIndex}`;
+  }
+
+  return (
+    <section className="panel participant-assignment-panel">
+      <div className="section-head participant-assignment-head">
+        <div>
+          <h2>Assign Participant Barcodes</h2>
+          <p>Assign a scanned barcode to each selected demographic member. Household and generated member IDs remain unchanged.</p>
+        </div>
+        <div className="section-actions participant-assignment-actions">
+          <span>{rows.filter((row) => row.barcode).length}/{rows.length} assigned</span>
+          <button className="secondary small" type="button" onClick={() => setCollapsed((current) => !current)}>
+            {collapsed ? "Show" : "Hide"}
+          </button>
+          <button className="secondary small" type="button" disabled={status.kind === "busy"} onClick={() => refreshParticipants()}>
+            <RefreshCw size={14} /> Refresh
+          </button>
+        </div>
+      </div>
+      {!collapsed ? <>
+      <div className="participant-assignment-note">
+        Only assigned barcodes can be used as participant identifiers in later forms. A barcode can belong to only one participant across this project.
+      </div>
+      {displayOptions.length ? (
+        <label className="display-field-select participant-display-field">
+          <span>Display</span>
+          <select value={displayField} onChange={(event) => setDisplayField(event.target.value)}>
+            {displayOptions.map((option) => <option key={option.name} value={option.name}>{option.label}</option>)}
+          </select>
+        </label>
+      ) : null}
+      <label className="field participant-barcode-variable-field">
+        <span>Shared barcode question variable</span>
+        <input
+          value={barcodeVariable}
+          disabled={Boolean(folderParticipantIdentifierVariable) || identifierActivated}
+          placeholder="participant_barcode"
+          onChange={(event) => setBarcodeVariable(slug(event.target.value))}
+        />
+        <small>{folderParticipantIdentifierVariable || identifierActivated ? "This variable is locked after changing the participant identifier." : "Choose this before changing the participant identifier. It will be shared by later forms in the folder."}</small>
+      </label>
+      {rows.length ? (
+        <div className="participant-assignment-list">
+          {rows.map((row) => (
+            <div className="participant-assignment-row" key={row.id}>
+              <div className="participant-assignment-details">
+                <strong>{rowDisplayValue(row)}</strong>
+                <small>Household: {row.householdIdentifier || "Not available"} · Repeat member {row.repeatIndex}</small>
+              </div>
+              <BarcodeCaptureField
+                value={barcodeDrafts[row.id] || ""}
+                disabled={status.kind === "busy"}
+                onChange={(value) => setBarcodeDrafts((current) => ({ ...current, [row.id]: value }))}
+              />
+              <button className="primary small" type="button" disabled={status.kind === "busy" || !String(barcodeDrafts[row.id] || "").trim()} onClick={() => assign(row)}>
+                {row.barcode ? "Update barcode" : "Assign barcode"}
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : <p className="muted">Submit at least one demographic form entry before assigning participant barcodes.</p>}
+      <button
+        className="primary participant-identifier-switch"
+        type="button"
+        disabled={identifierActivated || status.kind === "busy" || !rows.some((row) => row.barcode)}
+        onClick={activateParticipantIdentifier}
+      >
+        {identifierActivated ? "Participant identifier is barcode" : "Update primary identification variable"}
+      </button>
+      {status.message ? <p className={`participant-assignment-status ${status.kind}`}>{status.message}</p> : null}
+      </> : null}
+    </section>
+  );
+}
+
+function PreviewField({ question, value = "", onChange = () => {}, forceDisabled = false, languageMode = "default", choiceOptions = [], workspaceId = "", accessCode = "" }) {
   const disabled = Boolean(forceDisabled || question.readOnly || question.calculation);
   const calculated = Boolean(question.calculation);
-  const hint = String(question.hint || "").trim();
+  const label = localizedQuestion(question, "label", languageMode);
+  const hint = String(localizedQuestion(question, "hint", languageMode) || "").trim();
   const hintNode = hint ? <small className="preview-hint">{hint}</small> : null;
-  if (question.type === "select_one") {
+  const options = question.options?.length ? question.options : choiceOptions;
+  const renderMedia = (mediaType, source, className = "") => {
+    const src = mediaSource(source, workspaceId, accessCode);
+    if (!src) return null;
+    if (mediaType === "image") return <img className={`respondent-media ${className}`} src={src} alt="" />;
+    if (mediaType === "audio") return <audio className={`respondent-media ${className}`} controls src={src} />;
+    if (mediaType === "video") return <video className={`respondent-media ${className}`} controls src={src} />;
+    return <a className="media-file-link" href={src} target="_blank" rel="noreferrer">Open attached file</a>;
+  };
+  const renderOptionMedia = (option) => (
+    <span className="choice-media">
+      {renderMedia("image", option.image, "choice-media-image")}
+      {renderMedia("image", option.bigImage || option["big-image"], "choice-media-image")}
+      {renderMedia("audio", option.audio, "choice-media-audio")}
+      {renderMedia("video", option.video, "choice-media-video")}
+    </span>
+  );
+  const promptMediaNode = (
+    <div className="prompt-media">
+      {renderMedia("image", question.image)}
+      {renderMedia("image", question.bigImage || question["big-image"])}
+      {renderMedia("audio", question.audio)}
+      {renderMedia("video", question.video)}
+    </div>
+  );
+  if (question.type === "begin_group") {
     return (
-      <label className="preview-field">
-        <span>{question.label}{calculated ? <em> calculated</em> : null}</span>
+      <section className="preview-group-heading">
+        <h2>{label || question.name || "Section"}</h2>
         {hintNode}
-        <select value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
-          <option value="">Choose...</option>
-          {question.options?.map((option) => <option key={option.id || option.name} value={option.name}>{option.label}</option>)}
-        </select>
-      </label>
+      </section>
     );
   }
-  if (question.type === "select_multiple" || question.type === "rank") {
+  if (question.type === "select_one" || question.type === "select_one_from_file") {
+    return (
+      <div className="preview-field">
+        <span>{label}{calculated ? <em> calculated</em> : null}</span>
+        {hintNode}
+        {promptMediaNode}
+        <div className="preview-options" role="radiogroup" aria-label={label || question.name}>
+          {options.map((option) => (
+            <label key={option.id || option.name}>
+              <input
+                type="radio"
+                name={question.id || question.name}
+                value={option.name}
+                disabled={disabled}
+                checked={String(value || "") === String(option.name)}
+                onChange={(event) => onChange(event.target.value)}
+              />
+              <span>{localizedOption(option, "label", languageMode)}{renderOptionMedia(option)}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  if (question.type === "select_multiple" || question.type === "select_multiple_from_file" || question.type === "rank") {
     const selected = new Set(String(value || "").split(" ").filter(Boolean));
     return (
       <div className="preview-field">
-        <span>{question.label}</span>
+        <span>{label}</span>
         {hintNode}
+        {promptMediaNode}
         <div className="preview-options">
-          {question.options?.map((option) => (
+          {options.map((option) => (
             <label key={option.id || option.name}>
               <input
                 type="checkbox"
@@ -5784,7 +8373,7 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
                   onChange([...next].join(" "));
                 }}
               />
-              {" "}{option.label}
+              <span>{localizedOption(option, "label", languageMode)}{renderOptionMedia(option)}</span>
             </label>
           ))}
         </div>
@@ -5792,24 +8381,62 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
     );
   }
   if (question.type === "note") {
-    return <div className="preview-field note-field"><span>{question.label}</span>{hintNode}</div>;
+    return <div className="preview-field note-field"><span>{label}</span>{hintNode}</div>;
   }
   if (question.type === "calculate") {
     return null;
   }
-  if (["image", "audio", "video", "file"].includes(question.type) && !forceDisabled) {
+  if (["image", "audio", "video", "file", "background-audio"].includes(question.type) && !forceDisabled) {
+    const accept = question.type === "image" ? "image/*" : question.type === "audio" || question.type === "background-audio" ? "audio/*" : question.type === "video" ? "video/*" : undefined;
     return (
       <label className="preview-field">
-        <span>{question.label}</span>
+        <span>{label}</span>
         {hintNode}
-        <input type="file" disabled={disabled} onChange={(event) => onChange(event.target.files?.[0]?.name || "")} />
+        {renderMedia(question.type === "image" ? "image" : question.type === "audio" || question.type === "background-audio" ? "audio" : question.type === "video" ? "video" : "file", value)}
+        <input
+          type="file"
+          accept={accept}
+          capture={question.type === "image" || question.type === "audio" || question.type === "video" ? "environment" : undefined}
+          disabled={disabled}
+          onChange={async (event) => {
+            const file = event.target.files?.[0];
+            event.target.value = "";
+            if (!file) return;
+            try {
+              onChange(await fileToDataUrl(file));
+            } catch {
+              onChange("");
+            }
+          }}
+        />
       </label>
+    );
+  }
+  if (["start", "end", "today", "deviceid", "username", "phonenumber", "email"].includes(question.type)) {
+    return (
+      <div className="preview-field system-field">
+        <span>{label}</span>
+        {hintNode}
+        <input value={value} disabled readOnly />
+      </div>
+    );
+  }
+  if (question.type === "audit") {
+    return <div className="preview-field note-field"><span>{label || "Audit metadata"}</span><small>Captured automatically by ODK when available.</small></div>;
+  }
+  if (question.type === "barcode") {
+    return (
+      <div className="preview-field">
+        <span>{label}</span>
+        {hintNode}
+        <BarcodeCaptureField value={value} disabled={disabled} onChange={onChange} />
+      </div>
     );
   }
   if (question.type === "acknowledge") {
     return (
       <label className="preview-field acknowledge-field">
-        <span>{question.label}</span>
+        <span>{label}</span>
         {hintNode}
         <label>
           <input type="checkbox" disabled={disabled} checked={String(value) === "OK"} onChange={(event) => onChange(event.target.checked ? "OK" : "")} />
@@ -5821,7 +8448,7 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
   if (question.type === "start-geopoint") {
     return (
       <div className="preview-field location-preview-field">
-        <span>{question.label}</span>
+        <span>{label}</span>
         {hintNode}
         <p>Captured automatically when the ODK form opens.</p>
         {value ? <code>{value}</code> : null}
@@ -5829,53 +8456,10 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
     );
   }
   if (question.type === "geopoint") {
-    const parts = String(value || "").split(/\s+/);
-    const [lat = "", lon = "", alt = "", acc = ""] = parts;
-    const commit = (next) => onChange([next.lat, next.lon, next.alt, next.acc].filter((item, index) => index < 2 || String(item || "").trim()).join(" "));
-    const captureCurrentLocation = () => {
-      if (!navigator.geolocation) return;
-      navigator.geolocation.getCurrentPosition((position) => {
-        const coords = position.coords;
-        commit({
-          lat: String(coords.latitude),
-          lon: String(coords.longitude),
-          alt: Number.isFinite(coords.altitude) ? String(coords.altitude) : "0",
-          acc: Number.isFinite(coords.accuracy) ? String(coords.accuracy) : ""
-        });
-      });
-    };
-    return (
-      <div className="preview-field location-preview-field">
-        <span>{question.label}</span>
-        {hintNode}
-        <div className="geo-point-grid">
-          <input type="number" value={lat} disabled={disabled} placeholder="Latitude" onChange={(event) => commit({ lat: event.target.value, lon, alt, acc })} />
-          <input type="number" value={lon} disabled={disabled} placeholder="Longitude" onChange={(event) => commit({ lat, lon: event.target.value, alt, acc })} />
-          <input type="number" value={alt} disabled={disabled} placeholder="Altitude" onChange={(event) => commit({ lat, lon, alt: event.target.value, acc })} />
-          <input type="number" value={acc} disabled={disabled} placeholder="Accuracy" onChange={(event) => commit({ lat, lon, alt, acc: event.target.value })} />
-        </div>
-        {!disabled && !forceDisabled ? (
-          <button type="button" className="secondary small" onClick={captureCurrentLocation}>
-            <MapPin size={14} /> Use Current Location
-          </button>
-        ) : null}
-      </div>
-    );
+    return <LocationCaptureField question={question} value={value} onChange={onChange} disabled={disabled} label={label} hintNode={hintNode} />;
   }
   if (question.type === "geotrace" || question.type === "geoshape") {
-    return (
-      <label className="preview-field location-preview-field">
-        <span>{question.label}</span>
-        {hintNode}
-        <textarea
-          value={value}
-          disabled={disabled}
-          placeholder={question.type === "geotrace" ? "lat lon alt acc; lat lon alt acc" : "lat lon alt acc; lat lon alt acc; lat lon alt acc; lat lon alt acc"}
-          onChange={(event) => onChange(event.target.value)}
-        />
-        <small>{question.type === "geotrace" ? "A trace is saved as ordered GPS points." : "A shape is saved as a closed polygon of GPS points."}</small>
-      </label>
-    );
+    return <LocationCaptureField question={question} value={value} onChange={onChange} disabled={disabled} label={label} hintNode={hintNode} />;
   }
   const inputType = forceDisabled
     ? "text"
@@ -5887,17 +8471,53 @@ function PreviewField({ question, value = "", onChange = () => {}, forceDisabled
         ? "datetime-local"
         : question.type === "integer" || question.type === "decimal" || question.type === "range"
           ? "number"
-          : "text";
+        : "text";
+  const rangeAppearance = String(question.appearance || "").trim().toLowerCase();
+  const rangeStart = question.type === "range" ? parameterValue(question.parameters, "start", "1") : "";
+  const rangeEnd = question.type === "range" ? parameterValue(question.parameters, "end", "10") : "";
+  const rangeStep = question.type === "range" ? parameterValue(question.parameters, "step", "1") : "";
+  const rangeIsPicker = question.type === "range" && rangeAppearance === "picker";
+  const rangeIsVertical = question.type === "range" && rangeAppearance === "vertical";
   return (
     <label className="preview-field">
-      <span>{question.label}</span>
+      <span>{label}</span>
       {hintNode}
-      <input
-        type={inputType}
-        value={value}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value)}
-      />
+      {promptMediaNode}
+      {question.type === "range" ? (
+        rangeIsPicker ? (
+          <input
+            className="range-picker-input"
+            type="number"
+            min={rangeStart}
+            max={rangeEnd}
+            step={rangeStep}
+            value={value}
+            disabled={disabled}
+            onChange={(event) => onChange(event.target.value)}
+          />
+        ) : (
+          <div className={`range-preview ${rangeIsVertical ? "vertical" : "horizontal"}`}>
+            {rangeIsVertical ? <span>{rangeEnd}</span> : <span>{rangeStart}</span>}
+            <input
+              type="range"
+              min={rangeStart}
+              max={rangeEnd}
+              step={rangeStep}
+              value={value}
+              disabled={disabled}
+              onChange={(event) => onChange(event.target.value)}
+            />
+            {rangeIsVertical ? <span>{rangeStart}</span> : <span>{rangeEnd}</span>}
+          </div>
+        )
+      ) : (
+        <input
+          type={inputType}
+          value={value}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      )}
     </label>
   );
 }
@@ -5919,6 +8539,56 @@ function durationSeconds(start, end) {
   const endMs = Date.parse(end);
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return "";
   return String(Math.round((endMs - startMs) / 1000));
+}
+
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  const input = String(text || "");
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index];
+    const next = input[index + 1];
+    if (character === '"' && quoted && next === '"') {
+      cell += '"';
+      index += 1;
+    } else if (character === '"') {
+      quoted = !quoted;
+    } else if (character === "," && !quoted) {
+      row.push(cell);
+      cell = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      if (character === "\r" && next === "\n") index += 1;
+      row.push(cell);
+      if (row.some((value) => String(value).trim())) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += character;
+    }
+  }
+  if (cell || row.length) {
+    row.push(cell);
+    if (row.some((value) => String(value).trim())) rows.push(row);
+  }
+  if (rows.length < 2) return [];
+  const headers = rows[0].map((value) => String(value || "").trim().toLowerCase());
+  const valueIndex = headers.indexOf("name") >= 0 ? headers.indexOf("name") : headers.indexOf("value");
+  const labelIndex = headers.indexOf("label") >= 0 ? headers.indexOf("label") : valueIndex;
+  if (valueIndex < 0) return [];
+  return rows.slice(1)
+    .map((values, index) => ({
+      id: `external_choice_${index + 1}`,
+      name: String(values[valueIndex] || "").trim(),
+      label: String(values[labelIndex] || values[valueIndex] || "").trim()
+    }))
+    .filter((option) => option.name);
+}
+
+function parameterValue(parameters, key, fallback = "") {
+  const match = String(parameters || "").match(new RegExp(`(?:^|\\s)${escapeRegExp(key)}=([^\\s]+)`));
+  return match ? match[1] : fallback;
 }
 
 function escapeRegExp(value) {
@@ -6082,7 +8752,80 @@ function TimerRespondentPanel({ timers, values, startTimer, stopTimer }) {
   );
 }
 
-function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted, onError }) {
+function CurrentLocationReferenceMap() {
+  const [position, setPosition] = useState(null);
+  const [locationError, setLocationError] = useState("");
+  const zoom = 13;
+  const tileSize = 256;
+
+  useEffect(() => {
+    if (!navigator.geolocation) {
+      setLocationError("Location is not available in this browser.");
+      return undefined;
+    }
+    const watchId = navigator.geolocation.watchPosition(
+      ({ coords }) => {
+        setPosition({ latitude: coords.latitude, longitude: coords.longitude, accuracy: coords.accuracy });
+        setLocationError("");
+      },
+      () => setLocationError("Allow location access to show the device reference point."),
+      { enableHighAccuracy: true, maximumAge: 10000, timeout: 15000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, []);
+
+  if (!position) {
+    return (
+      <div className="location-reference-map location-reference-empty">
+        <MapPin size={18} />
+        <span>{locationError || "Getting current device location..."}</span>
+      </div>
+    );
+  }
+
+  const scale = 2 ** zoom;
+  const centerX = ((position.longitude + 180) / 360) * scale;
+  const latitudeRadians = (position.latitude * Math.PI) / 180;
+  const centerY = ((1 - Math.asinh(Math.tan(latitudeRadians)) / Math.PI) / 2) * scale;
+  const centerTileX = Math.floor(centerX);
+  const centerTileY = Math.floor(centerY);
+  const fractionalX = centerX - centerTileX;
+  const fractionalY = centerY - centerTileY;
+  const tiles = [];
+  for (let row = -1; row <= 1; row += 1) {
+    for (let column = -1; column <= 1; column += 1) {
+      const tileX = centerTileX + column;
+      const tileY = centerTileY + row;
+      const wrappedX = ((tileX % scale) + scale) % scale;
+      if (tileY < 0 || tileY >= scale) continue;
+      tiles.push(
+        <img
+          key={`${tileX}-${tileY}`}
+          className="location-reference-tile"
+          style={{ left: `${(column + 1 - fractionalX) * tileSize}px`, top: `${(row + 1 - fractionalY) * tileSize}px` }}
+          src={`https://tile.openstreetmap.org/${zoom}/${wrappedX}/${tileY}.png`}
+          alt=""
+        />
+      );
+    }
+  }
+  return (
+    <section className="location-reference-card" aria-label="Current device location reference">
+      <div className="location-reference-head">
+        <div><strong>Current device location</strong><span>Reference only. This marker cannot be moved or submitted as the answer.</span></div>
+        <MapPin size={18} />
+      </div>
+      <div className="location-reference-map">
+        <div className="location-reference-tiles">{tiles}</div>
+        <span className="location-reference-marker" aria-label="Current device location" />
+        <small className="location-reference-attribution">© OpenStreetMap contributors</small>
+      </div>
+      <code>{position.latitude.toFixed(6)}, {position.longitude.toFixed(6)} · ±{Math.round(position.accuracy || 0)} m</code>
+    </section>
+  );
+}
+
+function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted, onError, mapPicker = false, onMapSelected, mapPickerSelectRef = null }) {
   const mountRef = useRef(null);
   const submittedRef = useRef(onSubmitted);
   const errorRef = useRef(onError);
@@ -6104,6 +8847,7 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
     const mountPoint = mountRef.current;
     if (!mountPoint || !formXml) return undefined;
     let app = null;
+    let buttonObserver = null;
     let cancelled = false;
     setLoadState({ kind: "busy", message: "Loading form..." });
 
@@ -6118,6 +8862,15 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
         }
       }
       if (!instanceXml) throw new Error("ODK Web Forms did not provide xml_submission_file.");
+      if (mapPicker) {
+        const document = new DOMParser().parseFromString(instanceXml, "text/xml");
+        const value = document.getElementsByTagName("location")[0]?.textContent?.trim() || "";
+        const [latitude, longitude] = value.split(/\s+/).map(Number);
+        if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+          onMapSelected?.({ latitude: Number(latitude.toFixed(6)), longitude: Number(longitude.toFixed(6)) });
+        }
+        return;
+      }
       instanceXml = injectTimerValuesIntoXml(instanceXml, finalizeTimersRef.current());
       await postJson(`${apiBase}/odk-submissions`, {
         instanceXml,
@@ -6162,6 +8915,29 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
         });
         app.use(webFormsPlugin);
         app.mount(mountPoint);
+        if (mapPicker) {
+          const renameSubmitButton = () => {
+            mountPoint.querySelectorAll("button").forEach((button) => {
+              if (button.textContent?.trim() === "Send") {
+                button.style.display = "none";
+                button.setAttribute("aria-hidden", "true");
+              }
+              if (button.textContent?.trim() === "Select") {
+                button.style.display = "none";
+                button.setAttribute("aria-hidden", "true");
+              }
+            });
+          };
+          renameSubmitButton();
+          buttonObserver = new MutationObserver(renameSubmitButton);
+          buttonObserver.observe(mountPoint, { childList: true, subtree: true });
+          if (mapPickerSelectRef) {
+            mapPickerSelectRef.current = () => {
+              const button = [...mountPoint.querySelectorAll("button")].find((item) => /^(send|select)$/i.test(item.textContent?.trim() || ""));
+              button?.click();
+            };
+          }
+        }
         setLoadState({ kind: "idle", message: "" });
       } catch (error) {
         if (cancelled) return;
@@ -6175,9 +8951,11 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
 
     return () => {
       cancelled = true;
+      buttonObserver?.disconnect();
+      if (mapPickerSelectRef) mapPickerSelectRef.current = null;
       if (app) app.unmount();
     };
-  }, [apiBase, formXml, workspaceId]);
+  }, [apiBase, formXml, workspaceId, mapPicker]);
 
   return (
     <>
@@ -6734,7 +9512,8 @@ function LogicExpressionCard({
   allowHide = false,
   toggleLabel = "Use condition",
   emptyText = "No expression saved.",
-  info = ""
+  info = "",
+  below = null
 }) {
   const sources = useMemo(
     () => logicQuestionSources(form, question, { includeSelf, priorOnly: true }),
@@ -6786,6 +9565,7 @@ function LogicExpressionCard({
   function setMode(mode) {
     const nextState = { ...state, mode };
     setState(nextState);
+    if (readOnly) return;
     onChange(mode === "guided" ? buildLogicExpression(nextState, sources) : String(value || ""), {
       mode,
       behavior: nextState.behavior,
@@ -6838,7 +9618,7 @@ function LogicExpressionCard({
           </span>
           <small>ODK XLS format: "{column}" column.</small>
         </div>
-        <Toggle label={toggleLabel} checked={open} disabled={readOnly} onChange={enableCondition} />
+        <Toggle label={toggleLabel} hideLabel checked={open} disabled={readOnly} onChange={enableCondition} />
       </div>
 
       {!open ? (
@@ -6846,8 +9626,8 @@ function LogicExpressionCard({
       ) : (
         <>
           <div className="logic-tabs">
-            <button className={state.mode === "guided" ? "active" : ""} disabled={readOnly || !sources.length} onClick={() => setMode("guided")}>Builder</button>
-            <button className={state.mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => setMode("raw")}>Raw</button>
+            <button className={state.mode === "guided" ? "active" : ""} disabled={!sources.length} onClick={() => setMode("guided")}>Builder</button>
+            <button className={state.mode === "raw" ? "active" : ""} onClick={() => setMode("raw")}>Raw</button>
           </div>
 
           {state.mode === "raw" ? (
@@ -6957,8 +9737,42 @@ function LogicExpressionCard({
             <span>Saved XLSForm expression</span>
             <code>{generatedExpression || "No expression generated yet"}</code>
           </div>
+          {below}
         </>
       )}
+    </div>
+  );
+}
+
+function RequiredAnswerCard({ question, updateQuestion, readOnly = false, secondaryLanguage = "", secondaryValue = "", onSecondaryChange }) {
+  const enabled = Boolean(question.required);
+  return (
+    <div className="logic-card">
+      <div className="logic-card-head">
+        <div>
+          <span className="logic-title-row">
+            <h3>Required</h3>
+            <InfoButton label="Required">ODK XLS format: "required" column. Makes the respondent provide an answer before continuing.</InfoButton>
+          </span>
+          <small>ODK XLS format: "required" and "required_message" columns.</small>
+        </div>
+        <Toggle label="Required" hideLabel checked={enabled} disabled={readOnly} onChange={(value) => updateQuestion(question.id, { required: value })} />
+      </div>
+      {enabled ? (
+        <div className="logic-card-body">
+          <Field
+            label="Required message"
+            value={question.requiredMessage}
+            disabled={readOnly}
+            helpText={'ODK XLS format: "required_message" column.'}
+            info={columnInfoText("required_message")}
+            onChange={(value) => updateQuestion(question.id, { requiredMessage: value })}
+            secondaryLabel={secondaryLanguage}
+            secondaryValue={secondaryValue}
+            onSecondaryChange={onSecondaryChange}
+          />
+        </div>
+      ) : <p className="logic-muted">This question is optional.</p>}
     </div>
   );
 }
@@ -6974,6 +9788,12 @@ function buildCalculationExpression(config) {
   if (config.preset === "today") return "today()";
   if (config.preset === "now") return "now()";
   if (config.preset === "empty") return "''";
+  if (config.preset === "random_participant_id") {
+    const length = Math.max(1, Math.min(128, Number(config.randomLength) || 12));
+    const prefix = expressionLiteral(config.randomPrefix ?? "P-");
+    const suffix = expressionLiteral(config.randomSuffix ?? "");
+    return `once(concat('${prefix}', uuid(${length}), '${suffix}'))`;
+  }
   if (config.preset === "copy") return refA;
   if (config.preset === "count_selected") return refA ? `count-selected(${refA})` : "";
   if (config.preset === "sum") return refA && refB ? `${refA} + ${refB}` : "";
@@ -6992,11 +9812,22 @@ function initialCalculationState(value, sources) {
   const text = String(value || "").trim();
   const firstSource = sources[0]?.name || "";
   const secondSource = sources[1]?.name || firstSource;
-  const base = { mode: "preset", preset: "today", fieldA: firstSource, fieldB: secondSource, separator: " ", numberValue: "0" };
+  const base = { mode: "preset", preset: "today", fieldA: firstSource, fieldB: secondSource, separator: " ", numberValue: "0", randomLength: "12", randomPrefix: "P-", randomSuffix: "" };
   if (!text) return base;
   if (text === "today()") return { ...base, preset: "today" };
   if (text === "now()") return { ...base, preset: "now" };
   if (text === "''") return { ...base, preset: "empty" };
+  if (text === "once(concat('P-', uuid()))") return { ...base, preset: "random_participant_id" };
+  let randomMatch = text.match(/^once\(concat\('((?:\\'|[^'])*)', uuid\((\d+)\), '((?:\\'|[^'])*)'\)\)$/);
+  if (randomMatch) {
+    return {
+      ...base,
+      preset: "random_participant_id",
+      randomPrefix: randomMatch[1].replace(/\\'/g, "'"),
+      randomLength: randomMatch[2],
+      randomSuffix: randomMatch[3].replace(/\\'/g, "'")
+    };
+  }
   const copyMatch = text.match(/^\$\{([^}]+)\}$/);
   if (copyMatch) return { ...base, preset: "copy", fieldA: copyMatch[1] };
   const countMatch = text.match(/^count-selected\(\$\{([^}]+)\}\)$/);
@@ -7029,10 +9860,11 @@ function calculationPresetOptions(question) {
   if (type === "dateTime" || type === "time") {
     options.push({ value: "now", label: "Current date-time" });
   }
-  if (["calculate", "hidden"].includes(type)) {
+  if (["calculate", "hidden", "text"].includes(type)) {
     options.push(
       { value: "today", label: "Today" },
-      { value: "now", label: "Current date-time" }
+      { value: "now", label: "Current date-time" },
+      { value: "random_participant_id", label: "Generate random Participant ID" }
     );
   }
   options.push({ value: "empty", label: "Clear value" });
@@ -7056,7 +9888,7 @@ function calculationPresetOptions(question) {
 }
 
 function calculationNeedsFieldA(preset) {
-  return !["today", "now", "empty"].includes(preset);
+  return !["today", "now", "empty", "random_participant_id"].includes(preset);
 }
 
 function calculationNeedsFieldB(preset) {
@@ -7135,6 +9967,7 @@ function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = f
   const sourceKey = sources.map((source) => source.name).join("|");
   const stateKey = `${question.id}:default`;
   const [state, setState] = useState(() => initialDefaultState(value, question, sources));
+  const [enabled, setEnabled] = useState(Boolean(String(value || "").trim()));
   useEffect(() => {
     setState(initialDefaultState(value, question, sources));
   }, [stateKey, sourceKey]);
@@ -7154,6 +9987,7 @@ function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = f
 
   function commit(nextState) {
     setState(nextState);
+    if (readOnly) return;
     const nextDynamicPreset = dynamicPresetOptions.some((item) => item.value === nextState.dynamic.preset)
       ? nextState.dynamic.preset
       : dynamicPresetOptions[0]?.value || "copy";
@@ -7183,11 +10017,22 @@ function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = f
           </span>
           <small>ODK XLS format: "default" column.</small>
         </div>
+        <Toggle
+          label="Enable default answer"
+          hideLabel
+          checked={enabled}
+          disabled={readOnly}
+          onChange={(checked) => {
+            setEnabled(checked);
+            if (!checked) onChange("");
+          }}
+        />
       </div>
+      {enabled ? <fieldset className="logic-card-body">
       <div className="logic-tabs">
-        <button className={state.mode === "static" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "static" })}>Fixed</button>
-        <button className={state.mode === "builder" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "builder" })}>Builder</button>
-        <button className={state.mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "raw", rawValue: value || "" })}>Raw</button>
+        <button className={state.mode === "static" ? "active" : ""} onClick={() => commit({ ...state, mode: "static" })}>Fixed</button>
+        <button className={state.mode === "builder" ? "active" : ""} onClick={() => commit({ ...state, mode: "builder" })}>Builder</button>
+        <button className={state.mode === "raw" ? "active" : ""} onClick={() => commit({ ...state, mode: "raw", rawValue: value || "" })}>Raw</button>
       </div>
       {state.mode === "static" ? (
         <label className="logic-inline-field">
@@ -7281,6 +10126,7 @@ function DefaultValueBuilderCard({ form, question, value, onChange, readOnly = f
         <span>Saved XLSForm value</span>
         <code>{generatedValue || "No default"}</code>
       </div>
+      </fieldset> : <p className="logic-muted">No default answer is configured.</p>}
     </div>
   );
 }
@@ -7290,6 +10136,7 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
   const sourceKey = sources.map((source) => source.name).join("|");
   const stateKey = `${question.id}:calculation`;
   const [state, setState] = useState(() => initialCalculationState(value, sources));
+  const [enabled, setEnabled] = useState(Boolean(String(value || "").trim()));
   useEffect(() => {
     setState(initialCalculationState(value, sources));
   }, [stateKey, sourceKey]);
@@ -7304,6 +10151,7 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
       : presetOptions[0]?.value || "copy";
     const normalized = { ...nextState, preset: nextPreset };
     setState(normalized);
+    if (readOnly) return;
     onChange(normalized.mode === "preset" ? buildCalculationExpression(normalized) : String(value || ""), {
       mode: normalized.mode,
       preset: normalized.preset,
@@ -7323,10 +10171,21 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
           </span>
           <small>ODK XLS format: "calculation" column.</small>
         </div>
+        <Toggle
+          label="Enable calculated value"
+          hideLabel
+          checked={enabled}
+          disabled={readOnly}
+          onChange={(checked) => {
+            setEnabled(checked);
+            if (!checked) onChange("");
+          }}
+        />
       </div>
+      {enabled ? <fieldset className="logic-card-body">
       <div className="logic-tabs">
-        <button className={state.mode === "preset" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "preset" })}>Builder</button>
-        <button className={state.mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => commit({ ...state, mode: "raw" })}>Raw</button>
+        <button className={state.mode === "preset" ? "active" : ""} onClick={() => commit({ ...state, mode: "preset" })}>Builder</button>
+        <button className={state.mode === "raw" ? "active" : ""} onClick={() => commit({ ...state, mode: "raw" })}>Raw</button>
       </div>
       {state.mode === "raw" ? (
         <textarea
@@ -7378,12 +10237,37 @@ function CalculationBuilderCard({ form, question, value, onChange, readOnly = fa
               <input value={state.separator || ""} disabled={readOnly} onChange={(event) => commit({ ...state, separator: event.target.value })} />
             </label>
           ) : null}
+          {currentPreset === "random_participant_id" ? (
+            <>
+              <label className="logic-inline-field">
+                <span>Random ID length</span>
+                <input
+                  type="number"
+                  min="1"
+                  max="128"
+                  value={state.randomLength || "12"}
+                  disabled={readOnly}
+                  onChange={(event) => commit({ ...state, randomLength: event.target.value })}
+                />
+              </label>
+              <label className="logic-inline-field">
+                <span>Starts with</span>
+                <input value={state.randomPrefix ?? "P-"} disabled={readOnly} placeholder="P-" onChange={(event) => commit({ ...state, randomPrefix: event.target.value })} />
+              </label>
+              <label className="logic-inline-field">
+                <span>Ends with</span>
+                <input value={state.randomSuffix ?? ""} disabled={readOnly} placeholder="Optional suffix" onChange={(event) => commit({ ...state, randomSuffix: event.target.value })} />
+              </label>
+              <small className="logic-muted">The generated random section is alphanumeric. Prefix and suffix characters are added outside the selected random length.</small>
+            </>
+          ) : null}
         </div>
       )}
       <div className="expression-preview">
         <span>Saved XLSForm expression</span>
         <code>{generatedExpression || "No expression generated yet"}</code>
       </div>
+      </fieldset> : <p className="logic-muted">No calculated value is configured.</p>}
     </div>
   );
 }
@@ -7457,6 +10341,7 @@ function ChoiceFilterBuilderCard({ form, question, value, onChange, readOnly = f
 
   function commit(nextRows) {
     setRows(nextRows);
+    if (readOnly) return;
     onChange(buildChoiceFilterExpression(nextRows), { mode: "guided", rows: nextRows });
   }
 
@@ -7481,15 +10366,15 @@ function ChoiceFilterBuilderCard({ form, question, value, onChange, readOnly = f
           </span>
           <small>ODK XLS format: "choice_filter" column.</small>
         </div>
-        <Toggle label="Filter choices" checked={open} disabled={readOnly} onChange={enableFilter} />
+        <Toggle label="Filter choices" hideLabel checked={open} disabled={readOnly} onChange={enableFilter} />
       </div>
       {!open ? (
         <p className="logic-muted">All choices are shown.</p>
       ) : (
         <>
           <div className="logic-tabs">
-            <button className={mode === "guided" ? "active" : ""} disabled={readOnly || !sources.length} onClick={() => { setMode("guided"); onChange(buildChoiceFilterExpression(rows), { mode: "guided", rows }); }}>Builder</button>
-            <button className={mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => { setMode("raw"); onChange(value || "", { mode: "raw" }); }}>Raw</button>
+            <button className={mode === "guided" ? "active" : ""} disabled={!sources.length} onClick={() => { setMode("guided"); if (!readOnly) onChange(buildChoiceFilterExpression(rows), { mode: "guided", rows }); }}>Builder</button>
+            <button className={mode === "raw" ? "active" : ""} onClick={() => { setMode("raw"); if (!readOnly) onChange(value || "", { mode: "raw" }); }}>Raw</button>
           </div>
           {mode === "raw" ? (
             <textarea
@@ -7566,6 +10451,7 @@ function RepeatCountBuilderCard({ form, question, value, onChange, readOnly = fa
     setFixed(nextFixed);
     setSourceName(nextSourceName);
     const expression = nextMode === "fixed" ? String(Math.max(1, Number(nextFixed) || 1)) : nextMode === "answer" ? fieldReference(nextSourceName) : String(rawValue || "");
+    if (readOnly) return;
     onChange(expression, { mode: nextMode, fixed: nextFixed, sourceName: nextSourceName });
   }
 
@@ -7581,9 +10467,9 @@ function RepeatCountBuilderCard({ form, question, value, onChange, readOnly = fa
         </div>
       </div>
       <div className="logic-tabs">
-        <button className={mode === "fixed" ? "active" : ""} disabled={readOnly} onClick={() => commit("fixed")}>Fixed</button>
-        <button className={mode === "answer" ? "active" : ""} disabled={readOnly || !sources.length} onClick={() => commit("answer", fixed, sources[0]?.name || "")}>Answer</button>
-        <button className={mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => commit("raw")}>Raw</button>
+        <button className={mode === "fixed" ? "active" : ""} onClick={() => commit("fixed")}>Fixed</button>
+        <button className={mode === "answer" ? "active" : ""} disabled={!sources.length} onClick={() => commit("answer", fixed, sources[0]?.name || "")}>Answer</button>
+        <button className={mode === "raw" ? "active" : ""} onClick={() => commit("raw")}>Raw</button>
       </div>
       {mode === "fixed" ? (
         <label className="logic-inline-field">
@@ -7616,6 +10502,38 @@ function RepeatCountBuilderCard({ form, question, value, onChange, readOnly = fa
   );
 }
 
+function DemographicRepeatCard({ question, onChange, readOnly = false }) {
+  if (question.type !== "begin_repeat") return null;
+  return (
+    <div className="logic-card demographic-repeat-card">
+      <div className="logic-card-head">
+        <div>
+          <span className="logic-title-row"><h3>Demographic data</h3><InfoButton label="Demographic data">Marks this repeat as a roster of household or group members. ICPH uses this metadata for generated member IDs and later participant selection.</InfoButton></span>
+          <small>This is ICPH workflow metadata and is not exported as an XLSForm column.</small>
+        </div>
+        <Toggle
+          label="Enable demographic data"
+          hideLabel
+          checked={Boolean(question.demographicData)}
+          disabled={readOnly}
+          onChange={(checked) => onChange({ demographicData: checked })}
+        />
+      </div>
+      {question.demographicData ? (
+        <div className="logic-card-body">
+          <Toggle
+            label="Prefix generated member ID with parent identifier"
+            checked={Boolean(question.prefixWithParentIdentifier)}
+            disabled={readOnly}
+            onChange={(checked) => onChange({ prefixWithParentIdentifier: checked })}
+          />
+          <p className="logic-muted">The parent identifier is chosen at publish time. The generated ID question is added as the first question in this repeat.</p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function parseParameterRows(value) {
   const text = String(value || "").trim();
   if (!text) return [];
@@ -7628,19 +10546,38 @@ function parseParameterRows(value) {
   return rows;
 }
 
-function buildParameterExpression(rows) {
+function normalizeParameterRows(question, rows) {
+  if (rows === null) return null;
+  if (question.type !== "range") return rows;
+  return (rows || []).map((row) => ({
+    ...row,
+    key: row.key === "tick-interval" ? "tick_interval" : row.key === "tick-labelset" ? "tick_labelset" : row.key
+  }));
+}
+
+function buildParameterExpression(rows, question = {}) {
   return (rows || [])
     .map((row) => {
-      const key = slug(row.key || "").replace(/_/g, "-");
+      const normalizedKey = question.type === "range" && ["tick_interval", "tick_labelset"].includes(row.key)
+        ? row.key
+        : row.key === "tick-interval" && question.type === "range"
+          ? "tick_interval"
+          : row.key === "tick-labelset" && question.type === "range"
+            ? "tick_labelset"
+            : row.key;
+      const key = slug(normalizedKey || "").replace(/_/g, "-");
       if (!key || row.value === "") return "";
-      return `${key}=${String(row.value || "").trim()}`;
+      const savedKey = question.type === "range" && ["tick_interval", "tick_labelset"].includes(normalizedKey)
+        ? normalizedKey
+        : key;
+      return `${savedKey}=${String(row.value || "").trim()}`;
     })
     .filter(Boolean)
     .join(" ");
 }
 
 function parameterSuggestions(question) {
-  if (question.type === "range") return ["start", "end", "step"];
+  if (question.type === "range") return ["start", "end", "step", "tick_interval", "placeholder", "tick_labelset"];
   if (question.type === "image") return ["max-pixels", "quality"];
   if (question.type === "audio" || question.type === "video" || question.type === "background-audio") return ["max-duration"];
   if (question.type === "file") return ["accept"];
@@ -7648,22 +10585,118 @@ function parameterSuggestions(question) {
   return ["key"];
 }
 
+function parameterKeyHelp(question, key) {
+  const help = {
+    range: {
+      start: "Lowest selectable number. Defaults to 1.",
+      end: "Highest selectable number. Defaults to 10.",
+      step: "Distance between selectable values. Use decimals for decimal answers.",
+      tick_interval: "Optional spacing between visible number-line tick marks. It must be an exact multiple of step, for example step=5 and tick_interval=10.",
+      placeholder: "Optional value shown before the respondent makes a selection.",
+      tick_labelset: "Optional choices list name for labels on selected tick marks."
+    },
+    image: { "max-pixels": "Maximum image dimensions in pixels.", quality: "Image quality setting." },
+    audio: { "max-duration": "Maximum recording duration in seconds." },
+    video: { "max-duration": "Maximum recording duration in seconds." },
+    "background-audio": { "max-duration": "Maximum recording duration in seconds." },
+    barcode: { formats: "Allowed barcode formats, when supported by the device scanner." }
+  };
+  return help[question.type]?.[key] || "ODK parameter value for this question widget.";
+}
+
+function parameterValueMeta(question, key) {
+  if (question.type === "range") {
+    if (["start", "end", "step", "tick_interval", "placeholder"].includes(key)) {
+      return { type: "number", inputMode: "decimal", placeholder: key === "placeholder" ? "e.g. 50" : key === "tick_interval" ? "e.g. 25" : key === "start" ? "e.g. 0" : key === "end" ? "e.g. 10" : "e.g. 1" };
+    }
+    if (key === "tick_labelset") return { type: "text", placeholder: "e.g. agreement_labels" };
+  }
+  return { type: "text", placeholder: "value" };
+}
+
+const FILE_ACCEPT_PRESETS = [
+  { value: "", label: "Any file type" },
+  { value: "image/*", label: "Images only" },
+  { value: "application/pdf", label: "PDF only" },
+  { value: ".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document", label: "DOC and DOCX" },
+  { value: "image/*,application/pdf", label: "Images and PDF" },
+  { value: "audio/*", label: "Audio only" },
+  { value: "video/*", label: "Video only" }
+];
+
+function FileAcceptField({ value, onChange, readOnly = false }) {
+  const knownPreset = FILE_ACCEPT_PRESETS.some((preset) => preset.value === value);
+  const [custom, setCustom] = useState(Boolean(value && !knownPreset));
+  const selectedValue = custom ? "custom" : value;
+
+  useEffect(() => {
+    setCustom(Boolean(value && !FILE_ACCEPT_PRESETS.some((preset) => preset.value === value)));
+  }, [value]);
+
+  return (
+    <div className="file-accept-field">
+      <label className="field">
+        <span>Allowed file types</span>
+        <select
+          value={selectedValue}
+          disabled={readOnly}
+          onChange={(event) => {
+            const next = event.target.value;
+            if (next === "custom") {
+              setCustom(true);
+              return;
+            }
+            setCustom(false);
+            onChange(next);
+          }}
+        >
+          {FILE_ACCEPT_PRESETS.map((preset) => <option key={preset.label} value={preset.value}>{preset.label}</option>)}
+          <option value="custom">Custom MIME types or extensions</option>
+        </select>
+      </label>
+      {custom ? (
+        <label className="field">
+          <span>Custom types</span>
+          <input
+            value={value || ""}
+            disabled={readOnly}
+            placeholder="image/*, application/pdf, .csv"
+            onChange={(event) => onChange(event.target.value)}
+          />
+          <small>Separate MIME types or extensions with commas, for example <code>image/*, application/pdf, .csv</code>.</small>
+        </label>
+      ) : null}
+      <p className="logic-muted">Respondents will only be able to choose files matching this ODK <code>accept</code> rule.</p>
+    </div>
+  );
+}
+
 function ParametersBuilderCard({ question, value, onChange, readOnly = false }) {
   const stateKey = `${question.id}:parameters`;
-  const parsedRows = parseParameterRows(value);
+  const parsedRows = normalizeParameterRows(question, parseParameterRows(value));
   const [mode, setMode] = useState(String(value || "").trim() && parsedRows === null ? "raw" : "guided");
+  const [enabled, setEnabled] = useState(Boolean(String(value || "").trim()));
   const [rows, setRows] = useState(parsedRows?.length ? parsedRows : [{ id: crypto.randomUUID(), key: parameterSuggestions(question)[0], value: "" }]);
   useEffect(() => {
-    const nextRows = parseParameterRows(value);
+    const nextRows = normalizeParameterRows(question, parseParameterRows(value));
     setMode(String(value || "").trim() && nextRows === null ? "raw" : "guided");
     setRows(nextRows?.length ? nextRows : [{ id: crypto.randomUUID(), key: parameterSuggestions(question)[0], value: "" }]);
   }, [stateKey]);
-  const generatedExpression = mode === "guided" ? buildParameterExpression(rows) : String(value || "");
+  const generatedExpression = mode === "guided" ? buildParameterExpression(rows, question) : String(value || "");
+  const parameterIssue = question.type === "range"
+    ? rangeParametersIssue({ ...question, parameters: generatedExpression })
+    : "";
   const suggestions = parameterSuggestions(question);
+  const fileAcceptValue = rows.find((row) => String(row.key || "").trim().toLowerCase() === "accept")?.value || "";
+  const visibleRows = question.type === "file"
+    ? rows.filter((row) => String(row.key || "").trim().toLowerCase() !== "accept")
+    : rows;
 
   function commit(nextRows) {
-    setRows(nextRows);
-    onChange(buildParameterExpression(nextRows), { mode: "guided", rows: nextRows });
+    const normalizedRows = normalizeParameterRows(question, nextRows);
+    setRows(normalizedRows);
+    if (readOnly) return;
+    onChange(buildParameterExpression(normalizedRows, question), { mode: "guided", rows: normalizedRows });
   }
 
   return (
@@ -7676,10 +10709,39 @@ function ParametersBuilderCard({ question, value, onChange, readOnly = false }) 
           </span>
           <small>ODK XLS format: "parameters" column.</small>
         </div>
+        <Toggle
+          label="Enable parameters"
+          hideLabel
+          checked={enabled}
+          disabled={readOnly}
+          onChange={(checked) => {
+            setEnabled(checked);
+            if (!checked) onChange("");
+          }}
+        />
       </div>
+      {enabled ? <fieldset className="logic-card-body">
+      {question.type === "range" ? (
+        <p className="logic-muted parameter-help">
+          Choose <strong>start</strong>, <strong>end</strong>, and <strong>step</strong> to define the range. Optional keys control ticks and labels.
+        </p>
+      ) : null}
+      {question.type === "file" && mode === "guided" ? (
+        <FileAcceptField
+          value={fileAcceptValue}
+          readOnly={readOnly}
+          onChange={(nextValue) => {
+            const withoutAccept = rows.filter((row) => String(row.key || "").trim().toLowerCase() !== "accept");
+            const nextRows = nextValue
+              ? [{ id: rows.find((row) => String(row.key || "").trim().toLowerCase() === "accept")?.id || crypto.randomUUID(), key: "accept", value: nextValue }, ...withoutAccept]
+              : withoutAccept;
+            commit(nextRows);
+          }}
+        />
+      ) : null}
       <div className="logic-tabs">
-        <button className={mode === "guided" ? "active" : ""} disabled={readOnly} onClick={() => { setMode("guided"); onChange(buildParameterExpression(rows), { mode: "guided", rows }); }}>Builder</button>
-        <button className={mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => { setMode("raw"); onChange(value || "", { mode: "raw" }); }}>Raw</button>
+        <button className={mode === "guided" ? "active" : ""} onClick={() => { setMode("guided"); if (!readOnly) onChange(buildParameterExpression(rows, question), { mode: "guided", rows }); }}>Builder</button>
+        <button className={mode === "raw" ? "active" : ""} onClick={() => { setMode("raw"); if (!readOnly) onChange(value || "", { mode: "raw" }); }}>Raw</button>
       </div>
       {mode === "raw" ? (
         <textarea
@@ -7691,39 +10753,129 @@ function ParametersBuilderCard({ question, value, onChange, readOnly = false }) 
         />
       ) : (
         <div className="logic-builder">
-          {rows.map((row) => (
+          {visibleRows.map((row) => (
             <div className="parameter-rule" key={row.id}>
+              <div className="parameter-key-field">
+                <div className="parameter-key-row">
+                  <InfoButton label={`${row.key || "custom"} parameter`}>{parameterKeyHelp(question, row.key)}</InfoButton>
+                  <select
+                    value={suggestions.includes(row.key) ? row.key : "__custom"}
+                    disabled={readOnly}
+                    aria-label="Parameter key"
+                    onChange={(event) => commit(rows.map((item) => item.id === row.id ? { ...item, key: event.target.value === "__custom" ? "" : event.target.value } : item))}
+                  >
+                    {suggestions.map((item) => <option key={item} value={item}>{item}</option>)}
+                    <option value="__custom">Custom key...</option>
+                  </select>
+                </div>
+                {!suggestions.includes(row.key) ? (
+                  <input
+                    value={row.key || ""}
+                    disabled={readOnly}
+                    placeholder="custom key"
+                    onChange={(event) => commit(rows.map((item) => item.id === row.id ? { ...item, key: event.target.value } : item))}
+                  />
+                ) : null}
+              </div>
+              {(() => {
+                const meta = parameterValueMeta(question, row.key);
+                return (
               <input
-                list={`parameter-suggestions-${question.id}`}
-                value={row.key || ""}
-                disabled={readOnly}
-                placeholder="parameter"
-                onChange={(event) => commit(rows.map((item) => item.id === row.id ? { ...item, key: event.target.value } : item))}
-              />
-              <input
+                type={meta.type}
+                inputMode={meta.inputMode}
                 value={row.value || ""}
                 disabled={readOnly}
-                placeholder="value"
+                placeholder={meta.placeholder}
                 onChange={(event) => commit(rows.map((item) => item.id === row.id ? { ...item, value: event.target.value } : item))}
               />
+                );
+              })()}
               <button className="icon-button danger" disabled={readOnly || rows.length <= 1} onClick={() => commit(rows.filter((item) => item.id !== row.id))}>
                 <Trash2 size={14} />
               </button>
             </div>
           ))}
-          <datalist id={`parameter-suggestions-${question.id}`}>
-            {suggestions.map((item) => <option key={item} value={item} />)}
-          </datalist>
-          <button className="secondary small" disabled={readOnly} onClick={() => commit([...rows, { id: crypto.randomUUID(), key: suggestions[0], value: "" }])}>
-            <Plus size={14} /> Add parameter
-          </button>
+          {question.type !== "file" ? (
+            <button className="secondary small" disabled={readOnly} onClick={() => commit([...rows, { id: crypto.randomUUID(), key: suggestions[0], value: "" }])}>
+              <Plus size={14} /> Add parameter
+            </button>
+          ) : null}
         </div>
       )}
       <div className="expression-preview">
         <span>Saved XLSForm value</span>
         <code>{generatedExpression || "No parameters"}</code>
       </div>
+      {parameterIssue ? <p className="logic-error">{parameterIssue}</p> : null}
+      </fieldset> : <p className="logic-muted">No parameters are configured.</p>}
     </div>
+  );
+}
+
+const ADVANCED_ODK_COLUMNS = [
+  { key: "bind::type", label: "Bind data type", placeholder: "decimal, dateTime, int..." },
+  { key: "preload", label: "Preload", placeholder: "timestamp, property..." },
+  { key: "preloadParams", label: "Preload parameters", placeholder: "deviceid, subscriberid..." },
+  { key: "odk:length", label: "ODK length", placeholder: "10" },
+  { key: "jr:choice-name", label: "Choice name expression", placeholder: "jr:choice-name(...)" }
+];
+
+function AdvancedOdkColumnsCard({ question, updateQuestion, readOnly = false }) {
+  const columns = question.extraColumns && typeof question.extraColumns === "object" ? question.extraColumns : {};
+  const knownKeys = new Set(ADVANCED_ODK_COLUMNS.map((item) => item.key));
+  const customRows = Object.entries(columns).filter(([key, value]) => !knownKeys.has(key) && String(value || "").trim());
+
+  function updateColumn(key, value) {
+    const next = { ...(question.extraColumns || {}) };
+    if (String(value || "").trim()) next[key] = value;
+    else delete next[key];
+    updateQuestion(question.id, { extraColumns: next });
+  }
+
+  return (
+    <details className="logic-card advanced-odk-card">
+      <summary>
+        <span>
+          <strong>Advanced ODK settings</strong>
+          <small>Optional survey-sheet columns for imported or specialist XLSForms.</small>
+        </span>
+        <InfoButton label="Advanced ODK settings">These values are written to the survey sheet exactly as entered. Use only columns supported by your ODK runtime.</InfoButton>
+      </summary>
+      <div className="advanced-odk-fields">
+        {ADVANCED_ODK_COLUMNS.map((column) => (
+          <label className="field" key={column.key}>
+            <span>{column.label} <code>{column.key}</code></span>
+            <input
+              value={columns[column.key] || ""}
+              disabled={readOnly}
+              placeholder={column.placeholder}
+              onChange={(event) => updateColumn(column.key, event.target.value)}
+            />
+          </label>
+        ))}
+        {customRows.map(([key, value]) => (
+          <div className="advanced-odk-custom-row" key={key}>
+            <input value={key} disabled aria-label="Custom ODK column name" />
+            <input value={value} disabled={readOnly} aria-label={`Value for ${key}`} onChange={(event) => updateColumn(key, event.target.value)} />
+            <button className="icon-button danger" type="button" disabled={readOnly} onClick={() => updateColumn(key, "")} aria-label={`Remove ${key}`}><Trash2 size={14} /></button>
+          </div>
+        ))}
+        <button
+          className="secondary small"
+          type="button"
+          disabled={readOnly}
+          onClick={() => {
+            const key = window.prompt("ODK survey column name", "your:column");
+            if (key?.trim()) {
+              const value = window.prompt(`Value for ${key.trim()}`, "") || "";
+              updateColumn(key.trim(), value);
+            }
+          }}
+        >
+          <Plus size={14} /> Add custom ODK column
+        </button>
+      </div>
+    </details>
   );
 }
 
@@ -7765,7 +10917,7 @@ function TriggerBuilderCard({ form, question, value, onChange, readOnly = false 
           </span>
           <small>ODK XLS format: "trigger" column.</small>
         </div>
-        <Toggle label="Recalculate when another answer changes" checked={open} disabled={readOnly || !hasCalculation} onChange={enableTrigger} />
+        <Toggle label="Recalculate when another answer changes" hideLabel checked={open} disabled={readOnly || !hasCalculation} onChange={enableTrigger} />
       </div>
       {!hasCalculation ? (
         <p className="logic-muted">Add a Calculated value first. A trigger only controls when that calculation reruns.</p>
@@ -7774,8 +10926,8 @@ function TriggerBuilderCard({ form, question, value, onChange, readOnly = false 
       ) : (
         <>
           <div className="logic-tabs">
-            <button className={mode === "guided" ? "active" : ""} disabled={readOnly || !sources.length} onClick={() => { setMode("guided"); onChange(sourceName ? fieldReference(sourceName) : "", { mode: "guided", sourceName }); }}>Builder</button>
-            <button className={mode === "raw" ? "active" : ""} disabled={readOnly} onClick={() => { setMode("raw"); onChange(value || "", { mode: "raw" }); }}>Raw</button>
+            <button className={mode === "guided" ? "active" : ""} disabled={!sources.length} onClick={() => { setMode("guided"); if (!readOnly) onChange(sourceName ? fieldReference(sourceName) : "", { mode: "guided", sourceName }); }}>Builder</button>
+            <button className={mode === "raw" ? "active" : ""} onClick={() => { setMode("raw"); if (!readOnly) onChange(value || "", { mode: "raw" }); }}>Raw</button>
           </div>
           {mode === "raw" ? (
             <textarea
@@ -7815,14 +10967,14 @@ function TriggerBuilderCard({ form, question, value, onChange, readOnly = false 
 }
 
 const APPEARANCE_PRESETS = {
-  select_one: ["", "minimal", "autocomplete", "compact", "quickcompact", "label", "list-nolabel"],
-  select_multiple: ["", "minimal", "compact", "quickcompact", "label", "list-nolabel"],
+  select_one: ["", "map", "minimal", "autocomplete", "compact", "quickcompact", "label", "list-nolabel"],
+  select_multiple: ["", "map", "minimal", "compact", "quickcompact", "label", "list-nolabel"],
   rank: ["", "minimal"],
   image: ["", "annotate", "draw", "signature", "new", "selfie"],
   geopoint: ["", "maps", "placement-map", "hide-input"],
   geotrace: ["", "maps"],
   geoshape: ["", "maps"],
-  range: ["", "horizontal", "vertical", "picker"],
+  range: ["", "horizontal", "vertical", "picker", "no-ticks", "rating"],
   date: ["", "no-calendar", "month-year", "year"],
   text: ["", "numbers", "multiline", "printer", "url"]
 };
@@ -7860,6 +11012,11 @@ function AppearanceField({ question, readOnly, onChange }) {
         <InfoButton label="Appearance">{columnInfoText("appearance")}</InfoButton>
       </span>
       <small>ODK XLS format: "appearance" column.</small>
+      {question.type === "range" ? (
+        <small className="appearance-help">
+          Default or horizontal = number line; vertical = low-to-high vertical number line; picker = spinner-style number picker in ODK Collect; rating = stars.
+        </small>
+      ) : null}
       <div className="appearance-row">
         <select value={presets.includes(question.appearance || "") ? question.appearance || "" : "__custom"} disabled={readOnly} onChange={(event) => onChange(event.target.value === "__custom" ? question.appearance || "" : event.target.value)}>
           {presets.map((preset) => (
@@ -7969,6 +11126,168 @@ function LocationTypeHelp({ question }) {
   );
 }
 
+const GEOMETRY_POINT_PICKER_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<h:html xmlns:h="http://www.w3.org/1999/xhtml" xmlns="http://www.w3.org/2002/xforms" xmlns:jr="http://openrosa.org/javarosa">
+  <h:head>
+    <h:title>Choose map point</h:title>
+    <model>
+      <instance><data id="icph_geometry_picker"><location /></data></instance>
+      <bind nodeset="/data/location" type="geopoint" required="true()" />
+    </model>
+  </h:head>
+  <h:body><input ref="/data/location" appearance="placement-map"><label>Choose a point</label></input></h:body>
+</h:html>`;
+
+function GeopointOptionPicker({ onAdd, onClose }) {
+  const [mapView, setMapView] = useState({ center: { latitude: 20, longitude: 78 }, zoom: 5 });
+  const [selectedPoint, setSelectedPoint] = useState(null);
+  const [label, setLabel] = useState("");
+  const tileSize = 256;
+  const dragRef = useRef(null);
+  const suppressClickRef = useRef(false);
+  const mapSelectRef = useRef(null);
+
+  useEffect(() => {
+    if (!navigator.geolocation) return undefined;
+    navigator.geolocation.getCurrentPosition(({ coords }) => {
+      setMapView((current) => ({ ...current, center: { latitude: coords.latitude, longitude: coords.longitude } }));
+    }, () => {});
+    return undefined;
+  }, []);
+
+  function worldPoint(latitude, longitude) {
+    const scale = 2 ** mapView.zoom;
+    const x = ((longitude + 180) / 360) * scale;
+    const latitudeRadians = (latitude * Math.PI) / 180;
+    const y = ((1 - Math.asinh(Math.tan(latitudeRadians)) / Math.PI) / 2) * scale;
+    return { x, y };
+  }
+
+  function locationFromWorld(x, y) {
+    const scale = 2 ** mapView.zoom;
+    const longitude = (x / scale) * 360 - 180;
+    const latitude = (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / scale))) * 180) / Math.PI;
+    return { latitude, longitude };
+  }
+
+  function pointFromClick(event) {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const centerWorld = worldPoint(mapView.center.latitude, mapView.center.longitude);
+    const worldX = centerWorld.x + ((event.clientX - (bounds.left + bounds.width / 2)) / tileSize);
+    const worldY = centerWorld.y + ((event.clientY - (bounds.top + bounds.height / 2)) / tileSize);
+    const { latitude, longitude } = locationFromWorld(worldX, worldY);
+    setSelectedPoint({ latitude: Number(latitude.toFixed(6)), longitude: Number(longitude.toFixed(6)) });
+  }
+
+  function startPan(event) {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = { x: event.clientX, y: event.clientY, moved: false };
+  }
+
+  function movePan(event) {
+    if (!dragRef.current) return;
+    const dx = event.clientX - dragRef.current.x;
+    const dy = event.clientY - dragRef.current.y;
+    if (Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
+    dragRef.current.moved = true;
+    const centerWorld = worldPoint(mapView.center.latitude, mapView.center.longitude);
+    const nextCenter = locationFromWorld(centerWorld.x - dx / tileSize, centerWorld.y - dy / tileSize);
+    setMapView((current) => ({ ...current, center: nextCenter }));
+    dragRef.current.x = event.clientX;
+    dragRef.current.y = event.clientY;
+  }
+
+  function endPan() {
+    if (dragRef.current?.moved) suppressClickRef.current = true;
+    dragRef.current = null;
+  }
+
+  function changeZoom(delta) {
+    setMapView((current) => ({ ...current, zoom: Math.max(2, Math.min(18, current.zoom + delta)) }));
+  }
+
+  const zoom = mapView.zoom;
+  const scale = 2 ** zoom;
+  const centerWorld = worldPoint(mapView.center.latitude, mapView.center.longitude);
+  const centerTileX = Math.floor(centerWorld.x);
+  const centerTileY = Math.floor(centerWorld.y);
+  const fractionalX = centerWorld.x - centerTileX;
+  const fractionalY = centerWorld.y - centerTileY;
+  const tiles = [];
+  for (let row = -1; row <= 1; row += 1) {
+    for (let column = -1; column <= 1; column += 1) {
+      const tileX = centerTileX + column;
+      const tileY = centerTileY + row;
+      const wrappedX = ((tileX % scale) + scale) % scale;
+      if (tileY < 0 || tileY >= scale) continue;
+      tiles.push(
+        <img
+          key={`${tileX}-${tileY}`}
+          className="location-reference-tile"
+          style={{ left: `${(column + 1 - fractionalX) * tileSize}px`, top: `${(row + 1 - fractionalY) * tileSize}px` }}
+          src={`https://tile.openstreetmap.org/${zoom}/${wrappedX}/${tileY}.png`}
+          alt=""
+        />
+      );
+    }
+  }
+  const selectedWorld = selectedPoint ? worldPoint(selectedPoint.latitude, selectedPoint.longitude) : null;
+  const markerLeft = selectedWorld ? `calc(50% + ${(selectedWorld.x - centerWorld.x) * tileSize}px)` : "50%";
+  const markerTop = selectedWorld ? `calc(50% + ${(selectedWorld.y - centerWorld.y) * tileSize}px)` : "50%";
+
+  function addPoint() {
+    if (!selectedPoint) return;
+    onAdd({
+      name: `place_${Date.now().toString().slice(-6)}`,
+      label: label.trim() || `Place ${selectedPoint.latitude.toFixed(4)}, ${selectedPoint.longitude.toFixed(4)}`,
+      geometry: `POINT (${selectedPoint.longitude} ${selectedPoint.latitude})`
+    });
+    setSelectedPoint(null);
+    setLabel("");
+  }
+
+  function handleMapSelected(point) {
+    onAdd({
+      name: `place_${Date.now().toString().slice(-6)}`,
+      label: label.trim() || `Place ${point.latitude.toFixed(4)}, ${point.longitude.toFixed(4)}`,
+      geometry: `POINT (${point.longitude} ${point.latitude})`
+    });
+    onClose();
+  }
+
+  return (
+    <div className="geopoint-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div className="geopoint-picker" role="dialog" aria-modal="true" aria-label="Add a map point">
+        <div className="geopoint-picker-head">
+          <div><strong>Add map point</strong><span>Click the map to place a point, then give it a choice label.</span></div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close map point picker"><X size={16} /></button>
+        </div>
+        <div className="geopoint-picker-odk-map">
+          <OdkWebFormIsland
+            form={{ questions: [] }}
+            formXml={GEOMETRY_POINT_PICKER_XML}
+            workspaceId=""
+            formApiBase=""
+            mapPicker
+            mapPickerSelectRef={mapSelectRef}
+            onMapSelected={handleMapSelected}
+            onSubmitted={() => {}}
+            onError={() => {}}
+          />
+        </div>
+        <div className="geopoint-picker-actions">
+          <small className="muted">Move the point on the map, then select it.</small>
+          <button className="primary" type="button" onClick={() => mapSelectRef.current?.()}><MapPin size={16} /> Select</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TimerTypeHelp({ question }) {
   if (question?.type !== "timer") return null;
   return (
@@ -8047,12 +11366,13 @@ function updateLogicPatch(question, column, fieldName, value, builderState = {})
   };
 }
 
-function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, readOnly = false }) {
+function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, uploadOptionMedia, readOnly = false }) {
   const hasOptions = question.type === "select_one" || question.type === "select_multiple" || question.type === "rank";
   const hasExternalList = question.type === "select_one_from_file" || question.type === "select_multiple_from_file";
   const options = question.options || [];
   const isCalculate = question.type === "calculate";
   const isRank = question.type === "rank";
+  const showChoiceGeometry = /map/i.test(String(question.appearance || ""));
   const showRelevant = !END_STRUCTURAL_TYPES.has(question.type) && question.type !== "csv-external" && question.type !== "timer" && question.type !== "audit" || hasColumnValue(question, "relevant");
   const showRequiredControls = canRequireQuestion(question) || question.required || hasColumnValue(question, "requiredExpression", "requiredMessage");
   const showReadOnlyControls = (
@@ -8072,6 +11392,15 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
   const showGuidanceHint = canUseGuidanceHint(question) || hasColumnValue(question, "guidanceHint");
   const showEntitySaveTo = RESPONDENT_INPUT_TYPES.has(question.type) || hasColumnValue(question, "saveTo");
   const showPromptMedia = canUsePromptMedia(question) || hasColumnValue(question, "image", "bigImage", "audio", "video");
+  const secondaryLanguage = secondaryLanguageName(form);
+  const [showGeopointPicker, setShowGeopointPicker] = useState(false);
+  const [expandedOptionMedia, setExpandedOptionMedia] = useState({});
+  const [mapGeometryOptionId, setMapGeometryOptionId] = useState("");
+  const secondaryFieldProps = (key) => secondaryLanguage ? {
+    secondaryLabel: secondaryLanguage,
+    secondaryValue: translatedValue(question, key),
+    onSecondaryChange: (value) => updateQuestion(question.id, withTranslatedValue(question, key, value))
+  } : {};
 
   function updateOption(id, patch) {
     updateQuestion(question.id, {
@@ -8085,61 +11414,196 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
     });
   }
 
+  function addMapOption(option) {
+    updateQuestion(question.id, {
+      appearance: "map",
+      options: [...options, { id: crypto.randomUUID(), ...option }]
+    });
+  }
+
   function removeOption(id) {
     updateQuestion(question.id, { options: options.filter((option) => option.id !== id) });
   }
 
   return (
     <div className="editor-stack">
-      <QuestionTypeField
-        question={question}
-        readOnly={readOnly}
-        onChange={(nextType) => updateQuestion(question.id, questionTypePatch(question, nextType))}
-      />
+      <div className="question-type-row">
+        <QuestionTypeField
+          question={question}
+          readOnly={readOnly}
+          onChange={(nextType) => updateQuestion(question.id, questionTypePatch(question, nextType))}
+        />
+        {showReadOnlyControls ? (
+          <Toggle
+            label="Read only"
+            checked={question.readOnly || isCalculate}
+            disabled={readOnly || isCalculate}
+            onChange={(value) => updateQuestion(question.id, { readOnly: value })}
+          />
+        ) : null}
+      </div>
       <StructuralTypeHelp type={question.type} />
       <LocationTypeHelp question={question} />
       <TimerTypeHelp question={question} />
       <TimerSettingsCard question={question} updateQuestion={updateQuestion} readOnly={readOnly} />
-      <Field
-        label="Question name"
-        value={question.name}
-        disabled={readOnly}
-        helpText={'ODK XLS format: "name" column.'}
-        info={columnInfoText("name")}
-        onChange={(value) => updateQuestion(question.id, { name: slug(value) })}
-      />
-      <Field
-        label="Main question display text"
-        value={question.label}
-        disabled={readOnly}
-        helpText={'ODK XLS format: "label" column.'}
-        info={columnInfoText("label")}
-        onChange={(value) => updateQuestion(question.id, { label: value })}
-        multiline
-      />
-      <Field
-        label="Question hint"
-        value={question.hint}
-        disabled={readOnly}
-        helpText={'ODK XLS format: "hint" column.'}
-        info={columnInfoText("hint")}
-        onChange={(value) => updateQuestion(question.id, { hint: value })}
-        multiline
-      />
-      {showRequiredControls || showReadOnlyControls ? (
-        <div className="two-col">
-          {showRequiredControls ? (
-            <Toggle label="Required" checked={question.required} disabled={readOnly} onChange={(value) => updateQuestion(question.id, { required: value })} />
+      {!END_STRUCTURAL_TYPES.has(question.type) ? (
+        <>
+          <Field
+            label="Question name"
+            value={question.name}
+            disabled={readOnly}
+            helpText={'ODK XLS format: "name" column.'}
+            info={columnInfoText("name")}
+            onChange={(value) => updateQuestion(question.id, { name: slug(value) })}
+          />
+          <Field
+            label="Main question display text"
+            value={question.label}
+            disabled={readOnly}
+            helpText={'ODK XLS format: "label" column.'}
+            info={columnInfoText("label")}
+            onChange={(value) => updateQuestion(question.id, { label: value })}
+            multiline
+            {...secondaryFieldProps("label")}
+          />
+          <Field
+            label="Question hint"
+            value={question.hint}
+            disabled={readOnly}
+            helpText={'ODK XLS format: "hint" column.'}
+            info={columnInfoText("hint")}
+            onChange={(value) => updateQuestion(question.id, { hint: value })}
+            multiline
+            {...secondaryFieldProps("hint")}
+          />
+          {hasOptions ? (
+            <div className={`options-editor ${isRank ? "rank-items-editor" : ""}`}>
+              <div className="section-head">
+                <div>
+                  <h3>{isRank ? "Items respondents will rank" : "Options"}</h3>
+                  {isRank ? <p>Each row below is one item the respondent can place in order. The saved value is the item code; respondents see the display text.</p> : null}
+                </div>
+                <div className="section-actions">
+                  {isRank ? <button className="secondary small" disabled={readOnly} onClick={addOption}><Plus size={14} /> Add Item</button> : null}
+                  {!isRank ? <button className="secondary small" disabled={readOnly} onClick={() => setShowGeopointPicker((current) => !current)}><MapPin size={14} /> Add from map</button> : null}
+                </div>
+              </div>
+              {showGeopointPicker ? <GeopointOptionPicker onAdd={addMapOption} onClose={() => setShowGeopointPicker(false)} /> : null}
+              <Field
+                label={isRank ? "Rank item list name" : "List Name"}
+                value={question.listName}
+                disabled={readOnly}
+                helpText={'ODK XLS format: "list_name" column in the choices sheet.'}
+                info={isRank ? "All rank items are saved in one choices list. Keep this stable after publishing so older responses remain interpretable." : "The choices sheet list name that stores this question's answer options."}
+                onChange={(value) => updateQuestion(question.id, { listName: slug(value).toLowerCase() })}
+              />
+              {options.map((option) => (
+                <div className="option-block" key={option.id}>
+                  <div className="option-row">
+                    <label>
+                      <span>{isRank ? "Item code" : "Value"}</span>
+                      <input value={option.name} disabled={readOnly} placeholder={isRank ? "item_1" : "name"} onChange={(event) => updateOption(option.id, { name: event.target.value })} />
+                    </label>
+                    <label>
+                      <span>{isRank ? "Item display text" : "Display text"}</span>
+                      <input value={option.label} disabled={readOnly} placeholder={isRank ? "Item to rank" : "label"} onChange={(event) => updateOption(option.id, { label: event.target.value })} />
+                      {secondaryLanguage ? (
+                        <input
+                          value={translatedValue(option, "label")}
+                          disabled={readOnly}
+                          placeholder={`${secondaryLanguage} display text`}
+                          onChange={(event) => updateOption(option.id, withTranslatedValue(option, "label", event.target.value))}
+                        />
+                      ) : null}
+                    </label>
+                    <button className="icon-button danger" disabled={readOnly} onClick={() => removeOption(option.id)}><Trash2 size={14} /></button>
+                  </div>
+                  <button
+                    className="link-button option-media-toggle"
+                    type="button"
+                    onClick={() => setExpandedOptionMedia((current) => ({ ...current, [option.id]: !current[option.id] }))}
+                  >
+                    {expandedOptionMedia[option.id] ? "- media" : "+ media"}
+                  </button>
+                  {expandedOptionMedia[option.id] ? <div className="option-media-row">
+                    {[
+                      ["image", "Image", "image/*"],
+                      ["bigImage", "Big image", "image/*"],
+                      ["audio", "Audio", "audio/*"],
+                      ["video", "Video", "video/*"]
+                    ].map(([fieldName, label, accept]) => (
+                      <label className="option-media-field" key={fieldName}>
+                        <span>{label}</span>
+                        <input value={option[fieldName] || ""} disabled={readOnly} placeholder="No file" onChange={(event) => updateOption(option.id, { [fieldName]: event.target.value })} />
+                        <span className="secondary small file-action">
+                          <Upload size={13} /> {option[fieldName] ? "Replace" : "Upload"}
+                          <input
+                            type="file"
+                            accept={accept}
+                            disabled={readOnly}
+                            onChange={(event) => uploadOptionMedia?.(question.id, option.id, fieldName, event)}
+                          />
+                        </span>
+                      </label>
+                    ))}
+                    {showChoiceGeometry ? (
+                      <div className="option-geometry-field">
+                        <span>Map geometry <InfoButton label="WKT geometry help">
+                          <div className="wkt-help">
+                            <strong>WKT format rules</strong>
+                            <p><b>Coordinate order:</b> longitude (X) first, then latitude (Y), separated by a space.</p>
+                            <p><b>Point:</b> <code>POINT (longitude latitude)</code></p>
+                            <p><b>Line or polygon:</b> coordinate pairs are comma-separated, for example <code>LINESTRING (lon1 lat1, lon2 lat2)</code>.</p>
+                            <p><b>Files:</b> plain-text <code>.txt</code> files are accepted as-is. A <code>.wkt</code> extension is optional; do not rename the file unless you prefer that extension.</p>
+                          </div>
+                        </InfoButton></span>
+                        <input value={option.geometry || ""} disabled={readOnly} placeholder="WKT or geometry file" onChange={(event) => updateOption(option.id, { geometry: event.target.value })} />
+                        <span className="secondary small file-action">
+                          <Upload size={13} /> {option.geometry && looksLikeResourceFile(option.geometry) ? "Replace geometry file" : "Upload geometry file"}
+                          <input
+                            type="file"
+                            accept=".geojson,.json,.wkt,.txt,application/geo+json,application/json,text/plain"
+                            disabled={readOnly}
+                            onChange={(event) => uploadOptionMedia?.(question.id, option.id, "geometry", event)}
+                          />
+                        </span>
+                        {option.geometry ? (
+                          <div className="geometry-saved-state">
+                            <Check size={16} />
+                            <span><strong>Map point saved</strong><code>{option.geometry}</code></span>
+                          </div>
+                        ) : null}
+                        <button className="secondary small" type="button" disabled={readOnly} onClick={() => setMapGeometryOptionId((current) => current === option.id ? "" : option.id)}>
+                          <MapPin size={13} /> {mapGeometryOptionId === option.id ? "Close map picker" : "Pick point on map"}
+                        </button>
+                        {mapGeometryOptionId === option.id ? (
+                          <GeopointOptionPicker
+                            onAdd={(pointOption) => {
+                              updateOption(option.id, { geometry: pointOption.geometry });
+                              setMapGeometryOptionId("");
+                            }}
+                            onClose={() => setMapGeometryOptionId("")}
+                          />
+                        ) : null}
+                        <small>Optional. Paste WKT or upload a plain-text <code>.txt</code>/<code>.wkt</code> file. No renaming is required.</small>
+                      </div>
+                    ) : null}
+                  </div> : null}
+                </div>
+              ))}
+            </div>
           ) : null}
-          {showReadOnlyControls ? (
-            <Toggle
-              label="Read only"
-              checked={question.readOnly || isCalculate}
-              disabled={readOnly || isCalculate}
-              onChange={(value) => updateQuestion(question.id, { readOnly: value })}
-            />
-          ) : null}
-        </div>
+        </>
+      ) : null}
+      {showRequiredControls ? (
+        <RequiredAnswerCard
+          question={question}
+          updateQuestion={updateQuestion}
+          readOnly={readOnly}
+          secondaryLanguage={secondaryLanguage}
+          secondaryValue={translatedValue(question, "requiredMessage")}
+          onSecondaryChange={(value) => updateQuestion(question.id, withTranslatedValue(question, "requiredMessage", value))}
+        />
       ) : null}
       {showRelevant ? (
         <LogicExpressionCard
@@ -8196,27 +11660,18 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
           toggleLabel="Validate answer"
           emptyText="Any answer is accepted."
           info={columnInfoText("constraint")}
+          below={showConstraint || hasColumnValue(question, "constraintMessage") ? (
+            <Field
+              label="Message for respondent about the above answering condition"
+              value={question.constraintMessage}
+              disabled={readOnly}
+              helpText={'ODK XLS format: "constraint_message" column.'}
+              info={columnInfoText("constraint_message")}
+              onChange={(value) => updateQuestion(question.id, { constraintMessage: value })}
+              {...secondaryFieldProps("constraintMessage")}
+            />
+          ) : null}
           onChange={(value, builderState) => updateQuestion(question.id, updateLogicPatch(question, "constraint", "constraint", value, builderState))}
-        />
-      ) : null}
-      {showConstraint || hasColumnValue(question, "constraintMessage") ? (
-        <Field
-          label="Message for respondent about the above answering condition"
-          value={question.constraintMessage}
-          disabled={readOnly}
-          helpText={'ODK XLS format: "constraint_message" column.'}
-          info={columnInfoText("constraint_message")}
-          onChange={(value) => updateQuestion(question.id, { constraintMessage: value })}
-        />
-      ) : null}
-      {showRequiredControls || hasColumnValue(question, "requiredMessage") ? (
-        <Field
-          label="Required message"
-          value={question.requiredMessage}
-          disabled={readOnly}
-          helpText={'ODK XLS format: "required_message" column.'}
-          info={columnInfoText("required_message")}
-          onChange={(value) => updateQuestion(question.id, { requiredMessage: value })}
         />
       ) : null}
       {showDefault ? (
@@ -8273,9 +11728,17 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
           onChange={(value, builderState) => updateQuestion(question.id, updateLogicPatch(question, "repeat_count", "repeatCount", value, builderState))}
         />
       ) : null}
-      {showQuestionNote ? <Field label="Designer note" value={question.note} disabled={readOnly} helpText={'ODK XLS format: "note" column.'} info={columnInfoText("note")} onChange={(value) => updateQuestion(question.id, { note: value })} multiline /> : null}
-      {showGuidanceHint ? <Field label="Guidance hint" value={question.guidanceHint} disabled={readOnly} helpText={'ODK XLS format: "guidance_hint" column.'} info={columnInfoText("guidance_hint")} onChange={(value) => updateQuestion(question.id, { guidanceHint: value })} multiline /> : null}
+      {question.type === "begin_repeat" ? (
+        <DemographicRepeatCard
+          question={question}
+          readOnly={readOnly}
+          onChange={(patch) => updateQuestion(question.id, patch)}
+        />
+      ) : null}
+      {showQuestionNote ? <Field label="Designer note" value={question.note} disabled={readOnly} helpText={'ODK XLS format: "note" column.'} info={columnInfoText("note")} onChange={(value) => updateQuestion(question.id, { note: value })} multiline {...secondaryFieldProps("note")} /> : null}
+      {showGuidanceHint ? <Field label="Guidance hint" value={question.guidanceHint} disabled={readOnly} helpText={'ODK XLS format: "guidance_hint" column.'} info={columnInfoText("guidance_hint")} onChange={(value) => updateQuestion(question.id, { guidanceHint: value })} multiline {...secondaryFieldProps("guidanceHint")} /> : null}
       {showEntitySaveTo ? <Field label="Entity save_to" value={question.saveTo} disabled={readOnly} helpText={'ODK XLS format: "save_to" column. Leave blank unless this form creates or updates ODK Entities.'} info={columnInfoText("save_to")} onChange={(value) => updateQuestion(question.id, { saveTo: value })} /> : null}
+      <AdvancedOdkColumnsCard question={question} updateQuestion={updateQuestion} readOnly={readOnly} />
       {showPromptMedia ? (
         <>
           <MediaColumnField
@@ -8324,46 +11787,6 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
           />
         </>
       ) : null}
-      {hasOptions ? (
-        <div className={`options-editor ${isRank ? "rank-items-editor" : ""}`}>
-          <div className="section-head">
-            <div>
-              <h3>{isRank ? "Items respondents will rank" : "Options"}</h3>
-              {isRank ? <p>Each row below is one item the respondent can place in order. The saved value is the item code; respondents see the display text.</p> : null}
-            </div>
-            <button className="secondary small" disabled={readOnly} onClick={addOption}><Plus size={14} /> {isRank ? "Add Item" : "Add"}</button>
-          </div>
-          <Field
-            label={isRank ? "Rank item list name" : "List Name"}
-            value={question.listName}
-            disabled={readOnly}
-            helpText={'ODK XLS format: "list_name" column in the choices sheet.'}
-            info={isRank ? "All rank items are saved in one choices list. Keep this stable after publishing so older responses remain interpretable." : "The choices sheet list name that stores this question's answer options."}
-            onChange={(value) => updateQuestion(question.id, { listName: slug(value).toLowerCase() })}
-          />
-          {options.map((option) => (
-            <div className="option-block" key={option.id}>
-              <div className="option-row">
-                <label>
-                  <span>{isRank ? "Item code" : "Value"}</span>
-                  <input value={option.name} disabled={readOnly} placeholder={isRank ? "item_1" : "name"} onChange={(event) => updateOption(option.id, { name: event.target.value })} />
-                </label>
-                <label>
-                  <span>{isRank ? "Item display text" : "Display text"}</span>
-                  <input value={option.label} disabled={readOnly} placeholder={isRank ? "Item to rank" : "label"} onChange={(event) => updateOption(option.id, { label: event.target.value })} />
-                </label>
-                <button className="icon-button danger" disabled={readOnly} onClick={() => removeOption(option.id)}><Trash2 size={14} /></button>
-              </div>
-              <div className="option-media-row">
-                <input value={option.image || ""} disabled={readOnly} placeholder="image" onChange={(event) => updateOption(option.id, { image: event.target.value })} />
-                <input value={option.audio || ""} disabled={readOnly} placeholder="audio" onChange={(event) => updateOption(option.id, { audio: event.target.value })} />
-                <input value={option.video || ""} disabled={readOnly} placeholder="video" onChange={(event) => updateOption(option.id, { video: event.target.value })} />
-                <input value={option.geometry || ""} disabled={readOnly} placeholder="geometry" onChange={(event) => updateOption(option.id, { geometry: event.target.value })} />
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : null}
       {hasExternalList ? (
         <div className="options-editor">
           <Field
@@ -8379,10 +11802,14 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, r
   );
 }
 
-function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
+function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = null, resumePrimaryIdentifierValue = "", onBackToRespondent }) {
   const [form, setForm] = useState(null);
   const [formXml, setFormXml] = useState("");
   const [answers, setAnswers] = useState({});
+  const [activeGroupPage, setActiveGroupPage] = useState(0);
+  const [editingEntry, setEditingEntry] = useState(null);
+  const [languageMode, setLanguageMode] = useState("default");
+  const [externalChoices, setExternalChoices] = useState({});
   const [submissionSuccess, setSubmissionSuccess] = useState(false);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading form..." });
   const encodedWorkspaceId = workspaceId ? encodeURIComponent(workspaceRouteId(workspaceId)) : "";
@@ -8392,6 +11819,28 @@ function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
     : `/api/forms/${encodedWorkspaceId}`;
   const calculatedAnswers = form ? computeCalculatedAnswers(form, answers) : answers;
   const questionsToShow = form ? visibleQuestions(form, calculatedAnswers) : [];
+  const hasGroupSections = Boolean(form?.questions?.some((question) => question.type === "begin_group"));
+  const hasChoiceQuestions = Boolean(form?.questions?.some((question) => (
+    question.type === "select_one" ||
+    question.type === "select_multiple" ||
+    question.type === "select_one_from_file" ||
+    question.type === "select_multiple_from_file" ||
+    question.type === "rank"
+  )));
+  const groupPages = hasGroupSections ? groupedQuestionPages(questionsToShow) : [];
+  const pageQuestions = hasGroupSections ? (groupPages[activeGroupPage] || []) : questionsToShow;
+  const answerValidation = form ? validateAnswers(form, answers) : { answers: {}, errors: ["Form is not loaded."] };
+  const pageValidation = form ? validateAnswers(form, answers, pageQuestions) : answerValidation;
+  const canSubmit = Boolean(form && status.kind !== "busy" && !answerValidation.errors.length);
+  const isLastGroupPage = !hasGroupSections || activeGroupPage >= groupPages.length - 1;
+  const canAdvanceGroup = Boolean(form && status.kind !== "busy" && !pageValidation.errors.length);
+  const secondaryLanguage = form ? secondaryLanguageName(form) : "";
+  const hasBarcodeQuestions = Boolean(form?.questions?.some((question) => question.type === "barcode"));
+  const useOdkViewer = Boolean(formXml && !hasGroupSections && !hasChoiceQuestions && !hasBarcodeQuestions && !editingEntry && !entryId && checkpointAnswers === null && !resumePrimaryIdentifierValue);
+
+  useEffect(() => {
+    setActiveGroupPage(0);
+  }, [form?.formId, entryId, checkpointAnswers]);
 
   useEffect(() => {
     async function loadPublishedForm() {
@@ -8407,25 +11856,100 @@ function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
           setFormXml("");
         }
         setForm(publishedForm);
+        const externalQuestions = (publishedForm.questions || []).filter((question) => (
+          question.type === "select_one_from_file" || question.type === "select_multiple_from_file"
+        ));
+        const externalChoiceEntries = await Promise.all(externalQuestions.map(async (question) => {
+          const fileName = String(question.listName || "").trim();
+          if (!fileName) return null;
+          try {
+            const response = await fetch(`${API_BASE}${formApiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: adminAuthHeaders() });
+            if (!response.ok) return null;
+            return [question.name, parseCsvRows(await response.text())];
+          } catch {
+            return null;
+          }
+        }));
+        setExternalChoices(Object.fromEntries(externalChoiceEntries.filter(Boolean)));
         const defaults = {};
         for (const question of publishedForm.questions || []) {
           if (question.defaultValue && question.defaultValue !== "now()") defaults[question.name] = question.defaultValue;
           if (question.defaultValue === "now()" && question.type === "dateTime") {
             defaults[question.name] = new Date().toISOString().slice(0, 16);
           }
+          if (question.type === "today" && !defaults[question.name]) defaults[question.name] = todayString();
+          if (question.type === "start" && !defaults[question.name]) defaults[question.name] = localTimestamp();
+          if (question.type === "deviceid" && !defaults[question.name]) {
+            const storageKey = "icph_device_id";
+            try {
+              const existing = window.localStorage.getItem(storageKey) || crypto.randomUUID();
+              window.localStorage.setItem(storageKey, existing);
+              defaults[question.name] = existing;
+            } catch {
+              defaults[question.name] = "browser-device";
+            }
+          }
         }
-        setAnswers(defaults);
-        setStatus({ kind: "ok", message: data.hasXml ? "Ready in ODK Web Forms" : "Ready" });
+        const resumedAnswers = checkpointAnswers && typeof checkpointAnswers === "object" ? checkpointAnswers : {};
+        let entryAnswers = {};
+        let entryToEdit = null;
+        if (entryId) {
+          const entriesData = await requestJson(`${formApiBase}/entries`);
+          entryToEdit = (entriesData.entries || []).find((item) => String(item.id || "") === String(entryId));
+          if (!entryToEdit) throw new Error("Entry not found.");
+          entryAnswers = entryToEdit.answers && typeof entryToEdit.answers === "object" ? entryToEdit.answers : {};
+        }
+        const primaryIdentifierVariable = publishedForm.participantIdentifierVariable
+          || publishedForm.primaryIdentifierVariable
+          || draft.participantIdentifierVariable
+          || draft.primaryIdentifierVariable
+          || "";
+        const seededAnswers = normalizeStoredRepeatAnswers(publishedForm, {
+          ...defaults,
+          ...resumedAnswers,
+          ...entryAnswers
+        });
+        if (primaryIdentifierVariable && resumePrimaryIdentifierValue) {
+          seededAnswers[primaryIdentifierVariable] = resumePrimaryIdentifierValue;
+        }
+        setEditingEntry(entryToEdit);
+        setAnswers(seededAnswers);
+        const startLocationQuestion = publishedForm.questions?.find((question) => question.type === "start-geopoint");
+        if (startLocationQuestion && navigator.geolocation && !seededAnswers[startLocationQuestion.name]) {
+          navigator.geolocation.getCurrentPosition((position) => {
+            const coords = position.coords;
+            setAnswers((current) => ({
+              ...current,
+              [startLocationQuestion.name]: [coords.latitude, coords.longitude, coords.altitude || 0, coords.accuracy || ""].join(" ")
+            }));
+          }, () => {});
+        }
+        setSubmissionSuccess(false);
+        setStatus({ kind: "ok", message: entryToEdit ? "Editing submitted entry." : checkpointAnswers ? "Loaded saved checkpoint." : "Ready" });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
     loadPublishedForm();
-  }, [formApiBase]);
+  }, [checkpointAnswers, entryId, formApiBase, resumePrimaryIdentifierValue]);
 
   function setAnswer(name, value) {
     setSubmissionSuccess(false);
     setAnswers((current) => ({ ...current, [name]: value }));
+  }
+
+  function advanceGroupPage() {
+    if (!canAdvanceGroup) {
+      setStatus({ kind: "error", message: pageValidation.errors[0] || "Complete this section before continuing." });
+      return;
+    }
+    setStatus({ kind: "ok", message: "Ready" });
+    setActiveGroupPage((current) => Math.min(current + 1, groupPages.length - 1));
+  }
+
+  function goBackGroupPage() {
+    setStatus({ kind: "ok", message: "Ready" });
+    setActiveGroupPage((current) => Math.max(current - 1, 0));
   }
 
   async function submitEntry() {
@@ -8436,15 +11960,49 @@ function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
         setStatus({ kind: "error", message: validation.errors[0] });
         return;
       }
-      const visibleNames = new Set(visibleQuestions(form, validation.answers).map((question) => question.name));
+      const visibleNames = new Set(visibleQuestions(form, validation.answers).map(questionAnswerKey));
       const submissionAnswers = {};
       for (const [name, value] of Object.entries(validation.answers)) {
         if (visibleNames.has(name)) submissionAnswers[name] = value;
       }
-      await postJson(`${formApiBase}/entries`, { answers: submissionAnswers });
+      await postJson(`${formApiBase}/entries`, { entryId: editingEntry?.id || entryId || "", answers: submissionAnswers });
+      notifyCollectionChanged();
 	      setStatus({ kind: "ok", message: "Ready" });
 	      setSubmissionSuccess(true);
-	      setAnswers({});
+	      if (!editingEntry && !entryId) setAnswers({});
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  async function saveCheckpoint() {
+    if (!accessCode) {
+      setStatus({ kind: "error", message: "Open the form from the respondent page to save a checkpoint." });
+      return;
+    }
+    const primaryIdentifierVariable = String(form?.participantIdentifierVariable || form?.primaryIdentifierVariable || "").trim();
+    if (!primaryIdentifierVariable) {
+      setStatus({ kind: "error", message: "This form does not have a primary identifier variable." });
+      return;
+    }
+    const checkpointIdentifierValue = String(calculatedAnswers[primaryIdentifierVariable] || answers[primaryIdentifierVariable] || "").trim();
+    if (!checkpointIdentifierValue) {
+      setStatus({ kind: "error", message: `Fill ${primaryIdentifierQuestionText(form)} before saving a checkpoint.` });
+      return;
+    }
+    setStatus({ kind: "busy", message: "Saving checkpoint..." });
+    try {
+      const visibleNames = new Set(visibleQuestions(form, calculatedAnswers).map(questionAnswerKey));
+      const checkpointData = {};
+      for (const [name, value] of Object.entries(calculatedAnswers)) {
+        if (visibleNames.has(name) || name === primaryIdentifierVariable) checkpointData[name] = value;
+      }
+      await postJson(`${formApiBase}/checkpoint`, {
+        primaryIdentifierValue: checkpointIdentifierValue,
+        answers: checkpointData
+      });
+      notifyCollectionChanged();
+      setStatus({ kind: "ok", message: "Checkpoint saved." });
     } catch (error) {
       setStatus({ kind: "error", message: error.message || String(error) });
     }
@@ -8472,13 +12030,21 @@ function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
   }
 
   return (
-    <div className="fill-shell">
-      <header className="fill-header">
-        <div>
-          <h1>{form.title}</h1>
-          <p>{accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
-        </div>
+    <div className={`fill-shell ${useOdkViewer ? "odk-fill-shell" : ""}`}>
+      <header className={`fill-header ${useOdkViewer ? "odk-view-header" : ""}`}>
+        {!useOdkViewer ? (
+          <div>
+            <h1>{form.title}</h1>
+            <p>{editingEntry ? "Editing submitted entry" : accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
+          </div>
+        ) : <span className="odk-view-context">ICPH Form</span>}
         <div className="fill-header-actions">
+          {secondaryLanguage && !useOdkViewer ? (
+            <div className="language-switcher">
+              <button className={languageMode === "default" ? "active" : ""} type="button" onClick={() => setLanguageMode("default")}>English</button>
+              <button className={languageMode === "secondary" ? "active" : ""} type="button" onClick={() => setLanguageMode("secondary")}>{secondaryLanguage}</button>
+            </div>
+          ) : null}
           {onBackToRespondent ? (
             <button className="secondary small" onClick={onBackToRespondent}>
               <ChevronRight size={16} /> Change Code
@@ -8490,45 +12056,78 @@ function FillForm({ workspaceId, accessCode, onBackToRespondent }) {
           </div>
         </div>
 	      </header>
-	      {formXml ? (
-	        <main className="fill-card odk-fill-card">
+	      <main className={`fill-card ${useOdkViewer ? "odk-fill-card" : ""}`}>
+	        {!useOdkViewer && hasGroupSections ? (
+	          <div className="group-page-progress" aria-label="Form sections">
+	            <span>Section {Math.min(activeGroupPage + 1, groupPages.length)} of {groupPages.length}</span>
+	            <div className="group-page-progress-bar" aria-hidden="true">
+	              <span style={{ width: `${groupPages.length ? ((activeGroupPage + 1) / groupPages.length) * 100 : 0}%` }} />
+	            </div>
+	          </div>
+	        ) : null}
+	        {useOdkViewer ? (
 	          <OdkWebFormIsland
 	            form={form}
 	            formXml={formXml}
 	            workspaceId={workspaceId}
 	            formApiBase={formApiBase}
 	            onSubmitted={() => {
-	              setStatus({ kind: "ok", message: "Ready in ODK Web Forms" });
+	              notifyCollectionChanged();
+	              setStatus({ kind: "ok", message: "Submitted successfully." });
 	              setSubmissionSuccess(true);
 	            }}
-	            onError={(error) => {
-	              setStatus({ kind: "error", message: error.message || String(error) });
-	            }}
+	            onError={(error) => setStatus({ kind: "error", message: error?.message || String(error) })}
 	          />
-	          {submissionSuccess ? (
-	            <div className="submission-success-inline">
-	              <Check size={16} /> Submitted!
-	            </div>
-	          ) : null}
-	        </main>
-	      ) : (
-	        <main className="fill-card">
-	          {questionsToShow.map((question) => (
-            <PreviewField
-              key={question.id}
-              question={question}
-              value={calculatedAnswers[question.name] || ""}
-              onChange={(value) => setAnswer(question.name, value)}
-            />
-	          ))}
-	          <button className="primary submit-entry" onClick={submitEntry}>Submit Entry</button>
-	          {submissionSuccess ? (
-	            <div className="submission-success-inline">
-	              <Check size={16} /> Submitted!
-	            </div>
-	          ) : null}
-	        </main>
-	      )}
+	        ) : pageQuestions.map((question, index) => {
+            const answerKey = questionAnswerKey(question);
+            const previousQuestion = pageQuestions[index - 1];
+            const startsRepeat = question.repeatIndex && question.repeatIndex !== previousQuestion?.repeatIndex;
+            return (
+              <React.Fragment key={question.id}>
+                {startsRepeat ? <div className="repeat-instance-heading">{question.repeatLabel || "Repeat"} {question.repeatIndex}</div> : null}
+                <PreviewField
+                  question={question}
+                  value={calculatedAnswers[answerKey] || ""}
+                  onChange={(value) => setAnswer(answerKey, value)}
+                  languageMode={languageMode}
+                  choiceOptions={externalChoices[question.name] || []}
+                  workspaceId={workspaceId}
+                  accessCode={accessCode}
+                />
+              </React.Fragment>
+            );
+        })}
+	        {submissionSuccess ? (
+	          <div className="submission-success-inline">
+	            <Check size={16} /> {editingEntry ? "Updated!" : "Submitted!"}
+	          </div>
+	        ) : null}
+	      </main>
+	      {!useOdkViewer ? <footer className="respondent-footer">
+	        <div className={`footer-status ${status.kind}`}>
+	          {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
+	          <span>{status.message || (hasGroupSections && !isLastGroupPage ? (canAdvanceGroup ? "Ready to continue." : pageValidation.errors[0] || "Complete this section.") : (canSubmit ? "Ready to submit." : answerValidation.errors[0] || "Ready"))}</span>
+	        </div>
+	        <div className="footer-actions">
+	          <button className="secondary" disabled={!form || status.kind === "busy"} onClick={saveCheckpoint}>
+	            <Save size={16} /> Save Checkpoint
+	          </button>
+	          {hasGroupSections && activeGroupPage > 0 ? (
+            <button className="secondary group-page-back" disabled={status.kind === "busy"} onClick={goBackGroupPage}>
+              <ChevronRight size={16} /> Back
+            </button>
+          ) : null}
+          {hasGroupSections && !isLastGroupPage ? (
+            <button className="primary" disabled={!canAdvanceGroup} onClick={advanceGroupPage}>
+              Next <ChevronRight size={16} />
+            </button>
+          ) : (
+            <button className="primary" disabled={!canSubmit} onClick={submitEntry}>
+              <Check size={16} /> {editingEntry ? "Update" : "Submit"}
+            </button>
+          )}
+	        </div>
+	      </footer> : null}
     </div>
   );
 }
@@ -8537,7 +12136,7 @@ function EntryViewer({ workspaceId, entryId }) {
   const [form, setForm] = useState(null);
   const [entry, setEntry] = useState(null);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading entry..." });
-  const answers = form && entry ? computeCalculatedAnswers(form, entry.answers || {}) : {};
+  const answers = form && entry ? computeCalculatedAnswers(form, normalizeStoredRepeatAnswers(form, entry.answers || {})) : {};
   const questionsToShow = form ? visibleQuestions(form, answers) : [];
 
   useEffect(() => {
@@ -8590,8 +12189,9 @@ function EntryViewer({ workspaceId, entryId }) {
           <PreviewField
             key={question.id}
             question={question}
-            value={answers[question.name] || ""}
+            value={answers[questionAnswerKey(question)] || ""}
             forceDisabled
+            workspaceId={workspaceId}
           />
         ))}
       </main>

@@ -169,6 +169,18 @@ def ordered_headers(base_headers, rows, extra_keys=("extraColumns",)):
     return headers
 
 
+def secondary_language(form: dict) -> str:
+    if not form.get("multilingualEnabled"):
+        return ""
+    return str(form.get("multilingualLanguage") or "").strip()
+
+
+def translated(row: dict, key: str) -> str | None:
+    value = ((row.get("translations") or {}).get("secondary") or {}).get(key)
+    text = str(value or "").strip()
+    return text or None
+
+
 def valid_instance_name(value: str, survey_names: set[str]) -> str | None:
     text = str(value or "").strip()
     if not text:
@@ -206,7 +218,19 @@ def main() -> int:
     settings = wb.create_sheet("settings")
     entities = wb.create_sheet("entities")
 
+    second_lang = secondary_language(form)
     survey_headers = ordered_headers(SURVEY_HEADERS, questions)
+    if second_lang:
+        for header in (
+            f"label::{second_lang}",
+            f"hint::{second_lang}",
+            f"constraint_message::{second_lang}",
+            f"required_message::{second_lang}",
+            f"guidance_hint::{second_lang}",
+            f"note::{second_lang}",
+        ):
+            if header not in survey_headers:
+                survey_headers.append(header)
     choice_rows = []
     choices_by_list = {}
     for question in questions:
@@ -223,6 +247,7 @@ def main() -> int:
                 "list_name": list_name,
                 "name": name,
                 "label": label,
+                **({f"label::{second_lang}": translated(option, "label")} if second_lang else {}),
                 "image": option.get("image") or None,
                 "audio": option.get("audio") or None,
                 "video": option.get("video") or None,
@@ -243,6 +268,8 @@ def main() -> int:
             list_choices[name] = row
             choice_rows.append(row)
     choice_headers = ordered_headers(CHOICES_HEADERS, choice_rows)
+    if second_lang and f"label::{second_lang}" not in choice_headers:
+        choice_headers.append(f"label::{second_lang}")
     settings_extra = form.get("settingsExtraColumns") or {}
     settings_headers = list(SETTINGS_HEADERS)
     for header in settings_extra.keys():
@@ -289,6 +316,15 @@ def main() -> int:
             "save_to": question.get("saveTo") or question.get("save_to") or None,
             "big-image": question.get("bigImage") or question.get("big-image") or None,
         }
+        if second_lang:
+            values.update({
+                f"label::{second_lang}": translated(question, "label"),
+                f"hint::{second_lang}": translated(question, "hint"),
+                f"constraint_message::{second_lang}": translated(question, "constraintMessage"),
+                f"required_message::{second_lang}": translated(question, "requiredMessage"),
+                f"guidance_hint::{second_lang}": translated(question, "guidanceHint"),
+                f"note::{second_lang}": translated(question, "note"),
+            })
         for col_idx, header in enumerate(survey_headers, start=1):
             survey.cell(row=row_idx, column=col_idx, value=values.get(header))
 

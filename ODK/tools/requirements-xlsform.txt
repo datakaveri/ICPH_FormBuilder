@@ -1,1 +1,1 @@
-pyxform
+pyxform==4.5.0

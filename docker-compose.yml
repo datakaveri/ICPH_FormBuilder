@@ -2,14 +2,41 @@ services:
   icph:
     build:
       context: .
+      args:
+        VITE_FORM_BUILDER_API: "${VITE_FORM_BUILDER_API:-}"
     image: icph-form-builder:local
+    init: true
+    user: "${ICPH_UID:-1000}:${ICPH_GID:-1000}"
     ports:
-      - "5173:5173"
-      - "8787:8787"
+      - "127.0.0.1:5173:5173"
+      - "127.0.0.1:8787:8787"
     environment:
-      ICPH_ADMIN_PASSWORD: "${ICPH_ADMIN_PASSWORD:-ICPH2026}"
+      NODE_ENV: production
+      ICPH_ADMIN_PASSWORD: "${ICPH_ADMIN_PASSWORD:?Set ICPH_ADMIN_PASSWORD to a strong secret before starting}"
       ICPH_FORM_BUILDER_API_PORT: "8787"
-      VITE_FORM_BUILDER_API: "${VITE_FORM_BUILDER_API:-}"
     volumes:
-      - ./output:/app/output
+      - type: bind
+        source: ./output
+        target: /app/output
+      - type: bind
+        source: ./agentic-entity-mapper/SchemaTerminologies
+        target: /app/agentic-entity-mapper/SchemaTerminologies
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "Promise.all([fetch('http://127.0.0.1:5173/'), fetch('http://127.0.0.1:8787/api/health')]).then(([web, api]) => process.exit(web.ok && api.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    stop_grace_period: 30s
     restart: unless-stopped

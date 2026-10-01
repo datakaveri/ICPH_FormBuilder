@@ -50,6 +50,9 @@ form-builder/scripts/smoke_pipeline.mjs
 agentic-entity-mapper/*.zip
 ODK/*.xlsx
 ODK/*.csv
+ICPH_Platform_PRD_v1.0.pdf
+LAN_ACCESS.md
+/ARCHITECTURE.md
 ODK/Exit_Interview/
 ODK/ICPH_All_Question_Types_Test_assets/
 ODK/forms/converted/

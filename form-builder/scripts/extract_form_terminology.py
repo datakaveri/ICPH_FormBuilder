@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -772,6 +774,158 @@ def option_display_text(option: dict[str, Any]) -> str:
     return label or name
 
 
+LLM_ENTITY_PROMPT = """You are a clinical terminology extraction assistant.
+Extract only independently codeable clinical, administrative, demographic, procedure,
+measurement, substance, anatomy, or device concepts that are explicitly present in
+the supplied form question. Preserve meaning-changing qualifiers such as body site,
+severity, laterality, temporality, and negation. Do not invent diagnoses from a
+question's answer type, and do not extract generic instruction words, units, or
+response mechanics as entities.
+
+Return ONLY valid JSON in this exact shape:
+{{"entities":[{{"text":"...","confidence":"High|Medium|Low","reason":"..."}}]}}
+
+QUESTION CONTEXT:
+{context}
+"""
+
+
+def _json_from_model_text(value: Any) -> dict[str, Any]:
+    text = clean_text(value)
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("LLM response did not contain a JSON object.")
+    parsed = json.loads(text[start:end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response JSON was not an object.")
+    return parsed
+
+
+class LlmEntityExtractor:
+    """Small adapter for Ollama and OpenAI-compatible local model servers."""
+
+    def __init__(self, endpoint: str | None = None, model: str | None = None):
+        self.endpoint = (endpoint or os.environ.get("ICPH_LLM_ENDPOINT") or "http://10.10.17.55").rstrip("/")
+        self.model = model or os.environ.get("ICPH_LLM_MODEL") or ""
+        self.api_style = ""
+        self.timeout = max(5, int(os.environ.get("ICPH_LLM_TIMEOUT", "90")))
+        self._discover_model()
+
+    def _request_json(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{self.endpoint}{path}",
+            data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+            headers={"content-type": "application/json"},
+            method="POST" if payload is not None else "GET",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _discover_model(self) -> None:
+        if self.model:
+            self.api_style = "ollama"
+            return
+        model_rows: list[tuple[str, float]] = []
+        try:
+            data = self._request_json("/api/tags")
+            for item in data.get("models") or []:
+                name = clean_text(item.get("name") or item.get("model"))
+                size = clean_text((item.get("details") or {}).get("parameter_size"))
+                numeric_size = float(re.search(r"[0-9.]+", size).group(0)) if re.search(r"[0-9.]+", size) else 0
+                if name:
+                    model_rows.append((name, numeric_size))
+            if model_rows:
+                self.api_style = "ollama"
+        except Exception:
+            pass
+        if not model_rows:
+            try:
+                data = self._request_json("/v1/models")
+                for item in data.get("data") or []:
+                    name = clean_text(item.get("id"))
+                    if name:
+                        model_rows.append((name, 0))
+                if model_rows:
+                    self.api_style = "openai"
+            except Exception:
+                pass
+        if not model_rows:
+            raise RuntimeError(f"No models could be discovered at {self.endpoint}.")
+
+        def rank(row: tuple[str, float]) -> tuple[int, float, str]:
+            name, size = row
+            lowered = name.lower()
+            family = next((score for token, score in {
+                "qwen": 5,
+                "llama": 4,
+                "gemma": 3,
+                "mistral": 2,
+                "deepseek": 1,
+            }.items() if token in lowered), 0)
+            return family, size, name
+
+        self.model = sorted(model_rows, key=rank, reverse=True)[0][0]
+
+    def metadata(self) -> dict[str, Any]:
+        return {"enabled": True, "endpoint": self.endpoint, "model": self.model, "apiStyle": self.api_style}
+
+    def _complete(self, prompt: str) -> str:
+        if self.api_style == "ollama":
+            try:
+                data = self._request_json("/api/chat", {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.1},
+                })
+                return str((data.get("message") or {}).get("content") or "")
+            except Exception:
+                data = self._request_json("/api/generate", {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.1},
+                })
+                return str(data.get("response") or "")
+        data = self._request_json("/v1/chat/completions", {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+        })
+        return str((((data.get("choices") or [{}])[0].get("message") or {}).get("content")) or "")
+
+    def extract(self, question: dict[str, Any]) -> list[dict[str, str]]:
+        context = question_text(question)
+        parsed = _json_from_model_text(self._complete(LLM_ENTITY_PROMPT.format(context=context)))
+        entities = parsed.get("entities")
+        if not isinstance(entities, list):
+            raise ValueError("LLM response did not contain an entities list.")
+        results = []
+        seen = set()
+        for item in entities:
+            if not isinstance(item, dict):
+                continue
+            text = normalize_candidate_text(item.get("text"))
+            key = candidate_key(text)
+            if not text or not key or key in seen or len(text) > 180:
+                continue
+            seen.add(key)
+            results.append({
+                "candidate": text,
+                "confidence": clean_text(item.get("confidence")) or "Medium",
+                "reason": clean_text(item.get("reason")),
+            })
+            if len(results) >= 12:
+                break
+        return results
+
+
 def approved_mapping(match: dict[str, Any]) -> dict[str, Any]:
     return {
         "vocabulary": match.get("vocabulary", ""),
@@ -791,41 +945,56 @@ def approved_mapping(match: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def extract_form_entities(question: dict[str, Any], lookup: BruteVocabularyLookup | None = None) -> list[dict[str, Any]]:
+def extract_form_entities(
+    question: dict[str, Any],
+    lookup: BruteVocabularyLookup | None = None,
+    llm: LlmEntityExtractor | None = None,
+) -> list[dict[str, Any]]:
     qtype = clean_text(question.get("type"))
     if qtype in SKIP_TYPES:
         return []
 
     candidates: list[dict[str, str]] = []
-    candidates.extend(sourced_phrase_candidates(
-        question.get("label"),
-        source_component="label",
-        source_label="Question",
-    ))
-    candidates.extend(sourced_phrase_candidates(
-        question.get("hint"),
-        source_component="hint",
-        source_label="Question hint",
-    ))
-    candidates.extend(sourced_phrase_candidates(
-        question.get("guidanceHint") or question.get("guidance_hint"),
-        source_component="guidance_hint",
-        source_label="Guidance hint",
-    ))
+    if llm is not None:
+        for item in llm.extract(question):
+            candidates.append({
+                "candidate": item["candidate"],
+                "source_component": "llm_analysis",
+                "source_label": "LLM analysis",
+                "source_text": question_text(question),
+                "llm_confidence": item.get("confidence", "Medium"),
+                "llm_reason": item.get("reason", ""),
+            })
+    else:
+        candidates.extend(sourced_phrase_candidates(
+            question.get("label"),
+            source_component="label",
+            source_label="Question",
+        ))
+        candidates.extend(sourced_phrase_candidates(
+            question.get("hint"),
+            source_component="hint",
+            source_label="Question hint",
+        ))
+        candidates.extend(sourced_phrase_candidates(
+            question.get("guidanceHint") or question.get("guidance_hint"),
+            source_component="guidance_hint",
+            source_label="Guidance hint",
+        ))
 
-    if qtype.startswith("select_"):
-        for option in question.get("options") or []:
-            option_text = option_display_text(option)
-            option_candidates = sourced_phrase_candidates(
-                option.get("label") or option.get("name"),
-                source_component="option",
-                source_label="Option/choice",
-                include_option=True,
-            )
-            if option_text:
-                for item in option_candidates:
-                    item["source_text"] = option_text
-            candidates.extend(option_candidates)
+        if qtype.startswith("select_"):
+            for option in question.get("options") or []:
+                option_text = option_display_text(option)
+                option_candidates = sourced_phrase_candidates(
+                    option.get("label") or option.get("name"),
+                    source_component="option",
+                    source_label="Option/choice",
+                    include_option=True,
+                )
+                if option_text:
+                    for item in option_candidates:
+                        item["source_text"] = option_text
+                candidates.extend(option_candidates)
 
     entities = []
     seen = set()
@@ -844,8 +1013,12 @@ def extract_form_entities(question: dict[str, Any], lookup: BruteVocabularyLooku
             "source_component": item.get("source_component") or "",
             "source_label": item.get("source_label") or "",
             "source_text": item.get("source_text") or "",
-            "decomposition_method": "field_level_phrase_candidates",
+            "decomposition_method": "llm_entity_decomposition" if llm is not None else "field_level_phrase_candidates",
         }
+        if item.get("llm_confidence"):
+            mapping["confidence"] = item["llm_confidence"]
+        if item.get("llm_reason"):
+            mapping["extraction_reason"] = item["llm_reason"]
         candidates_from_vocabularies = lookup.search(candidate) if lookup is not None else []
         if candidates_from_vocabularies:
             mapping["candidate_mappings"] = candidates_from_vocabularies[:12]
@@ -904,10 +1077,28 @@ def main() -> int:
         "questions": existing_questions if selected_ids and existing_questions else [],
         "warnings": [],
         "rerunQuestionIds": sorted(selected_ids),
+        "llm": {"enabled": bool(form.get("terminologyUseLlm")), "status": "disabled"},
     }
     write_json(args.output_path, payload)
 
     lookup = BruteVocabularyLookup(args.mapper_root)
+    llm = None
+    if form.get("terminologyUseLlm"):
+        try:
+            llm = LlmEntityExtractor()
+            payload["llm"] = {**llm.metadata(), "status": "ready"}
+        except Exception as exc:
+            payload["llm"] = {
+                "enabled": True,
+                "status": "unavailable",
+                "endpoint": os.environ.get("ICPH_LLM_ENDPOINT") or "http://10.10.17.55",
+                "error": str(exc),
+            }
+            payload["warnings"].append({
+                "stage": "LLM",
+                "message": f"LLM mode was enabled but could not be started; using deterministic extraction instead: {exc}",
+            })
+        write_json(args.output_path, payload)
     if lookup.warnings:
         payload["warnings"].extend(lookup.warnings)
         write_json(args.output_path, payload)
@@ -960,10 +1151,21 @@ def main() -> int:
         else:
             try:
                 result["processedText"] = source_text
-                result["entities"] = extract_form_entities(question, lookup)
+                result["entities"] = extract_form_entities(question, lookup, llm)
             except Exception as exc:
-                result["status"] = "error"
-                result["warnings"] = [{"stage": "TERMINOLOGY", "message": str(exc)}]
+                if llm is not None:
+                    try:
+                        result["entities"] = extract_form_entities(question, lookup, None)
+                        result["warnings"] = [{
+                            "stage": "LLM",
+                            "message": f"LLM analysis failed for this question; deterministic extraction was used instead: {exc}",
+                        }]
+                    except Exception as fallback_exc:
+                        result["status"] = "error"
+                        result["warnings"] = [{"stage": "TERMINOLOGY", "message": str(fallback_exc)}]
+                else:
+                    result["status"] = "error"
+                    result["warnings"] = [{"stage": "TERMINOLOGY", "message": str(exc)}]
 
         existing = output_by_key.get(question_id) or output_by_key.get(question_name)
         if existing in payload["questions"]:

@@ -29,17 +29,45 @@ contains `docker-compose.yml`.
 If you are using Git, the commands look like this:
 
 ```bash
-git clone https://github.com/nikipatil281/ICPH_health.git ICPH
+git clone https://github.com/datakaveri/ICPH_FromBuilder.git ICPH
 cd ICPH
-docker compose up --build
+cp .env.example .env
 ```
 
 If you downloaded the repository as a ZIP from GitHub, unzip it first, rename
 the unzipped folder to `ICPH`, open that folder in Terminal, and then run:
 
 ```bash
-docker compose up --build
+cp .env.example .env
 ```
+
+Edit `.env` and replace the `ICPH_ADMIN_PASSWORD` placeholder with a private,
+random secret of at least 16 characters. The production server refuses the
+sample placeholder and the old default password. Keep `.env` private; it is
+excluded from the Docker build context.
+
+## Add Client Terminology Assets
+
+If you receive a separate `ICPH_SchemaTerminologies.zip`, place it in
+`agentic-entity-mapper/` and unzip it there before starting the app. The
+resulting folder must be named `SchemaTerminologies`.
+
+The complete `agentic-entity-mapper/SchemaTerminologies/` directory is mounted
+from the host into the container. Terminology data and uploaded MetaForms stay
+on the host, are not baked into the image, and are available without rebuilding.
+
+Before starting, create the host data directory and match the container user to
+your account so the app can write persisted data without running as root:
+
+```bash
+mkdir -p output
+export ICPH_UID="$(id -u)"
+export ICPH_GID="$(id -g)"
+docker compose up --build -d
+```
+
+Follow startup logs with `docker compose logs -f icph` and stop following with
+Ctrl-C. The containers continue running in the background.
 
 If Docker says `no configuration file provided: not found`, you are probably
 one folder too high or too low. Move into the main `ICPH` project folder, the
@@ -49,41 +77,6 @@ If Docker says it `failed to connect to the docker API` or asks whether the
 Docker daemon is running, open Docker Desktop first and wait until it says
 Docker is running. Then run the Docker command again from the main `ICPH`
 folder.
-
-## Add Client Terminology Assets
-
-You may receive a separate file named:
-
-```text
-ICPH_SchemaTerminologies.zip
-```
-
-Place that ZIP file inside:
-
-```text
-ICPH/agentic-entity-mapper/
-```
-
-Then unzip it there. After unzipping, you should see a folder named:
-
-```text
-SchemaTerminologies
-```
-
-inside:
-
-```text
-ICPH/agentic-entity-mapper/
-```
-
-The ZIP file name can stay as `ICPH_SchemaTerminologies.zip`; the folder created
-after unzipping must be named `SchemaTerminologies`.
-
-Once that folder is in place, return to the main `ICPH` folder and start the app:
-
-```bash
-docker compose up --build
-```
 
 Open the app:
 
@@ -97,18 +90,10 @@ The API is exposed at:
 http://localhost:8787
 ```
 
-The admin workspace is password-gated. The default local password is:
-
-```text
-ICPH2026
-```
-
-For any shared or deployed environment, set a different password before
-starting:
-
-```bash
-ICPH_ADMIN_PASSWORD='replace-this' docker compose up --build
-```
+The web and API ports are bound to the host loopback interface by default. For
+shared hosting, put an HTTPS reverse proxy in front of ports `5173` and `8787`;
+HTTPS is required for browser camera and geolocation permissions. Do not expose
+the API directly to the public internet.
 
 Generated form workspaces and submissions are persisted on the host at:
 
@@ -116,17 +101,26 @@ Generated form workspaces and submissions are persisted on the host at:
 output/forms/
 ```
 
+Terminology data, uploaded MetaForm documents, and generated metadata persist in
+`agentic-entity-mapper/SchemaTerminologies/`.
+
 Stop the containers with:
 
 ```bash
 docker compose down
 ```
 
+This stops/removes the container but leaves both host data directories intact.
+Do not delete `output/` or the MetaForm data directory when redeploying.
+
 By default, the browser calls the API on the same hostname as the web app, port
-`8787`. If you need to override that, set the API URL explicitly:
+`8787`. When using a reverse proxy that serves both paths on one HTTPS origin,
+set `VITE_FORM_BUILDER_API` in `.env` to that origin (for example,
+`https://forms.example.org`) and rebuild. The proxy should route `/` to port
+`5173` and `/api/` to port `8787`.
 
 ```bash
-VITE_FORM_BUILDER_API='http://your-hostname:8787' docker compose up --build
+docker compose up --build -d
 ```
 
 ## Active Flow
@@ -150,10 +144,17 @@ If reviewed terminology exists for the workspace, the FHIR handoff passes
 ICD-10, and RxNorm mappings are written into the generated FHIR as question
 codings; unreviewed suggestions are ignored.
 
-Terminology extraction is lightweight and rules/lookup-based; it is not an LLM
-agent. Admins can manually add a missed entity from the Terminology tab. The UI
-warns if any typed words are not present in the question text or options, but
-the admin may still confirm and review that entity.
+Terminology extraction defaults to deterministic rules and local lookup data.
+LLM-assisted extraction is temporarily down and disabled in the UI. FHIR bundle
+generation runs locally and does not call an LLM or require external model
+access; it can use admin-approved terminology mappings when available.
+
+## Offline Access
+
+This release requires a connection to the app server. Offline form filling,
+queued submissions, and PWA installation are not included. Those need explicit
+offline data storage, conflict/retry, and participant-data protection behavior;
+they should be implemented and tested as a separate release before field use.
 
 ## Local Development Without Docker
 

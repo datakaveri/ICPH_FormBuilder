@@ -132,6 +132,11 @@ The server writes XLSX with:
 scripts/export_xlsform.py
 ```
 
+## LLM-Assisted Terminology
+
+LLM-assisted extraction is temporarily down. The toggle is disabled, and
+terminology extraction continues to use the deterministic workflow.
+
 Then converts XLSX to XML with:
 
 ```text

@@ -1,6 +1,12 @@
 .DS_Store
 .git
 .git-unlinked-backups
+.env
+.env.*
+!.env.example
+/ICPH_Platform_PRD_v1.0.pdf
+/ARCHITECTURE.md
+/LAN_ACCESS.md
 
 # Local runtime state
 output/
@@ -40,6 +46,5 @@ ODK/central/*/files/
 ODK/central/*/node_modules/
 ODK/central/*/tmp/
 
-# Uploaded MetaForms and generated schema chunks.
-agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/*
-agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/*
+# Large/private terminology data is mounted from the host at runtime.
+agentic-entity-mapper/SchemaTerminologies/

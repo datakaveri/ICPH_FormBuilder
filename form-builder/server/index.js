@@ -10,12 +10,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, "..");
 const icphRoot = path.resolve(appRoot, "..");
 const outputRoot = path.join(icphRoot, "output", "forms");
+const foldersPath = path.join(outputRoot, "folders.json");
+const metaFormPrimariesPath = path.join(outputRoot, "meta-form-primaries.json");
+const participantRegistryPath = path.join(outputRoot, "participant-registry.json");
+const DEFAULT_FOLDER_BARCODE_VARIABLE = "participant_barcode";
 const odkVenvBin = path.join(icphRoot, "ODK", ".venv-xlsform", "bin");
 const pythonBin = path.join(odkVenvBin, "python");
 const xls2xformBin = path.join(odkVenvBin, "xls2xform");
 const exporterPath = path.join(appRoot, "scripts", "export_xlsform.py");
 const importerPath = path.join(appRoot, "scripts", "import_xlsform.py");
 const inspectorPath = path.join(appRoot, "scripts", "inspect_xlsform.py");
+const folderResponseExporterPath = path.join(appRoot, "scripts", "export_folder_responses.py");
 const terminologyExtractorPath = path.join(appRoot, "scripts", "extract_form_terminology.py");
 const mapperRoot = path.join(icphRoot, "agentic-entity-mapper");
 const mapperPythonBin = path.join(mapperRoot, ".venv", "bin", "python");
@@ -27,7 +32,14 @@ const schemaPreprocessorPath = path.join(mapperRoot, "preprocess_icph_metaforms.
 const schemaManifestName = "icph_metaforms_manifest.json";
 const schemaAggregateChunksName = "icph_metaform_chunks.jsonl";
 const port = Number(process.env.ICPH_FORM_BUILDER_API_PORT || 8787);
-const adminPassword = process.env.ICPH_ADMIN_PASSWORD || "ICPH2026";
+const configuredAdminPassword = String(process.env.ICPH_ADMIN_PASSWORD || "");
+if (
+  process.env.NODE_ENV === "production"
+  && (configuredAdminPassword.length < 16 || configuredAdminPassword === "ICPH2026" || /replace[_ -]?with/i.test(configuredAdminPassword))
+) {
+  throw new Error("Set ICPH_ADMIN_PASSWORD to a private secret of at least 16 characters before running in production.");
+}
+const adminPassword = configuredAdminPassword || "ICPH2026";
 const adminTokens = new Map();
 const adminTokenTtlMs = 12 * 60 * 60 * 1000;
 const accessCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -51,7 +63,7 @@ const nonPrimaryIdentifierTypes = new Set([
 ]);
 const corsHeaders = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+  "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
   "access-control-allow-headers": "content-type,x-admin-token,x-admin-password,authorization"
 };
 
@@ -156,8 +168,8 @@ async function loginAdmin(payload) {
 
 function cleanRespondentAccessCode(value) {
   const code = String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-  if (!/^[A-Z0-9]{5}$/.test(code)) {
-    const error = new Error("Enter the 5-character respondent form code.");
+  if (!/^[A-Z0-9]{1,10}$/.test(code)) {
+    const error = new Error("Enter a respondent form code with up to 10 letters or numbers.");
     error.statusCode = 400;
     throw error;
   }
@@ -231,8 +243,19 @@ function formBuildSnapshot(form = {}) {
     submissionUrl: form.submissionUrl || "",
     allowChoiceDuplicates: form.allowChoiceDuplicates || "",
     primaryIdentifierVariable: form.primaryIdentifierVariable || "",
+    terminologyUseLlm: false,
+    multilingualEnabled: Boolean(form.multilingualEnabled),
+    multilingualLanguage: form.multilingualLanguage || "",
     entities: form.entities || [],
     questions: form.questions || []
+  };
+}
+
+function normalizeResponseSettings(source = {}) {
+  return {
+    allowResponseEdits: Boolean(source.allowResponseEdits),
+    limitOneResponsePerIdentifier: source.limitOneResponsePerIdentifier !== false,
+    participantIdentifierVariable: String(source.participantIdentifierVariable || "").trim()
   };
 }
 
@@ -457,6 +480,7 @@ async function listSchemaDocuments() {
   await mkdir(schemaOriginalDir, { recursive: true });
   await mkdir(schemaProcessedDir, { recursive: true });
   const manifest = await readSchemaManifest();
+  const metaFormPrimaries = await readMetaFormPrimaries();
   const originalNames = new Set();
   try {
     for (const name of await readdir(schemaOriginalDir)) {
@@ -523,6 +547,7 @@ async function listSchemaDocuments() {
       updatedAt: sourceStat?.mtime?.toISOString?.() || info.processed_at || null,
       processedAt: info.processed_at || null,
       formCount: info.form_count || 0,
+      primaryIdentifierVariable: metaFormPrimaries[name] || null,
       formOptions: formOptions.sort((a, b) => Number(a.formIndex || 0) - Number(b.formIndex || 0)),
       variableCount: info.variable_count || 0,
       chunkCount: info.chunk_count || 0,
@@ -571,6 +596,9 @@ async function deleteSchemaDocument(fileName) {
   const sourcePath = path.join(schemaOriginalDir, cleanName);
   const markdownPath = path.join(schemaProcessedDir, `${stem}.md`);
   const chunksPath = path.join(schemaProcessedDir, `${stem}.chunks.jsonl`);
+  const linkedWorkspaceIds = (await listForms()).forms
+    .filter((item) => item.metaFormLink?.fileName === cleanName)
+    .map((item) => item.workspaceId);
 
   await rm(sourcePath, { force: true });
   await rm(markdownPath, { force: true });
@@ -582,7 +610,9 @@ async function deleteSchemaDocument(fileName) {
   await rebuildSchemaAggregate(manifest);
   await writeSchemaManifest(manifest);
 
-  return { ok: true, deleted: { fileName: cleanName, sourcePath, markdownPath, chunksPath }, ...(await listSchemaDocuments()) };
+  for (const workspaceId of linkedWorkspaceIds) await deleteForm(workspaceId);
+
+  return { ok: true, deleted: { fileName: cleanName, sourcePath, markdownPath, chunksPath }, deletedWorkspaceIds: linkedWorkspaceIds, ...(await listSchemaDocuments()) };
 }
 
 function runCommand(command, args, options = {}) {
@@ -597,6 +627,341 @@ function runCommand(command, args, options = {}) {
   });
 }
 
+async function folderPrimaryDetails(folderId) {
+  const cleanId = String(folderId || "").trim();
+  if (!cleanId) return null;
+  const folders = await readFolders();
+  const folder = folders.find((item) => item.id === cleanId);
+  if (!folder) throw new Error("Folder not found.");
+  const storedVariable = String(folder.primaryIdentifierVariable || "").trim();
+  if (storedVariable) {
+    const forms = await listForms();
+    const source = forms.forms.find((item) => item.folderId === cleanId && item.hasXml && item.primaryIdentifierVariable === storedVariable);
+    if (source) {
+      try {
+        const loaded = await loadDraft(source.workspaceId);
+        const question = (loaded.draft.questions || []).find((item) => item.name === storedVariable);
+        return { variable: storedVariable, question };
+      } catch {}
+    }
+    return { variable: storedVariable, question: null };
+  }
+  const forms = await listForms();
+  const source = forms.forms.find((item) => item.folderId === cleanId && item.hasXml && item.primaryIdentifierVariable);
+  if (!source) return null;
+  const variable = String(source.primaryIdentifierVariable || "").trim();
+  try {
+    const loaded = await loadDraft(source.workspaceId);
+    const question = (loaded.draft.questions || []).find((item) => item.name === variable);
+    return { variable, question };
+  } catch {
+    return { variable, question: null };
+  }
+}
+
+function publishedFolderForms(forms = [], folderId = "") {
+  const groups = new Map();
+  for (const form of forms.filter((item) => (
+    item.folderId === folderId
+    && item.hasXml
+    && item.respondentAccessCode
+    && !item.collectionLocked
+  ))) {
+    const key = form.versionBaseId
+      || form.formId
+      || form.title
+      || String(form.workspaceId || "").replace(/_v\d+$/i, "");
+    const group = groups.get(key) || [];
+    group.push(form);
+    groups.set(key, group);
+  }
+  return [...groups.values()]
+    .map((versions) => versions.slice().sort((a, b) => Number(a.versionNumber || 1) - Number(b.versionNumber || 1)).at(-1))
+    .filter(Boolean);
+}
+
+function folderAnswerValue(answers = {}, name = "", repeatIndex = null) {
+  const cleanName = String(name || "").trim();
+  if (!cleanName) return "";
+  if (repeatIndex !== null) return entryValue(repeatAnswerValue(answers, cleanName, repeatIndex));
+  const prefix = `${cleanName}__repeat_`;
+  const repeated = Object.keys(answers)
+    .filter((key) => key.startsWith(prefix))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }))
+    .map((key) => answers[key]);
+  return repeated.length ? entryValue(repeated) : entryValue(answers[cleanName]);
+}
+
+function folderQuestionKey(index, form) {
+  return `form_${index + 1}_${slugify(form.title || form.formId || form.workspaceId)}`;
+}
+
+function mergeFolderCell(row, key, value) {
+  const next = String(value ?? "").trim();
+  if (!next) return;
+  const current = String(row[key] ?? "").trim();
+  if (!current) {
+    row[key] = next;
+    return;
+  }
+  const values = current.split(" | ");
+  if (!values.includes(next)) row[key] = `${current} | ${next}`;
+}
+
+async function exportFolderResponses(folderId) {
+  const cleanId = String(folderId || "").trim();
+  const folders = await readFolders();
+  const folder = folders.find((item) => item.id === cleanId);
+  if (!folder) {
+    const error = new Error("Folder not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const allForms = (await listForms()).forms || [];
+  const selectedForms = publishedFolderForms(allForms, cleanId);
+  if (!selectedForms.length) throw new Error("This folder has no published and unlocked forms to export.");
+  const registry = await readParticipantRegistry();
+  const descriptors = [];
+  for (const form of selectedForms) {
+    const loaded = await loadDraft(form.workspaceId);
+    const entries = await readEntries(form.workspaceId);
+    const draft = loaded.draft || {};
+    const demographic = draft.questions?.some((question) => question.type === "begin_repeat" && question.demographicData);
+    descriptors.push({ form, draft, entries, demographic, formKey: folderQuestionKey(descriptors.length, form) });
+  }
+
+  const columns = [
+    { key: "participant_identifier", label: "Participant identifier" },
+    { key: "barcode", label: "Participant barcode" },
+    { key: "household_identifier", label: "Household identifier" },
+    { key: "demographic_member_identifier", label: "Demographic member identifier" }
+  ];
+  for (const descriptor of descriptors) {
+    for (const header of dataHeadersForDraft(descriptor.draft)) {
+      columns.push({
+        key: `${descriptor.formKey}::${header}`,
+        label: `${descriptor.form.title || descriptor.form.formId} · ${header}`
+      });
+    }
+  }
+
+  const rows = new Map();
+  function rowFor(identityKey, identity = {}) {
+    let row = rows.get(identityKey);
+    if (!row) {
+      row = {
+        participant_identifier: identity.participantIdentifier || "",
+        barcode: identity.barcode || "",
+        household_identifier: identity.householdIdentifier || "",
+        demographic_member_identifier: identity.memberIdentifier || ""
+      };
+      rows.set(identityKey, row);
+    }
+    mergeFolderCell(row, "participant_identifier", identity.participantIdentifier);
+    mergeFolderCell(row, "barcode", identity.barcode);
+    mergeFolderCell(row, "household_identifier", identity.householdIdentifier);
+    mergeFolderCell(row, "demographic_member_identifier", identity.memberIdentifier);
+    return row;
+  }
+
+  for (const descriptor of descriptors) {
+    const headers = dataHeadersForDraft(descriptor.draft);
+    if (descriptor.demographic) {
+      const members = demographicParticipantRows(descriptor.draft, descriptor.entries, registry);
+      for (const member of members) {
+        const participantIdentifier = member.barcode || member.memberIdentifier || member.householdIdentifier || `${member.entryId}:${member.repeatIndex}`;
+        const identityKey = member.barcode || `${member.householdIdentifier}::${member.memberIdentifier || `${member.entryId}:${member.repeatIndex}`}`;
+        const row = rowFor(identityKey, {
+          participantIdentifier,
+          barcode: member.barcode,
+          householdIdentifier: member.householdIdentifier,
+          memberIdentifier: member.memberIdentifier
+        });
+        for (const header of headers) {
+          const childValue = Object.prototype.hasOwnProperty.call(member.displayAnswers || {}, header)
+            ? entryValue(member.displayAnswers[header])
+            : folderAnswerValue(descriptor.entries.find((entry) => entry.id === member.entryId)?.answers || {}, header);
+          mergeFolderCell(row, `${descriptor.formKey}::${header}`, childValue);
+        }
+      }
+      continue;
+    }
+
+    const participantVariable = descriptor.draft.participantIdentifierVariable || descriptor.draft.primaryIdentifierVariable || "";
+    for (const entry of descriptor.entries) {
+      const answers = entry.answers || {};
+      const participantIdentifier = folderAnswerValue(answers, participantVariable) || entry.instanceName || entry.id;
+      const row = rowFor(`${participantIdentifier}`.toLowerCase(), { participantIdentifier });
+      for (const header of headers) mergeFolderCell(row, `${descriptor.formKey}::${header}`, folderAnswerValue(answers, header));
+    }
+  }
+
+  const exportDir = path.join(outputRoot, "folder_exports");
+  await mkdir(exportDir, { recursive: true });
+  const stem = `${slugify(folder.name)}_${timestampId()}_${Math.random().toString(36).slice(2, 8)}`;
+  const inputPath = path.join(exportDir, `${stem}.json`);
+  const outputPath = path.join(exportDir, `${stem}.xlsx`);
+  try {
+    await writeFile(inputPath, JSON.stringify({ columns, rows: [...rows.values()] }), "utf8");
+    const result = await runCommand(pythonBin, [folderResponseExporterPath, inputPath, outputPath]);
+    if (result.code !== 0 || !existsSync(outputPath)) {
+      throw new Error(result.stderr.trim() || "Could not create the folder response workbook.");
+    }
+    return {
+      fileName: `${slugify(folder.name)}_responses.xlsx`,
+      data: await readFile(outputPath),
+      formCount: descriptors.length,
+      rowCount: rows.size
+    };
+  } finally {
+    await rm(inputPath, { force: true });
+    await rm(outputPath, { force: true });
+  }
+}
+
+async function claimFolderPrimaryIdentifier(folderId, variable) {
+  const cleanId = String(folderId || "").trim();
+  const cleanVariable = String(variable || "").trim();
+  if (!cleanId || !cleanVariable) return;
+  const folders = await readFolders();
+  const index = folders.findIndex((item) => item.id === cleanId);
+  if (index < 0) throw new Error("Folder not found.");
+  const folder = folders[index];
+  if (folder.participantIdentifierMode === "barcode") {
+    const barcodeVariable = String(folder.participantIdentifierVariable || DEFAULT_FOLDER_BARCODE_VARIABLE).trim();
+    if (cleanVariable !== barcodeVariable) {
+      throw new Error(`Forms in this folder must use the shared barcode identifier variable "${barcodeVariable}".`);
+    }
+    return;
+  }
+  const existing = String(folder.primaryIdentifierVariable || "").trim();
+  if (existing && existing !== cleanVariable) {
+    throw new Error(`Forms in this folder must use the shared primary identifier variable "${existing}".`);
+  }
+  if (!existing) {
+    folders[index] = { ...folders[index], primaryIdentifierVariable: cleanVariable, updatedAt: isoStamp() };
+    await writeFolders(folders);
+  }
+}
+
+function sharedBarcodeQuestion(variable) {
+  return {
+    id: `folder_barcode_${slugify(variable)}_${timestampId()}`,
+    type: "barcode",
+    name: variable,
+    label: "Participant barcode",
+    hint: "Scan the barcode assigned to this participant.",
+    required: true,
+    identifierLocked: true,
+    folderSharedIdentifier: "barcode"
+  };
+}
+
+async function syncFolderBarcodeQuestions(folderId, variable, sourceWorkspaceId = "") {
+  const forms = (await listForms()).forms.filter((item) => item.folderId === folderId);
+  for (const item of forms) {
+    if (item.workspaceId === sourceWorkspaceId) continue;
+    const loaded = await loadDraft(item.workspaceId);
+    const entries = await readEntries(item.workspaceId);
+    if (entries.length) continue;
+    const questions = loaded.draft.questions || [];
+    const existing = questions.find((question) => question.name === variable && question.type === "barcode");
+    if (existing?.identifierLocked && loaded.draft.participantIdentifierVariable === variable && loaded.draft.primaryIdentifierVariable === variable) continue;
+    const withoutParentIdentifier = questions.filter((question) => question.name !== loaded.draft.primaryIdentifierVariable || question.name === variable);
+    const nextQuestions = existing
+      ? withoutParentIdentifier.map((question) => question.id === existing.id ? { ...question, identifierLocked: true, folderSharedIdentifier: "barcode", required: true } : question)
+      : (() => {
+          const next = [...withoutParentIdentifier];
+          next.unshift(sharedBarcodeQuestion(variable));
+          return next;
+        })();
+    const nextDraft = {
+      ...loaded.draft,
+      questions: nextQuestions,
+      primaryIdentifierVariable: variable,
+      participantIdentifierVariable: variable,
+      updatedAt: isoStamp()
+    };
+    if (item.hasXml) await exportForm({ workspaceId: item.workspaceId, form: nextDraft });
+    else await writeFile(loaded.draftPath, JSON.stringify(nextDraft, null, 2) + "\n", "utf8");
+  }
+}
+
+async function enableFolderBarcodeParticipantMode(folderId, requestedVariable = "") {
+  const cleanId = String(folderId || "").trim();
+  if (!cleanId) return;
+  const cleanVariable = String(requestedVariable || DEFAULT_FOLDER_BARCODE_VARIABLE).trim().toLowerCase();
+  if (!/^[a-z_][a-z0-9_]*$/.test(cleanVariable)) throw new Error("Barcode question variable must start with a letter or underscore and contain only letters, numbers, or underscores.");
+  const folders = await readFolders();
+  const index = folders.findIndex((item) => item.id === cleanId);
+  if (index < 0) throw new Error("Folder not found.");
+  const existingVariable = String(folders[index].participantIdentifierVariable || "").trim();
+  if (existingVariable && existingVariable !== cleanVariable) throw new Error(`This folder already uses "${existingVariable}" as its barcode variable.`);
+  folders[index] = {
+    ...folders[index],
+    participantIdentifierMode: "barcode",
+    participantIdentifierVariable: existingVariable || cleanVariable,
+    updatedAt: isoStamp()
+  };
+  await writeFolders(folders);
+  await syncFolderBarcodeQuestions(cleanId, existingVariable || cleanVariable);
+}
+
+async function readMetaFormPrimaries() {
+  try {
+    const parsed = JSON.parse(await readFile(metaFormPrimariesPath, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeMetaFormPrimaries(primaries) {
+  await mkdir(outputRoot, { recursive: true });
+  await writeFile(metaFormPrimariesPath, JSON.stringify(primaries, null, 2) + "\n", "utf8");
+}
+
+async function claimMetaFormPrimary(fileName, variable) {
+  const cleanName = String(fileName || "").trim();
+  const cleanVariable = String(variable || "").trim();
+  if (!cleanName || !cleanVariable) return;
+  const primaries = await readMetaFormPrimaries();
+  const existing = String(primaries[cleanName] || "").trim();
+  if (existing && existing !== cleanVariable) {
+    throw new Error(`Forms linked to this MetaForm must use the shared primary identifier variable "${existing}".`);
+  }
+  if (!existing) {
+    primaries[cleanName] = cleanVariable;
+    await writeMetaFormPrimaries(primaries);
+  }
+}
+
+async function releaseSharedIdentifiersForForm(draft) {
+  const forms = await listForms();
+  if (draft?.folderId && !forms.forms.some((item) => item.folderId === draft.folderId)) {
+    const folders = await readFolders();
+    const folderIndex = folders.findIndex((item) => item.id === draft.folderId);
+    if (folderIndex >= 0 && (folders[folderIndex].primaryIdentifierVariable || folders[folderIndex].participantIdentifierMode)) {
+      folders[folderIndex] = {
+        ...folders[folderIndex],
+        primaryIdentifierVariable: "",
+        participantIdentifierMode: "",
+        participantIdentifierVariable: "",
+        updatedAt: isoStamp()
+      };
+      await writeFolders(folders);
+    }
+  }
+  const metaFileName = String(draft?.metaFormLink?.fileName || "").trim();
+  if (metaFileName && !forms.forms.some((item) => item.metaFormLink?.fileName === metaFileName)) {
+    const primaries = await readMetaFormPrimaries();
+    if (Object.prototype.hasOwnProperty.call(primaries, metaFileName)) {
+      delete primaries[metaFileName];
+      await writeMetaFormPrimaries(primaries);
+    }
+  }
+}
+
 async function createForm(payload) {
   const title = String(payload.title || "Untitled ICPH Form").trim();
   const formId = slugify(payload.formId || title).replace(/-/g, "_");
@@ -605,13 +970,20 @@ async function createForm(payload) {
   const outputDir = await ensureWorkspace(workspaceId);
   const metaFormLink = normalizeMetaFormLink(payload);
   const linkedPrimary = metaFormLink ? await existingMetaFormPrimary(metaFormLink.fileName) : null;
+  const folderId = String(payload.folderId || "").trim() || null;
+  const folderPrimary = folderId ? await folderPrimaryDetails(folderId) : null;
+  const folderRecord = folderId ? (await readFolders()).find((item) => item.id === folderId) : null;
   if (metaFormLink) {
     if (!metaFormLink.formIndex) throw new Error("Choose which form in the linked MetaForm you are building.");
     if (!payload.primaryIdentifierAcknowledged) {
       throw new Error("Acknowledge that this primary identifier is common to every XLSForm linked to this MetaForm.");
     }
   }
-  const primaryIdentifierVariable = String(linkedPrimary?.variable || payload.primaryIdentifierVariable || "").trim();
+  const requestedPrimaryIdentifier = String(payload.primaryIdentifierVariable || "").trim();
+  if (folderPrimary?.variable && requestedPrimaryIdentifier && requestedPrimaryIdentifier !== folderPrimary.variable) {
+    throw new Error(`Forms in this folder must use the shared primary identifier variable "${folderPrimary.variable}".`);
+  }
+  const primaryIdentifierVariable = String(linkedPrimary?.variable || requestedPrimaryIdentifier || folderPrimary?.variable || "").trim();
   const variableDetails = metaFormLink && primaryIdentifierVariable
     ? await metaFormVariableDetails(metaFormLink.fileName, metaFormLink.formIndex, primaryIdentifierVariable)
     : null;
@@ -619,18 +991,29 @@ async function createForm(payload) {
     throw new Error(`Primary identifier variable "${primaryIdentifierVariable}" was not found in the selected MetaForm form.`);
   }
   const questions = [];
-  if (metaFormLink && primaryIdentifierVariable) {
+  const folderBarcodeVariable = folderRecord?.participantIdentifierMode === "barcode"
+    ? String(folderRecord.participantIdentifierVariable || DEFAULT_FOLDER_BARCODE_VARIABLE).trim()
+    : "";
+  if (folderBarcodeVariable) {
+    questions.push(sharedBarcodeQuestion(folderBarcodeVariable));
+  } else if (metaFormLink && primaryIdentifierVariable) {
     questions.push(copiedPrimaryQuestion(linkedPrimary?.question || variableDetailsToQuestion(variableDetails, primaryIdentifierVariable), primaryIdentifierVariable));
+  } else if (folderPrimary?.variable) {
+    questions.push(copiedPrimaryQuestion(folderPrimary.question, folderPrimary.variable));
   }
+  const effectivePrimaryIdentifierVariable = folderBarcodeVariable || primaryIdentifierVariable;
   const draft = {
     title,
     formId,
     version: payload.version || "1",
     versionNumber: 1,
     versionBaseId,
+    folderId,
     metaFormLink,
-    primaryIdentifierVariable,
-    instanceName: primaryIdentifierVariable ? instanceNameForPrimaryIdentifier(primaryIdentifierVariable) : "",
+    primaryIdentifierVariable: effectivePrimaryIdentifierVariable,
+    participantIdentifierVariable: folderBarcodeVariable || "",
+    terminologyUseLlm: false,
+    instanceName: effectivePrimaryIdentifierVariable ? instanceNameForPrimaryIdentifier(effectivePrimaryIdentifierVariable) : "",
     defaultLanguage: "english",
     questions,
     createdAt: isoStamp(),
@@ -641,10 +1024,68 @@ async function createForm(payload) {
   return { workspaceId, outputDir, draftPath, draft };
 }
 
+async function readFolders() {
+  try {
+    const parsed = JSON.parse(await readFile(foldersPath, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeFolders(folders) {
+  await mkdir(outputRoot, { recursive: true });
+  await writeFile(foldersPath, JSON.stringify(folders, null, 2) + "\n", "utf8");
+}
+
+async function readParticipantRegistry() {
+  try {
+    const parsed = JSON.parse(await readFile(participantRegistryPath, "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeParticipantRegistry(records) {
+  await mkdir(outputRoot, { recursive: true });
+  await writeFile(participantRegistryPath, JSON.stringify(records, null, 2) + "\n", "utf8");
+}
+
+async function createFolder(payload) {
+  const name = String(payload.name || "").trim();
+  if (!name) throw new Error("Folder name is required.");
+  const folders = await readFolders();
+  if (folders.some((folder) => folder.name.toLowerCase() === name.toLowerCase())) {
+    throw new Error("A folder with that name already exists.");
+  }
+  const folder = { id: `${timestampId()}_${slugify(name)}`, name, primaryIdentifierVariable: "", createdAt: isoStamp(), updatedAt: isoStamp() };
+  folders.push(folder);
+  await writeFolders(folders);
+  return { ok: true, folder, folders };
+}
+
+async function deleteFolder(folderId) {
+  const cleanId = String(folderId || "").trim();
+  if (!cleanId) throw new Error("Folder id is required.");
+  const folders = await readFolders();
+  const folder = folders.find((item) => item.id === cleanId);
+  if (!folder) throw new Error("Folder not found.");
+
+  const forms = await listForms();
+  const deletedWorkspaceIds = forms.forms
+    .filter((item) => item.folderId === cleanId)
+    .map((item) => item.workspaceId);
+  for (const workspaceId of deletedWorkspaceIds) await deleteForm(workspaceId);
+
+  await writeFolders(folders.filter((item) => item.id !== cleanId));
+  return { ok: true, deletedFolder: folder, deletedWorkspaceIds, folders: await readFolders() };
+}
+
 async function loadDraft(workspaceId) {
   const { cleanId, outputDir } = await requireWorkspace(workspaceId);
   const draftPath = path.join(outputDir, "drafts", "form.json");
-  const draft = JSON.parse(await readFile(draftPath, "utf8"));
+  const draft = { ...JSON.parse(await readFile(draftPath, "utf8")), terminologyUseLlm: false };
   return { workspaceId: cleanId, outputDir, draftPath, draft, ...(await workspaceMeta(cleanId)) };
 }
 
@@ -658,6 +1099,7 @@ async function findWorkspaceByRespondentCode(value) {
     if (!existsSync(draftPath)) continue;
     try {
       const draft = JSON.parse(await readFile(draftPath, "utf8"));
+      if (draft.collectionLocked) continue;
       const respondentAccessCode = String(draft.respondentAccessCode || draft.publicAccessCode || "").trim().toUpperCase();
       if (respondentAccessCode === code) {
         return {
@@ -690,6 +1132,22 @@ async function generateUniqueRespondentAccessCode(workspaceId) {
   throw new Error("Could not generate a unique respondent form code.");
 }
 
+async function ensureUniqueRespondentAccessCode(code, workspaceId) {
+  const cleanCode = cleanRespondentAccessCode(code);
+  const currentWorkspaceId = cleanWorkspaceId(workspaceId);
+  try {
+    const found = await findWorkspaceByRespondentCode(cleanCode);
+    if (found.workspaceId !== currentWorkspaceId) {
+      const error = new Error("That respondent code is already used by another published form.");
+      error.statusCode = 409;
+      throw error;
+    }
+  } catch (error) {
+    if (error.statusCode !== 404) throw error;
+  }
+  return cleanCode;
+}
+
 async function loadPublicForm(value) {
   const found = await findWorkspaceByRespondentCode(value);
   const meta = await workspaceMeta(found.workspaceId);
@@ -705,6 +1163,45 @@ async function loadPublicForm(value) {
     formId: found.draft?.formId || meta.formId,
     hasXml: meta.hasXml,
     draft: found.draft
+  };
+}
+
+async function listPublicForms() {
+  const all = await listForms();
+  const forms = [];
+  for (const item of all.forms || []) {
+    if (!item.hasXml || !item.respondentAccessCode || item.collectionLocked) continue;
+    const draft = (await loadDraft(item.workspaceId)).draft;
+    const entries = await readEntries(item.workspaceId);
+    forms.push({
+      workspaceId: item.workspaceId,
+      title: item.title,
+      formId: item.formId,
+      respondentAccessCode: item.respondentAccessCode,
+      primaryIdentifierVariable: item.primaryIdentifierVariable,
+      participantIdentifierVariable: item.participantIdentifierVariable || item.primaryIdentifierVariable,
+      entryCount: entries.length,
+      updatedAt: item.updatedAt,
+      publishedAt: item.publishedAt,
+      responseSettings: item.responseSettings,
+      displayFields: dataHeadersForDraft(draft).map((name) => {
+        const question = (draft.questions || []).find((item) => item.name === name);
+        return { name, label: question?.label || name };
+      }),
+      entries
+    });
+  }
+  return { ok: true, forms };
+}
+
+async function loadPublicFormEntries(value) {
+  const found = await findWorkspaceByRespondentCode(value);
+  return {
+    ok: true,
+    accessCode: found.code,
+    workspaceId: found.workspaceId,
+    title: found.draft?.title || found.workspaceId,
+    entries: await readEntries(found.workspaceId)
   };
 }
 
@@ -725,6 +1222,24 @@ async function submitPublicEntry(value, payload) {
   return { ok: true, accessCode: found.code, entry: data.entry };
 }
 
+async function deletePublicEntries(value, payload) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const data = await deleteEntries(found.workspaceId, payload);
+  return { ok: true, accessCode: found.code, ...data };
+}
+
+async function loadPublicCheckpoint(value, payload) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const data = await loadRespondentCheckpoint(found.workspaceId, payload);
+  return { ok: true, accessCode: found.code, ...data };
+}
+
+async function savePublicCheckpoint(value, payload) {
+  const found = await findWorkspaceByRespondentCode(value);
+  const data = await saveRespondentCheckpoint(found.workspaceId, payload);
+  return { ok: true, accessCode: found.code, ...data };
+}
+
 async function submitPublicOdkEntry(value, payload) {
   const found = await findWorkspaceByRespondentCode(value);
   const data = await submitOdkEntry(found.workspaceId, payload);
@@ -742,6 +1257,21 @@ async function loadFormXml(workspaceId) {
     workspaceId: cleanId,
     xmlPath: meta.xmlPath,
     xml: await readFile(meta.xmlPath, "utf8")
+  };
+}
+
+async function loadFormXlsx(workspaceId) {
+  const { cleanId } = await requireWorkspace(workspaceId);
+  const meta = await workspaceMeta(cleanId);
+  if (!meta.xlsxPath || !existsSync(meta.xlsxPath)) {
+    throw new Error("Generated ODK XLS not found for this form.");
+  }
+  return {
+    ok: true,
+    workspaceId: cleanId,
+    xlsxPath: meta.xlsxPath,
+    fileName: path.basename(meta.xlsxPath),
+    data: await readFile(meta.xlsxPath)
   };
 }
 
@@ -1263,6 +1793,10 @@ async function startTerminologyExtraction(workspaceId, options = {}) {
   }
   const draftPath = path.join(outputDir, "drafts", "form.json");
   const resultPath = terminologyResultPath(outputDir);
+  const draft = JSON.parse(await readFile(draftPath, "utf8"));
+  draft.terminologyUseLlm = false;
+  draft.updatedAt = isoStamp();
+  await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
   const questionIds = Array.isArray(options.questionIds)
     ? [...new Set(options.questionIds.map((id) => String(id || "").trim()).filter(Boolean))]
     : [];
@@ -1394,6 +1928,7 @@ async function createFormVersion(workspaceId) {
   delete nextDraft.publishedAt;
   delete nextDraft.respondentAccessCode;
   delete nextDraft.publicAccessCode;
+  delete nextDraft.respondentCodeMode;
   const draftPath = path.join(outputDir, "drafts", "form.json");
   await writeFile(draftPath, JSON.stringify(nextDraft, null, 2) + "\n", "utf8");
   await copyDirIfExists(path.join(loaded.outputDir, "attachments"), path.join(outputDir, "attachments"));
@@ -1417,9 +1952,56 @@ async function createFormVersion(workspaceId) {
   return loadDraft(nextWorkspaceId);
 }
 
+async function updateResponseSettings(workspaceId, payload) {
+  const loaded = await loadDraft(workspaceId);
+  if (!(await workspaceHasPublishedXml(loaded.outputDir))) {
+    throw new Error("Participant identifier settings can be changed after the form is published.");
+  }
+  const responseSettings = normalizeResponseSettings(payload || {});
+  if (responseSettings.participantIdentifierVariable) {
+    const question = (loaded.draft.questions || []).find((item) => item.name === responseSettings.participantIdentifierVariable);
+    if (!question) throw new Error("Choose a participant identifier question that exists in this form.");
+    if (question.name !== loaded.draft.primaryIdentifierVariable && question.type !== "barcode") {
+      throw new Error("Choose the form primary identifier or a barcode question.");
+    }
+  }
+  const draft = {
+    ...loaded.draft,
+    ...responseSettings,
+    updatedAt: isoStamp()
+  };
+  await writeFile(loaded.draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  return { ok: true, workspaceId: loaded.workspaceId, draft, ...(await workspaceMeta(loaded.workspaceId)) };
+}
+
+async function updateCollectionAccess(workspaceId, payload) {
+  const loaded = await loadDraft(workspaceId);
+  const draft = {
+    ...loaded.draft,
+    collectionLocked: Boolean(payload?.collectionLocked),
+    updatedAt: isoStamp()
+  };
+  await writeFile(loaded.draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  return { ok: true, workspaceId: loaded.workspaceId, draft, ...(await workspaceMeta(loaded.workspaceId)) };
+}
+
+async function updateTerminologySettings(workspaceId, payload) {
+  const loaded = await loadDraft(workspaceId);
+  if (await workspaceHasPublishedXml(loaded.outputDir)) {
+    throw new Error("Terminology settings are locked after publishing. Create a new version to change them.");
+  }
+  const draft = {
+    ...loaded.draft,
+    terminologyUseLlm: false,
+    updatedAt: isoStamp()
+  };
+  await writeFile(loaded.draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  return { ok: true, workspaceId: loaded.workspaceId, draft, ...(await workspaceMeta(loaded.workspaceId)) };
+}
+
 async function checkpointForm(payload) {
   const { cleanId: workspaceId, outputDir } = await requireWorkspace(payload.workspaceId);
-  const draft = { ...payload.form, updatedAt: isoStamp() };
+  const draft = { ...payload.form, terminologyUseLlm: false, updatedAt: isoStamp() };
   const draftPath = path.join(outputDir, "drafts", "form.json");
   const checkpointPath = path.join(outputDir, "drafts", "checkpoints", `${timestampId()}.json`);
   const body = JSON.stringify(draft, null, 2) + "\n";
@@ -1430,22 +2012,49 @@ async function checkpointForm(payload) {
 
 async function exportForm(payload) {
   const { cleanId: workspaceId, outputDir } = await requireWorkspace(payload.workspaceId);
-  const draft = { ...payload.form, updatedAt: isoStamp() };
+  let draft = { ...payload.form, terminologyUseLlm: false, updatedAt: isoStamp() };
   const existingMeta = await workspaceMeta(workspaceId);
   const firstPublish = !existingMeta.hasXml;
+  const folderId = String(draft.folderId || "").trim();
+  const folderPrimary = folderId ? await folderPrimaryDetails(folderId) : null;
+  const folder = folderId ? (await readFolders()).find((item) => item.id === folderId) : null;
+  const participantRegistry = folder?.participantIdentifierMode === "barcode" ? await readParticipantRegistry() : [];
+  const isBarcodeAssignmentSource = participantRegistry.some((item) => item.workspaceId === workspaceId);
+  const folderBarcodeModeForForm = folder?.participantIdentifierMode === "barcode" && !isBarcodeAssignmentSource;
+  if (folderPrimary?.variable && draft.primaryIdentifierVariable && draft.primaryIdentifierVariable !== folderPrimary.variable && !folderBarcodeModeForForm) {
+    throw new Error(`Forms in this folder must use the shared primary identifier variable "${folderPrimary.variable}".`);
+  }
+  if (firstPublish && folderId && !folderPrimary?.variable && !draft.primaryIdentifierAcknowledged) {
+    throw new Error("Acknowledge that this primary identifier is common to every form created in this folder.");
+  }
   if (!existingMeta.hasXml && draft.previousVersionWorkspaceId && !formHasVersionChanges(draft)) {
     throw new Error("Edit at least one Build item before publishing a new version.");
   }
   if (draft.previousVersionWorkspaceId) {
     draft.versionChangeSummary = describeVersionChanges(draft);
   }
+  if (folderBarcodeModeForForm) {
+    const barcodeQuestion = (draft.questions || []).find((item) => item?.type === "barcode" && String(item.name || "").trim());
+    if (!barcodeQuestion) {
+      throw new Error("This folder now uses assigned participant barcodes. Add a Barcode question before publishing this form.");
+    }
+    draft.primaryIdentifierVariable = barcodeQuestion.name;
+    draft.participantIdentifierVariable = barcodeQuestion.name;
+  }
   if (draft.primaryIdentifierVariable) {
     const identifierIssue = primaryIdentifierProblem(draft.questions || [], draft.primaryIdentifierVariable);
     if (identifierIssue) throw new Error(identifierIssue);
     draft.instanceName = instanceNameForPrimaryIdentifier(draft.primaryIdentifierVariable);
   }
+  if (!draft.participantIdentifierVariable) {
+    draft.participantIdentifierVariable = draft.primaryIdentifierVariable || "";
+  }
+  delete draft.primaryIdentifierAcknowledged;
+  const requestedRespondentAccessCode = draft.respondentAccessCode || draft.publicAccessCode || "";
   const respondentAccessCode = firstPublish
-    ? draft.respondentAccessCode || draft.publicAccessCode || await generateUniqueRespondentAccessCode(workspaceId)
+    ? requestedRespondentAccessCode
+      ? await ensureUniqueRespondentAccessCode(requestedRespondentAccessCode, workspaceId)
+      : await generateUniqueRespondentAccessCode(workspaceId)
     : draft.respondentAccessCode || draft.publicAccessCode || null;
   if (firstPublish) {
     delete draft.respondentAccessCode;
@@ -1484,7 +2093,14 @@ async function exportForm(payload) {
     xmlOk = existsSync(xmlPath);
   }
   if (firstPublish && xmlOk) {
+    if (folderId && draft.primaryIdentifierVariable) {
+      await claimFolderPrimaryIdentifier(folderId, draft.primaryIdentifierVariable);
+    }
+    if (draft.metaFormLink?.fileName && draft.primaryIdentifierVariable) {
+      await claimMetaFormPrimary(draft.metaFormLink.fileName, draft.primaryIdentifierVariable);
+    }
     draft.respondentAccessCode = respondentAccessCode;
+    draft.respondentCodeMode = draft.respondentCodeMode === "custom" ? "custom" : "random";
     draft.publishedAt = draft.publishedAt || isoStamp();
     await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
   }
@@ -1553,6 +2169,20 @@ function normalizeMetaFormLink(payload) {
 async function existingMetaFormPrimary(fileName) {
   const cleanName = String(fileName || "").trim();
   if (!cleanName) return null;
+  const persistedPrimaries = await readMetaFormPrimaries();
+  const persistedVariable = String(persistedPrimaries[cleanName] || "").trim();
+  if (persistedVariable) {
+    const forms = await listForms();
+    const source = forms.forms.find((item) => item.metaFormLink?.fileName === cleanName && item.primaryIdentifierVariable === persistedVariable);
+    let question = null;
+    if (source) {
+      try {
+        const loaded = await loadDraft(source.workspaceId);
+        question = (loaded.draft.questions || []).find((item) => item.name === persistedVariable) || null;
+      } catch {}
+    }
+    return { variable: persistedVariable, question };
+  }
   await mkdir(outputRoot, { recursive: true });
   let names = [];
   try {
@@ -1564,6 +2194,11 @@ async function existingMetaFormPrimary(fileName) {
     try {
       const draft = JSON.parse(await readFile(draftPath, "utf8"));
       if (draft?.metaFormLink?.fileName !== cleanName) continue;
+      let published = false;
+      try {
+        published = (await readdir(path.join(outputRoot, name, "xml"))).some((entry) => entry.endsWith(".xml"));
+      } catch {}
+      if (!published) continue;
       const variable = String(draft.primaryIdentifierVariable || "").trim();
       if (!variable) continue;
       const question = (draft.questions || []).find((item) => item.name === variable) || null;
@@ -1663,6 +2298,9 @@ async function importXlsx(payload) {
   const draft = JSON.parse(await readFile(draftPath, "utf8"));
   const metaFormLink = normalizeMetaFormLink(payload);
   const linkedPrimary = metaFormLink ? await existingMetaFormPrimary(metaFormLink.fileName) : null;
+  const folderId = String(payload.folderId || "").trim() || null;
+  const folderPrimary = folderId ? await folderPrimaryDetails(folderId) : null;
+  const folderRecord = folderId ? (await readFolders()).find((item) => item.id === folderId) : null;
   if (metaFormLink) {
     if (!metaFormLink.formIndex) throw new Error("Choose which form in the linked MetaForm this XLSForm represents.");
     if (!payload.primaryIdentifierAcknowledged) {
@@ -1670,22 +2308,50 @@ async function importXlsx(payload) {
     }
   }
   const variableNames = new Set((draft.questions || []).map((question) => question.name).filter(Boolean));
-  const primaryIdentifierVariable = String(linkedPrimary?.variable || payload.primaryIdentifierVariable || "").trim();
+  const requestedPrimaryIdentifier = String(payload.primaryIdentifierVariable || "").trim();
+  const folderBarcodeVariable = folderRecord?.participantIdentifierMode === "barcode"
+    ? String(folderRecord.participantIdentifierVariable || DEFAULT_FOLDER_BARCODE_VARIABLE).trim()
+    : "";
+  if (folderPrimary?.variable && requestedPrimaryIdentifier && requestedPrimaryIdentifier !== folderPrimary.variable && !folderBarcodeVariable) {
+    throw new Error(`Forms in this folder must use the shared primary identifier variable "${folderPrimary.variable}".`);
+  }
+  if (folderId && !folderPrimary?.variable && !folderBarcodeVariable && !payload.primaryIdentifierAcknowledged) {
+    throw new Error("Acknowledge that this primary identifier is common to every form created in this folder.");
+  }
+  const primaryIdentifierVariable = String(folderBarcodeVariable || linkedPrimary?.variable || folderPrimary?.variable || requestedPrimaryIdentifier || "").trim();
   if (!primaryIdentifierVariable) throw new Error("Choose the primary identifier variable for this XLSForm.");
   if (!variableNames.has(primaryIdentifierVariable)) {
-    if (linkedPrimary && payload.addMissingPrimaryIdentifier) {
-      draft.questions = [copiedPrimaryQuestion(linkedPrimary.question, primaryIdentifierVariable), ...(draft.questions || [])];
+    if (folderBarcodeVariable) {
+      draft.questions = [sharedBarcodeQuestion(folderBarcodeVariable), ...(draft.questions || [])];
+      variableNames.add(folderBarcodeVariable);
+    } else if ((linkedPrimary || folderPrimary) && payload.addMissingPrimaryIdentifier) {
+      draft.questions = [copiedPrimaryQuestion(linkedPrimary?.question || folderPrimary?.question, primaryIdentifierVariable), ...(draft.questions || [])];
       variableNames.add(primaryIdentifierVariable);
     } else {
       throw new Error(`Primary identifier variable "${primaryIdentifierVariable}" is not present in the XLSForm survey name column.`);
     }
   }
+  if (folderBarcodeVariable && !variableNames.has(folderBarcodeVariable)) {
+    draft.questions = [
+      ...(draft.questions || []).slice(0, 1),
+      sharedBarcodeQuestion(folderBarcodeVariable),
+      ...(draft.questions || []).slice(1)
+    ];
+    variableNames.add(folderBarcodeVariable);
+  }
+  if (folderBarcodeVariable) {
+    draft.questions = (draft.questions || []).filter((question) => question.name !== primaryIdentifierVariable || question.name === folderBarcodeVariable);
+  }
+  const effectivePrimaryIdentifierVariable = folderBarcodeVariable || primaryIdentifierVariable;
 	  const updatedDraft = {
 	    ...draft,
 		    importedFrom: originalName,
-		    metaFormLink,
-		    primaryIdentifierVariable,
-		    instanceName: instanceNameForPrimaryIdentifier(primaryIdentifierVariable),
+	    metaFormLink,
+	    folderId,
+	    primaryIdentifierVariable: effectivePrimaryIdentifierVariable,
+	    participantIdentifierVariable: folderBarcodeVariable || "",
+	    terminologyUseLlm: false,
+	    instanceName: instanceNameForPrimaryIdentifier(primaryIdentifierVariable),
 		    versionNumber: 1,
 	    versionBaseId,
 	    createdAt: isoStamp(),
@@ -1760,6 +2426,96 @@ async function readEntries(workspaceId) {
     .map((line) => JSON.parse(line));
 }
 
+function cleanCheckpointIdentifier(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    const error = new Error("Enter the primary identifier value for this form.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return text;
+}
+
+function checkpointIdentifierKey(value) {
+  return cleanCheckpointIdentifier(value).toLowerCase();
+}
+
+async function readRespondentCheckpoints(workspaceId) {
+  const { outputDir } = await requireWorkspace(workspaceId);
+  const checkpointsPath = path.join(outputDir, "data", "checkpoints.jsonl");
+  if (!existsSync(checkpointsPath)) return [];
+  const text = await readFile(checkpointsPath, "utf8");
+  return text
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function writeRespondentCheckpoints(workspaceId, checkpoints) {
+  const { outputDir } = await requireWorkspace(workspaceId);
+  const checkpointsPath = path.join(outputDir, "data", "checkpoints.jsonl");
+  await mkdir(path.dirname(checkpointsPath), { recursive: true });
+  await writeFile(checkpointsPath, checkpoints.map((item) => JSON.stringify(item)).join("\n") + (checkpoints.length ? "\n" : ""), "utf8");
+  return checkpointsPath;
+}
+
+async function loadRespondentCheckpoint(workspaceId, payload) {
+  const loaded = await loadDraft(workspaceId);
+  const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
+  if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
+  const primaryIdentifierValue = cleanCheckpointIdentifier(payload.primaryIdentifierValue);
+  const key = checkpointIdentifierKey(primaryIdentifierValue);
+  const checkpoints = await readRespondentCheckpoints(workspaceId);
+  const checkpoint = checkpoints.find((item) => item.primaryIdentifierKey === key) || null;
+  return {
+    workspaceId,
+    primaryIdentifierVariable,
+    primaryIdentifierValue,
+    checkpoint
+  };
+}
+
+async function deleteRespondentCheckpoint(workspaceId, primaryIdentifierValue) {
+  if (!String(primaryIdentifierValue || "").trim()) return null;
+  const key = checkpointIdentifierKey(primaryIdentifierValue);
+  const checkpoints = await readRespondentCheckpoints(workspaceId);
+  const next = checkpoints.filter((item) => item.primaryIdentifierKey !== key);
+  if (next.length === checkpoints.length) return null;
+  return writeRespondentCheckpoints(workspaceId, next);
+}
+
+async function saveRespondentCheckpoint(workspaceId, payload) {
+  const loaded = await loadDraft(workspaceId);
+  const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
+  if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
+  const answers = payload.answers && typeof payload.answers === "object" ? payload.answers : {};
+  const primaryIdentifierValue = cleanCheckpointIdentifier(
+    payload.primaryIdentifierValue || answers[primaryIdentifierVariable]
+  );
+  const now = isoStamp();
+  const key = checkpointIdentifierKey(primaryIdentifierValue);
+  const checkpoints = await readRespondentCheckpoints(workspaceId);
+  const previous = checkpoints.find((item) => item.primaryIdentifierKey === key);
+  const checkpoint = {
+    id: previous?.id || `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
+    workspaceId,
+    primaryIdentifierVariable,
+    primaryIdentifierValue,
+    primaryIdentifierKey: key,
+    savedAt: now,
+    answers: {
+      ...answers,
+      [primaryIdentifierVariable]: primaryIdentifierValue
+    }
+  };
+  const next = [
+    ...checkpoints.filter((item) => item.primaryIdentifierKey !== key),
+    checkpoint
+  ];
+  const checkpointsPath = await writeRespondentCheckpoints(workspaceId, next);
+  return { workspaceId, primaryIdentifierVariable, primaryIdentifierValue, checkpoint, checkpointsPath };
+}
+
 async function saveEntriesCsv(workspaceId, draft, entries) {
   const { outputDir } = await requireWorkspace(workspaceId);
   const csvPath = path.join(outputDir, "data", `${slugify(draft.formId || draft.title)}_entries.csv`);
@@ -1809,6 +2565,177 @@ function primaryIdentifierForDraft(draft) {
   return String(draft?.primaryIdentifierVariable || "").trim();
 }
 
+function participantIdentifierForDraft(draft) {
+  return String(draft?.participantIdentifierVariable || draft?.primaryIdentifierVariable || "").trim();
+}
+
+function repeatAnswerValue(answers = {}, name, repeatIndex) {
+  const indexed = answers[`${name}__repeat_${repeatIndex}`];
+  if (indexed !== undefined && indexed !== null) return indexed;
+  const values = answers[name];
+  if (Array.isArray(values)) return values[repeatIndex - 1] ?? "";
+  return repeatIndex === 1 ? values ?? "" : "";
+}
+
+function demographicParticipantRows(draft = {}, entries = [], registry = []) {
+  const questions = draft.questions || [];
+  const definitions = [];
+  for (let index = 0; index < questions.length; index += 1) {
+    const repeat = questions[index];
+    if (repeat.type !== "begin_repeat" || !repeat.demographicData) continue;
+    const endIndex = findRepeatEndForServer(questions, index);
+    const children = questions.slice(index + 1, endIndex).filter((question) => question.name);
+    const generatedQuestion = children.find((question) => question.demographicGeneratedId) || null;
+    definitions.push({ repeat, children, generatedQuestion });
+    index = endIndex;
+  }
+  const rows = [];
+  for (const entry of entries) {
+    for (const definition of definitions) {
+      const observedCount = definition.children.reduce((max, question) => {
+        const values = entry.answers?.[question.name];
+        const indexed = Object.keys(entry.answers || {})
+          .map((key) => key.match(new RegExp(`^${escapeRegExpServer(question.name)}__repeat_(\\d+)$`))?.[1])
+          .filter(Boolean)
+          .map(Number);
+        return Math.max(max, Array.isArray(values) ? values.length : 0, ...indexed);
+      }, 0);
+      const configuredCount = /^\d+$/.test(String(definition.repeat.repeatCount || "").trim())
+        ? Number(definition.repeat.repeatCount)
+        : 0;
+      const count = Math.max(1, observedCount, configuredCount);
+      for (let repeatIndex = 1; repeatIndex <= count; repeatIndex += 1) {
+        const id = `${entry.id}:${definition.repeat.name || "repeat"}:${repeatIndex}`;
+        const assignment = registry.find((item) => item.id === id);
+        rows.push({
+          id,
+          entryId: entry.id,
+          submittedAt: entry.submittedAt,
+          repeatName: definition.repeat.name || "repeat",
+          repeatLabel: definition.repeat.label || definition.repeat.name || "Demographic member",
+          repeatIndex,
+          householdIdentifier: String(entryValue(entry.answers?.[draft.primaryIdentifierVariable]) || "").trim(),
+          memberIdentifier: definition.generatedQuestion
+            ? String(entryValue(repeatAnswerValue(entry.answers || {}, definition.generatedQuestion.name, repeatIndex)) || "").trim()
+            : "",
+          displayAnswers: Object.fromEntries(definition.children.map((question) => [
+            question.name,
+            repeatAnswerValue(entry.answers || {}, question.name, repeatIndex)
+          ])),
+          barcode: assignment?.barcode || "",
+          assignedAt: assignment?.assignedAt || null
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+function escapeRegExpServer(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findRepeatEndForServer(questions, startIndex) {
+  let depth = 0;
+  for (let index = startIndex; index < questions.length; index += 1) {
+    if (questions[index]?.type === "begin_repeat") depth += 1;
+    if (questions[index]?.type === "end_repeat") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return questions.length;
+}
+
+async function listParticipantAssignments(workspaceId) {
+  const loaded = await loadDraft(workspaceId);
+  const entries = await readEntries(workspaceId);
+  const registry = await readParticipantRegistry();
+  const options = [];
+  const questions = loaded.draft.questions || [];
+  for (let index = 0; index < questions.length; index += 1) {
+    if (questions[index]?.type !== "begin_repeat" || !questions[index]?.demographicData) continue;
+    const endIndex = findRepeatEndForServer(questions, index);
+    for (const question of questions.slice(index + 1, endIndex)) {
+      if (question?.name && !structuralQuestionTypes.has(question.type) && !options.some((option) => option.name === question.name)) {
+        options.push({ name: question.name, label: question.label || question.name });
+      }
+    }
+    index = endIndex;
+  }
+  return {
+    ok: true,
+    workspaceId: loaded.workspaceId,
+    rows: demographicParticipantRows(loaded.draft, entries, registry),
+    options
+  };
+}
+
+async function activateFolderBarcodeParticipantIdentifier(workspaceId, payload = {}) {
+  const loaded = await loadDraft(workspaceId);
+  const folderId = String(loaded.draft.folderId || "").trim();
+  if (!folderId) throw new Error("This demographic form is not part of a folder.");
+  const folderForms = (await listForms()).forms.filter((item) => item.folderId === folderId);
+  const sourceWorkspaceIds = new Set(folderForms.map((item) => item.workspaceId));
+  const registry = await readParticipantRegistry();
+  if (!registry.some((item) => sourceWorkspaceIds.has(item.workspaceId))) {
+    throw new Error("Assign at least one participant barcode before changing the participant identifier.");
+  }
+  const variable = String(payload.participantIdentifierVariable || "").trim();
+  await enableFolderBarcodeParticipantMode(folderId, variable);
+  return {
+    ok: true,
+    folderId,
+    participantIdentifierVariable: (await readFolders()).find((folder) => folder.id === folderId)?.participantIdentifierVariable || DEFAULT_FOLDER_BARCODE_VARIABLE,
+    rows: demographicParticipantRows(loaded.draft, await readEntries(workspaceId), registry)
+  };
+}
+
+async function assignParticipantBarcode(workspaceId, payload) {
+  const loaded = await loadDraft(workspaceId);
+  const entryId = String(payload?.entryId || "").trim();
+  const repeatName = String(payload?.repeatName || "").trim();
+  const repeatIndex = Number(payload?.repeatIndex);
+  const barcode = String(payload?.barcode || "").trim();
+  if (!entryId || !repeatName || !Number.isInteger(repeatIndex) || repeatIndex < 1) throw new Error("Choose a demographic participant before assigning a barcode.");
+  if (!barcode) throw new Error("Scan or enter a barcode before assigning it.");
+  const rows = demographicParticipantRows(loaded.draft, await readEntries(workspaceId), await readParticipantRegistry());
+  const row = rows.find((item) => item.entryId === entryId && item.repeatName === repeatName && item.repeatIndex === repeatIndex);
+  if (!row) throw new Error("That demographic participant could not be found.");
+  const registry = await readParticipantRegistry();
+  const duplicate = registry.find((item) => item.barcode.toLowerCase() === barcode.toLowerCase() && item.id !== row.id);
+  if (duplicate) throw new Error(`Barcode ${barcode} is already assigned to another participant.`);
+  const record = {
+    id: row.id,
+    barcode,
+    workspaceId: loaded.workspaceId,
+    formId: loaded.draft.formId || loaded.draft.title || loaded.workspaceId,
+    entryId,
+    repeatName,
+    repeatIndex,
+    householdIdentifier: row.householdIdentifier,
+    memberIdentifier: row.memberIdentifier,
+    assignedAt: isoStamp()
+  };
+  const next = [...registry.filter((item) => item.id !== row.id), record];
+  await writeParticipantRegistry(next);
+  return { ok: true, assignment: record, rows: demographicParticipantRows(loaded.draft, await readEntries(workspaceId), next) };
+}
+
+async function assertAssignedParticipantBarcode(draft, barcode) {
+  if (String(draft?.participantIdentifierVariable || "").trim()) {
+    const question = (draft.questions || []).find((item) => item.name === draft.participantIdentifierVariable);
+    if (question?.type === "barcode") {
+      const records = await readParticipantRegistry();
+      if (!records.some((item) => String(item.barcode || "").toLowerCase() === String(barcode || "").trim().toLowerCase())) {
+        const error = new Error("This barcode has not been assigned to an eligible participant yet.");
+        error.statusCode = 409;
+        throw error;
+      }
+    }
+  }
+}
+
 function mapperHeadersForDraft(draft) {
   return dataHeadersForDraft(draft);
 }
@@ -1844,22 +2771,127 @@ async function saveMapperCsv(workspaceId, draft, entries) {
   };
 }
 
+function primaryIdentifierEntryKey(draft, answers = {}) {
+  const primaryIdentifierVariable = participantIdentifierForDraft(draft);
+  if (!primaryIdentifierVariable) return "";
+  return String(entryValue(answers?.[primaryIdentifierVariable]) || "").trim().toLowerCase();
+}
+
+async function assertEntryMutationAllowed(draft, entries, answers, entryId = "") {
+  const settings = normalizeResponseSettings(draft);
+  const requestedEntryId = String(entryId || "").trim();
+  if (requestedEntryId && !settings.allowResponseEdits) {
+    const error = new Error("Responses cannot be changed after submission for this form.");
+    error.statusCode = 403;
+    throw error;
+  }
+  const primaryIdentifierVariable = participantIdentifierForDraft(draft);
+  const primaryKey = primaryIdentifierEntryKey(draft, answers);
+  const participantQuestion = (draft.questions || []).find((item) => item.name === primaryIdentifierVariable);
+  if (participantQuestion?.type === "barcode" && !primaryKey) {
+    const error = new Error(`Enter the barcode in ${primaryIdentifierVariable} before submitting.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  await assertAssignedParticipantBarcode(draft, primaryKey);
+  if (settings.limitOneResponsePerIdentifier && primaryIdentifierVariable && primaryKey) {
+    const duplicate = entries.find((entry) =>
+      String(entry.id || "") !== requestedEntryId &&
+      primaryIdentifierEntryKey(draft, entry.answers || {}) === primaryKey
+    );
+    if (duplicate) {
+      const error = new Error(`One ${primaryIdentifierVariable} can submit only one response for this form.`);
+      error.statusCode = 409;
+      throw error;
+    }
+  }
+}
+
+async function writeEntries(workspaceId, draft, entries) {
+  const { outputDir } = await requireWorkspace(workspaceId);
+  const entriesPath = path.join(outputDir, "data", "entries.jsonl");
+  await mkdir(path.dirname(entriesPath), { recursive: true });
+  await writeFile(entriesPath, entries.map((item) => JSON.stringify(item)).join("\n") + (entries.length ? "\n" : ""), "utf8");
+  const csvPath = await saveEntriesCsv(workspaceId, draft, entries);
+  return { entriesPath, csvPath };
+}
+
+async function deleteEntries(workspaceId, payload) {
+  const loaded = await loadDraft(workspaceId);
+  const ids = new Set((Array.isArray(payload?.entryIds) ? payload.entryIds : [payload?.entryId])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean));
+  if (!ids.size) {
+    const error = new Error("Choose at least one entry to delete.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const existing = await readEntries(workspaceId);
+  const entries = existing.filter((entry) => !ids.has(String(entry.id || "")));
+  if (entries.length === existing.length) {
+    const error = new Error("No matching entries were found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const { outputDir } = await requireWorkspace(workspaceId);
+  for (const id of ids) {
+    const instancePath = path.join(outputDir, "data", `${id}.xml`);
+    if (existsSync(instancePath)) {
+      await rm(instancePath, { force: true });
+    }
+  }
+  const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
+  return {
+    ok: true,
+    workspaceId: loaded.workspaceId,
+    deletedCount: existing.length - entries.length,
+    entries,
+    entriesPath,
+    csvPath
+  };
+}
+
 async function submitEntry(workspaceId, payload) {
   const loaded = await loadDraft(workspaceId);
-  const outputDir = loaded.outputDir;
   const submittedAt = isoStamp();
   const answers = payload.answers || {};
+  const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
+  const existing = await readEntries(workspaceId);
+  const requestedEntryId = String(payload.entryId || "").trim();
+  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
+  if (requestedEntryId) {
+    const index = existing.findIndex((item) => String(item.id || "") === requestedEntryId);
+    if (index < 0) {
+      const error = new Error("Entry not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const updatedAt = isoStamp();
+    const entry = {
+      ...existing[index],
+      updatedAt,
+      instanceName: entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt),
+      answers
+    };
+    const entries = [...existing];
+    entries[index] = entry;
+    const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
+    if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
+      await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable]);
+    }
+    return { ok: true, workspaceId, entry, entries, entriesPath, csvPath, updated: true };
+  }
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     submittedAt,
     instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
     answers
   };
-  const entriesPath = path.join(outputDir, "data", "entries.jsonl");
-  const existing = await readEntries(workspaceId);
   const entries = [...existing, entry];
-  await writeFile(entriesPath, entries.map((item) => JSON.stringify(item)).join("\n") + "\n", "utf8");
-  const csvPath = await saveEntriesCsv(workspaceId, loaded.draft, entries);
+  const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
+  if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
+    await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable]);
+  }
   return { ok: true, workspaceId, entry, entries, entriesPath, csvPath };
 }
 
@@ -1870,6 +2902,33 @@ async function submitOdkEntry(workspaceId, payload) {
   if (!instanceXml) throw new Error("ODK submission XML is required.");
   const submittedAt = isoStamp();
   const answers = extractSimpleAnswersFromXml(instanceXml);
+  const existing = await readEntries(workspaceId);
+  const requestedEntryId = String(payload.entryId || "").trim();
+  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
+  if (requestedEntryId) {
+    const index = existing.findIndex((item) => String(item.id || "") === requestedEntryId);
+    if (index < 0) {
+      const error = new Error("Entry not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const entry = {
+      ...existing[index],
+      updatedAt: isoStamp(),
+      source: "odk-web-forms",
+      payloadType: payload?.payloadType || "monolithic",
+      submissionMeta: payload?.submissionMeta || null,
+      instanceXml,
+      answers,
+      instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt)
+    };
+    const entries = [...existing];
+    entries[index] = entry;
+    const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
+    const instancePath = path.join(outputDir, "data", `${entry.id}.xml`);
+    await writeFile(instancePath, instanceXml + "\n", "utf8");
+    return { ok: true, workspaceId, entry, entries, entriesPath, instancePath, csvPath, updated: true };
+  }
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     submittedAt,
@@ -1880,13 +2939,10 @@ async function submitOdkEntry(workspaceId, payload) {
     answers,
     instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, submittedAt)
   };
-  const entriesPath = path.join(outputDir, "data", "entries.jsonl");
-  const existing = await readEntries(workspaceId);
   const entries = [...existing, entry];
-  await writeFile(entriesPath, entries.map((item) => JSON.stringify(item)).join("\n") + "\n", "utf8");
+  const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
   const instancePath = path.join(outputDir, "data", `${entry.id}.xml`);
   await writeFile(instancePath, instanceXml + "\n", "utf8");
-  const csvPath = await saveEntriesCsv(workspaceId, loaded.draft, entries);
   return { ok: true, workspaceId, entry, entries, entriesPath, instancePath, csvPath };
 }
 
@@ -2032,12 +3088,14 @@ async function workspaceMeta(workspaceId) {
   if (draft && !xmlFiles.length && (draft.respondentAccessCode || draft.publicAccessCode || draft.publishedAt)) {
     delete draft.respondentAccessCode;
     delete draft.publicAccessCode;
+    delete draft.respondentCodeMode;
     delete draft.publishedAt;
     draft.updatedAt = isoStamp();
     await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
   }
   if (draft && xmlFiles.length && !draft.respondentAccessCode && !draft.publicAccessCode) {
     draft.respondentAccessCode = await generateUniqueRespondentAccessCode(cleanId);
+    draft.respondentCodeMode = draft.respondentCodeMode === "custom" ? "custom" : "random";
     draft.publishedAt = draft.publishedAt || isoStamp();
     draft.updatedAt = draft.updatedAt || isoStamp();
     await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
@@ -2089,7 +3147,17 @@ async function workspaceMeta(workspaceId) {
     updatedAt: draft?.updatedAt || mtime.toISOString(),
     importedFrom: draft?.importedFrom || null,
     metaFormLink: draft?.metaFormLink || null,
+    folderId: draft?.folderId || null,
     primaryIdentifierVariable: draft?.primaryIdentifierVariable || null,
+    participantIdentifierVariable: draft?.participantIdentifierVariable || draft?.primaryIdentifierVariable || null,
+    folderPrimaryIdentifierVariable: draft?.folderId
+      ? (String((await readFolders()).find((folder) => folder.id === draft.folderId)?.primaryIdentifierVariable || "").trim() || null)
+      : null,
+    folderParticipantIdentifierVariable: draft?.folderId
+      ? (String((await readFolders()).find((folder) => folder.id === draft.folderId)?.participantIdentifierVariable || "").trim() || null)
+      : null,
+    responseSettings: normalizeResponseSettings(draft || {}),
+    collectionLocked: Boolean(draft?.collectionLocked),
     buildFinishedAt: draft?.buildFinishedAt || null,
     publishedAt: draft?.publishedAt || null,
     respondentAccessCode: draft?.respondentAccessCode || draft?.publicAccessCode || null,
@@ -2122,7 +3190,15 @@ async function deleteForm(workspaceId) {
   if (!existsSync(path.join(outputDir, "drafts", "form.json"))) {
     throw new Error("Refusing to delete this folder because it does not look like a form workspace.");
   }
+  let draft = null;
+  try {
+    draft = JSON.parse(await readFile(path.join(outputDir, "drafts", "form.json"), "utf8"));
+  } catch {}
   await rm(outputDir, { recursive: true, force: false });
+  const registry = await readParticipantRegistry();
+  const remainingRegistry = registry.filter((item) => item.workspaceId !== cleanId);
+  if (remainingRegistry.length !== registry.length) await writeParticipantRegistry(remainingRegistry);
+  await releaseSharedIdentifiersForForm(draft);
   return { ok: true, workspaceId: cleanId, deletedPath: outputDir };
 }
 
@@ -2143,8 +3219,12 @@ const server = createServer(async (req, res) => {
     const publicFormMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)$/);
     const publicXmlMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/xml$/);
     const publicEntriesMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries$/);
+    const publicCheckpointMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/checkpoint$/);
     const publicOdkSubmissionMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/odk-submissions$/);
     const publicAttachmentFileMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments\/([^/]+)$/);
+    if (req.method === "GET" && pathname === "/api/public/forms") {
+      return jsonResponse(res, 200, await listPublicForms());
+    }
     if (req.method === "GET" && publicFormMatch) {
       return jsonResponse(res, 200, await loadPublicForm(decodeURIComponent(publicFormMatch[1])));
     }
@@ -2158,12 +3238,44 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && publicEntriesMatch) {
       return jsonResponse(res, 200, await submitPublicEntry(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
     }
+    if (req.method === "GET" && publicEntriesMatch) {
+      return jsonResponse(res, 200, await loadPublicFormEntries(decodeURIComponent(publicEntriesMatch[1])));
+    }
+    if (req.method === "DELETE" && publicEntriesMatch) {
+      return jsonResponse(res, 200, await deletePublicEntries(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
+    }
+    if (req.method === "POST" && publicCheckpointMatch) {
+      return jsonResponse(res, 200, await savePublicCheckpoint(decodeURIComponent(publicCheckpointMatch[1]), await requestBody(req)));
+    }
+    if (req.method === "PUT" && publicCheckpointMatch) {
+      return jsonResponse(res, 200, await loadPublicCheckpoint(decodeURIComponent(publicCheckpointMatch[1]), await requestBody(req)));
+    }
     if (req.method === "POST" && publicOdkSubmissionMatch) {
       return jsonResponse(res, 200, await submitPublicOdkEntry(decodeURIComponent(publicOdkSubmissionMatch[1]), await requestBody(req)));
     }
     assertAdmin(req);
     if (req.method === "GET" && pathname === "/api/forms") {
       return jsonResponse(res, 200, await listForms());
+    }
+    if (req.method === "GET" && pathname === "/api/folders") {
+      return jsonResponse(res, 200, { ok: true, folders: await readFolders() });
+    }
+    if (req.method === "POST" && pathname === "/api/folders") {
+      return jsonResponse(res, 200, await createFolder(await requestBody(req)));
+    }
+    const folderExportMatch = pathname.match(/^\/api\/folders\/([^/]+)\/responses\.xlsx$/);
+    if (req.method === "GET" && folderExportMatch) {
+      const workbook = await exportFolderResponses(decodeURIComponent(folderExportMatch[1]));
+      res.writeHead(200, {
+        "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "content-disposition": `attachment; filename="${workbook.fileName.replace(/"/g, "")}"`,
+        ...corsHeaders
+      });
+      return res.end(workbook.data);
+    }
+    const folderMatch = pathname.match(/^\/api\/folders\/([^/]+)$/);
+    if (req.method === "DELETE" && folderMatch) {
+      return jsonResponse(res, 200, await deleteFolder(decodeURIComponent(folderMatch[1])));
     }
     if (req.method === "GET" && pathname === "/api/schema-documents") {
       return jsonResponse(res, 200, await listSchemaDocuments());
@@ -2196,11 +3308,18 @@ const server = createServer(async (req, res) => {
     }
     const formMatch = pathname.match(/^\/api\/forms\/([^/]+)$/);
     const entriesMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries$/);
+    const participantsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants$/);
+    const participantAssignMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants\/assign$/);
+    const participantActivateMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants\/activate$/);
     const fhirMatch = pathname.match(/^\/api\/forms\/([^/]+)\/fhir$/);
+    const responseSettingsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/response-settings$/);
+    const accessMatch = pathname.match(/^\/api\/forms\/([^/]+)\/collection-access$/);
+    const terminologySettingsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/terminology-settings$/);
     const terminologyMatch = pathname.match(/^\/api\/forms\/([^/]+)\/terminology$/);
 	    const terminologyReviewMatch = pathname.match(/^\/api\/forms\/([^/]+)\/terminology\/review$/);
 	    const versionMatch = pathname.match(/^\/api\/forms\/([^/]+)\/versions$/);
 	    const xmlMatch = pathname.match(/^\/api\/forms\/([^/]+)\/xml$/);
+	    const xlsxMatch = pathname.match(/^\/api\/forms\/([^/]+)\/xlsx$/);
     const attachmentsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/attachments$/);
     const attachmentFileMatch = pathname.match(/^\/api\/forms\/([^/]+)\/attachments\/([^/]+)$/);
     const odkSubmissionMatch = pathname.match(/^\/api\/forms\/([^/]+)\/odk-submissions$/);
@@ -2214,14 +3333,41 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && entriesMatch) {
       return jsonResponse(res, 200, { ok: true, entries: await readEntries(decodeURIComponent(entriesMatch[1])) });
     }
+    if (req.method === "GET" && participantsMatch) {
+      return jsonResponse(res, 200, await listParticipantAssignments(decodeURIComponent(participantsMatch[1])));
+    }
+    if (req.method === "POST" && participantAssignMatch) {
+      return jsonResponse(res, 200, await assignParticipantBarcode(decodeURIComponent(participantAssignMatch[1]), await requestBody(req)));
+    }
+    if (req.method === "POST" && participantActivateMatch) {
+      return jsonResponse(res, 200, await activateFolderBarcodeParticipantIdentifier(decodeURIComponent(participantActivateMatch[1]), await requestBody(req)));
+    }
     if (req.method === "GET" && fhirMatch) {
       return jsonResponse(res, 200, { ok: true, fhirBundles: await listFhirBundles(decodeURIComponent(fhirMatch[1])) });
+    }
+    if (req.method === "PUT" && responseSettingsMatch) {
+      return jsonResponse(res, 200, await updateResponseSettings(decodeURIComponent(responseSettingsMatch[1]), await requestBody(req)));
+    }
+    if (req.method === "PUT" && accessMatch) {
+      return jsonResponse(res, 200, await updateCollectionAccess(decodeURIComponent(accessMatch[1]), await requestBody(req)));
+    }
+    if (req.method === "PUT" && terminologySettingsMatch) {
+      return jsonResponse(res, 200, await updateTerminologySettings(decodeURIComponent(terminologySettingsMatch[1]), await requestBody(req)));
     }
     if (req.method === "GET" && terminologyMatch) {
       return jsonResponse(res, 200, await loadTerminology(decodeURIComponent(terminologyMatch[1])));
     }
     if (req.method === "GET" && xmlMatch) {
       return jsonResponse(res, 200, await loadFormXml(decodeURIComponent(xmlMatch[1])));
+    }
+    if (req.method === "GET" && xlsxMatch) {
+      const xlsx = await loadFormXlsx(decodeURIComponent(xlsxMatch[1]));
+      res.writeHead(200, {
+        "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "content-disposition": `attachment; filename="${xlsx.fileName.replace(/"/g, "")}"`,
+        ...corsHeaders
+      });
+      return res.end(xlsx.data);
     }
     if (req.method === "GET" && attachmentsMatch) {
       return jsonResponse(res, 200, await listAttachments(decodeURIComponent(attachmentsMatch[1])));
@@ -2232,6 +3378,9 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && entriesMatch) {
       return jsonResponse(res, 200, await submitEntry(decodeURIComponent(entriesMatch[1]), await requestBody(req)));
+    }
+    if (req.method === "DELETE" && entriesMatch) {
+      return jsonResponse(res, 200, await deleteEntries(decodeURIComponent(entriesMatch[1]), await requestBody(req)));
     }
     if (req.method === "POST" && attachmentsMatch) {
       return jsonResponse(res, 200, await uploadAttachment(decodeURIComponent(attachmentsMatch[1]), await requestBody(req)));
@@ -2249,7 +3398,7 @@ const server = createServer(async (req, res) => {
 	      const body = await requestBody(req);
 	      return jsonResponse(res, 200, await startTerminologyExtraction(decodeURIComponent(terminologyMatch[1]), {
 	        force: true,
-	        questionIds: body.questionIds || body.selectedQuestionIds || []
+	        questionIds: body.questionIds || body.selectedQuestionIds || [],
 	      }));
 	    }
 	    if (req.method === "POST" && terminologyReviewMatch) {

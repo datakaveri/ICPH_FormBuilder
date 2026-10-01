@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -k \"npm:server\" \"npm:client\"",
+    "lan": "node scripts/start-lan.mjs",
     "client": "vite --host 0.0.0.0 --port 5173",
     "server": "node server/index.js",
+    "test:barcode": "node scripts/test_barcode_decoders.cjs",
     "start": "concurrently -k \"npm:server\" \"npm:preview\"",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0 --port 5173"
@@ -14,6 +16,8 @@
   "dependencies": {
     "@getodk/web-forms": "^0.24.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "@zxing/browser": "^0.2.1",
+    "@zxing/library": "^0.23.0",
     "concurrently": "^9.1.2",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
