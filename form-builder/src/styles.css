@@ -631,9 +631,42 @@ button:disabled {
 
 .field-agent-topbar {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  grid-template-areas: "home title logout";
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas: "home title sync logout";
   align-items: start;
+}
+
+.field-agent-sync-status {
+  grid-area: sync;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.field-agent-sync-status > span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+}
+
+.field-agent-sync-status .sync-online {
+  border-color: #b9dfcc;
+  color: #176b49;
+  background: #f2faf5;
+}
+
+.field-agent-sync-status .sync-offline {
+  border-color: #f0d0a5;
+  color: #8a5100;
+  background: #fff8ed;
 }
 
 .field-agent-layout {
@@ -4366,6 +4399,15 @@ button:disabled {
 }
 
 @media (max-width: 1100px) {
+  .field-agent-topbar {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas: "home logout" "title title" "sync sync";
+  }
+
+  .field-agent-sync-status {
+    justify-content: flex-start;
+  }
+
   .access-head {
     grid-template-columns: 1fr;
   }
@@ -4505,6 +4547,16 @@ button:disabled {
   align-items: center;
   justify-content: flex-end;
   flex-wrap: wrap;
+}
+
+.fill-header-main {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.fill-change-code {
+  justify-self: start;
 }
 
 .offline-sync-indicator {

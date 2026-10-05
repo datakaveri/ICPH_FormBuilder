@@ -11,6 +11,7 @@ import {
   Calendar,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Clock,
   ClipboardList,
@@ -971,6 +972,35 @@ function xlsDate(value) {
   return String(value || "").replace(/^['"]|['"]$/g, "");
 }
 
+function xlsNumber(value) {
+  const text = String(value ?? "").trim();
+  return text ? Number(text) : NaN;
+}
+
+function xlsStringLength(value) {
+  return Array.from(String(value ?? "")).length;
+}
+
+function xlsContains(value, search) {
+  return String(value ?? "").includes(String(search ?? ""));
+}
+
+function xlsStartsWith(value, prefix) {
+  return String(value ?? "").startsWith(String(prefix ?? ""));
+}
+
+function xlsEndsWith(value, suffix) {
+  return String(value ?? "").endsWith(String(suffix ?? ""));
+}
+
+function xlsRegex(value, pattern) {
+  try {
+    return new RegExp(String(pattern ?? "")).test(String(value ?? ""));
+  } catch {
+    return false;
+  }
+}
+
 function transformXlsExpression(expression) {
   let js = String(expression || "").trim();
   js = js.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
@@ -978,12 +1008,18 @@ function transformXlsExpression(expression) {
   js = js.replace(/\bdate\s*\(/g, "xlsDate(");
   js = js.replace(/\btoday\s*\(/g, "today(");
   js = js.replace(/\bint\s*\(/g, "Math.trunc(");
+  js = js.replace(/\bstring-length\s*\(/g, "xlsStringLength(");
+  js = js.replace(/\bstarts-with\s*\(/g, "xlsStartsWith(");
+  js = js.replace(/\bends-with\s*\(/g, "xlsEndsWith(");
+  js = js.replace(/\bcontains\s*\(/g, "xlsContains(");
+  js = js.replace(/\bregex\s*\(/g, "xlsRegex(");
+  js = js.replace(/\bnumber\s*\(/g, "xlsNumber(");
   js = js.replace(/\bif\s*\(/g, "ifFn(");
   js = js.replace(/\$\{([^}]+)\}/g, (_, name) => `get(${JSON.stringify(name)})`);
   js = js.replace(/\/data(?:\/[A-Za-z0-9_-]+)*\/([A-Za-z0-9_:-]+)/g, (_, name) => `get(${JSON.stringify(name)})`);
   js = js.replace(/\btrue\s*\(\s*\)/gi, "true");
   js = js.replace(/\bfalse\s*\(\s*\)/gi, "false");
-  js = js.replace(/(^|[^\w$])\.(?=\s|[=!<>+\-*/)]|$)/g, "$1current");
+  js = js.replace(/(^|[^\w$])\.(?=\s|[=!<>+\-*/),]|$)/g, "$1current");
   js = js.replace(/\bdiv\b/g, "/");
   js = js.replace(/\band\b/gi, "&&");
   js = js.replace(/\bor\b/gi, "||");
@@ -1004,13 +1040,19 @@ function evaluateXlsExpression(expression, answers = {}, currentValue = "") {
   };
   const once = (value) => value;
   try {
-    return Function("get", "current", "selected", "decimalDateTime", "xlsDate", "today", "ifFn", "uuid", "once", `return (${js});`)(
+    return Function("get", "current", "selected", "decimalDateTime", "xlsDate", "today", "xlsNumber", "xlsStringLength", "xlsContains", "xlsStartsWith", "xlsEndsWith", "xlsRegex", "ifFn", "uuid", "once", `return (${js});`)(
       get,
       currentValue,
       selected,
       decimalDateTime,
       xlsDate,
       todayString,
+      xlsNumber,
+      xlsStringLength,
+      xlsContains,
+      xlsStartsWith,
+      xlsEndsWith,
+      xlsRegex,
       ifFn,
       uuid,
       once
@@ -1347,6 +1389,27 @@ async function listOfflineFormPackages() {
   });
 }
 
+async function listOfflineCheckpointMetadata() {
+  const records = await readEncryptedOfflineRecords("submissionQueue");
+  const checkpointsByCode = new Map();
+  for (const record of records) {
+    if (!String(record.path || "").endsWith("/checkpoint")) continue;
+    const match = String(record.path || "").match(/\/api\/public\/forms\/([^/]+)\/checkpoint$/);
+    const code = normalizeAccessCodeInput(match?.[1] || "");
+    const identifier = String(record.payload?.primaryIdentifierValue || "").trim();
+    if (!code || !identifier) continue;
+    const current = checkpointsByCode.get(code) || new Map();
+    current.set(identifier.toLowerCase(), {
+      id: record.id,
+      primaryIdentifierValue: identifier,
+      savedAt: record.createdAt,
+      localOnly: true
+    });
+    checkpointsByCode.set(code, current);
+  }
+  return new Map(Array.from(checkpointsByCode.entries()).map(([code, checkpoints]) => [code, Array.from(checkpoints.values())]));
+}
+
 async function saveOfflineFormPackage(formPackage) {
   await offlineStoreRequest("formPackages", "readwrite", (store) => store.put(formPackage));
   try { await navigator.storage?.persist?.(); } catch {}
@@ -1375,8 +1438,11 @@ async function saveOfflineFirst(path, payload) {
     const registration = await navigator.serviceWorker?.ready;
     await registration?.sync?.register?.("icph-submit-queue");
   } catch {}
-  const result = await syncPendingSubmissions(id);
-  return { id, queued: !result.syncedIds.includes(id), error: result.errors[id] || "", pendingCount: result.pendingCount };
+  const pendingCount = await getPendingSubmissionCount();
+  // The encrypted local write is the save operation. Do not make the respondent
+  // wait for a network sync before confirming that the entry is safely stored.
+  void syncPendingSubmissions(id).catch(() => {});
+  return { id, queued: true, error: "", pendingCount };
 }
 
 async function syncPendingSubmissions(onlyId = "") {
@@ -2623,7 +2689,11 @@ function App() {
   }
   if (path.startsWith("/public-fill/")) {
     const params = new URLSearchParams(window.location.search);
-    return <FillForm accessCode={decodeURIComponent(path.replace("/public-fill/", "").split("/")[0])} entryId={params.get("entryId") || ""} />;
+    return <FillForm
+      accessCode={decodeURIComponent(path.replace("/public-fill/", "").split("/")[0])}
+      entryId={params.get("entryId") || ""}
+      resumeCheckpointIdentifier={params.get("checkpoint") || ""}
+    />;
   }
   if (path.startsWith("/fill/")) {
     const params = new URLSearchParams(window.location.search);
@@ -3158,6 +3228,7 @@ function RespondentPortal({ initialCode = "" }) {
     return (
       <FillForm
         accessCode={session.accessCode}
+        fresh={session.mode === "fresh"}
         checkpointAnswers={session.checkpoint?.answers || null}
         resumePrimaryIdentifierValue={session.primaryIdentifierValue || ""}
         onBackToRespondent={() => {
@@ -3223,6 +3294,8 @@ function FieldAgentPortal() {
   const [selectedCode, setSelectedCode] = useState("");
   const [displayFieldByCode, setDisplayFieldByCode] = useState({});
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading published forms..." });
   const selectedForm = forms.find((item) => item.respondentAccessCode === selectedCode) || forms[0] || null;
   const fieldAgentEntryIds = useMemo(
@@ -3238,11 +3311,30 @@ function FieldAgentPortal() {
     || "";
   const fieldAgentAllSelected = fieldAgentEntryIds.length > 0 && selectedEntryIds.length === fieldAgentEntryIds.length;
 
+  async function refreshFieldAgentSyncStatus(sync = false) {
+    try {
+      const result = sync && navigator.onLine ? await syncPendingSubmissions() : null;
+      setPendingSyncCount(result?.pendingCount ?? await getPendingSubmissionCount());
+    } catch {
+      setPendingSyncCount(await getPendingSubmissionCount());
+    }
+  }
+
   async function loadPublishedForms() {
     setStatus({ kind: "busy", message: "Loading published forms..." });
     try {
       const data = await requestJson("/api/public/forms");
-      const nextForms = data.forms || [];
+      const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
+      const nextForms = (data.forms || []).map((form) => {
+        const serverCheckpoints = form.checkpoints || [];
+        const localOnly = (localCheckpoints.get(normalizeAccessCodeInput(form.respondentAccessCode)) || [])
+          .filter((localCheckpoint) => !serverCheckpoints.some((checkpoint) => (
+            String(checkpoint.primaryIdentifierValue || "").trim().toLowerCase()
+              === String(localCheckpoint.primaryIdentifierValue || "").trim().toLowerCase()
+          )));
+        const checkpoints = [...serverCheckpoints, ...localOnly];
+        return { ...form, checkpoints, checkpointCount: checkpoints.length };
+      });
       setForms(nextForms);
       setSelectedCode((current) => nextForms.some((item) => item.respondentAccessCode === current)
         ? current
@@ -3250,8 +3342,17 @@ function FieldAgentPortal() {
       setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
     } catch (error) {
       const savedForms = await listOfflineFormPackages().catch(() => []);
+      const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
       if (savedForms.length) {
-        setForms(savedForms.map((item) => ({ ...item, respondentAccessCode: item.accessCode })));
+        setForms(savedForms.map((item) => {
+          const checkpoints = localCheckpoints.get(normalizeAccessCodeInput(item.accessCode)) || [];
+          return {
+            ...item,
+            respondentAccessCode: item.accessCode,
+            checkpoints,
+            checkpointCount: checkpoints.length
+          };
+        }));
         setSelectedCode((current) => savedForms.some((item) => item.accessCode === current)
           ? current
           : savedForms[0]?.accessCode || "");
@@ -3264,6 +3365,23 @@ function FieldAgentPortal() {
 
   useEffect(() => {
     loadPublishedForms();
+  }, []);
+
+  useEffect(() => {
+    const updateOnlineState = () => {
+      const online = navigator.onLine;
+      setIsOnline(online);
+      refreshFieldAgentSyncStatus(online);
+    };
+    refreshFieldAgentSyncStatus(navigator.onLine);
+    window.addEventListener("online", updateOnlineState);
+    window.addEventListener("offline", updateOnlineState);
+    window.addEventListener("focus", updateOnlineState);
+    return () => {
+      window.removeEventListener("online", updateOnlineState);
+      window.removeEventListener("offline", updateOnlineState);
+      window.removeEventListener("focus", updateOnlineState);
+    };
   }, []);
 
   useEffect(() => {
@@ -3286,10 +3404,13 @@ function FieldAgentPortal() {
     };
   }, []);
 
-  function openFillForm(form, entryId = "") {
+  function openFillForm(form, entryId = "", checkpointIdentifierValue = "") {
     const code = normalizeAccessCodeInput(form?.respondentAccessCode);
     if (!code) return;
-    const query = entryId ? `?entryId=${encodeURIComponent(entryId)}` : "";
+    const params = new URLSearchParams();
+    if (entryId) params.set("entryId", entryId);
+    if (checkpointIdentifierValue) params.set("checkpoint", checkpointIdentifierValue);
+    const query = params.toString() ? `?${params.toString()}` : "";
     window.open(`/public-fill/${encodeURIComponent(code)}${query}`, "_blank");
   }
 
@@ -3329,6 +3450,15 @@ function FieldAgentPortal() {
           <h1>Field Agent</h1>
           <p>Published form collection</p>
         </div>
+        <div className="field-agent-sync-status" aria-live="polite">
+          <span className={isOnline ? "sync-online" : "sync-offline"}>{isOnline ? "Online" : "Offline"}</span>
+          <span>{pendingSyncCount} unsynced {pendingSyncCount === 1 ? "entry" : "entries"}</span>
+          {pendingSyncCount && isOnline ? (
+            <button className="secondary small" type="button" onClick={() => refreshFieldAgentSyncStatus(true)}>
+              <RefreshCw size={14} /> Sync now
+            </button>
+          ) : null}
+        </div>
         <div className="topbar-brand">
           <BrandLogos />
         </div>
@@ -3351,7 +3481,7 @@ function FieldAgentPortal() {
               >
                 <span>{formItem.title}</span>
                 <strong>{formItem.respondentAccessCode}</strong>
-                <small>{formItem.entryCount || 0} entries</small>
+                <small>{formItem.entryCount || 0} entries · {formItem.checkpointCount || 0} incomplete</small>
               </button>
             ))}
           </div>
@@ -3383,6 +3513,31 @@ function FieldAgentPortal() {
                     </select>
                   </label>
                 ) : null}
+              </div>
+              <div className="panel entries-panel field-agent-checkpoints">
+                <div className="section-head">
+                  <h2>Incomplete checkpoints</h2>
+                  <span>{selectedForm.checkpointCount || 0} saved</span>
+                </div>
+                {selectedForm.checkpoints?.length ? (
+                  <div className="entries-table">
+                    {selectedForm.checkpoints.slice().reverse().map((checkpoint) => (
+                      <div className="entry-row field-agent-entry-row" key={checkpoint.id || checkpoint.primaryIdentifierValue}>
+                        <div className="entry-details">
+                          <strong>{checkpoint.primaryIdentifierValue}</strong>
+                          <small>Saved {checkpoint.savedAt ? new Date(checkpoint.savedAt).toLocaleString() : "recently"}</small>
+                        </div>
+                        <div className="entry-actions">
+                          <button className="secondary small icon-text-button" onClick={() => openFillForm(selectedForm, "", checkpoint.primaryIdentifierValue)}>
+                            <Forward size={14} /> Continue
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="muted">No incomplete checkpoints.</p>
+                )}
               </div>
               <div className="panel entries-panel field-agent-entries">
                 <div className="section-head">
@@ -12077,7 +12232,7 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, u
   );
 }
 
-function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = null, resumePrimaryIdentifierValue = "", onBackToRespondent }) {
+function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkpointAnswers = null, resumePrimaryIdentifierValue = "", resumeCheckpointIdentifier = "", onBackToRespondent }) {
   const [form, setForm] = useState(null);
   const [formXml, setFormXml] = useState("");
   const [answers, setAnswers] = useState({});
@@ -12118,11 +12273,11 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
   const canAdvanceGroup = Boolean(form && status.kind !== "busy" && !pageValidation.errors.length);
   const secondaryLanguage = form ? secondaryLanguageName(form) : "";
   const hasBarcodeQuestions = Boolean(form?.questions?.some((question) => question.type === "barcode"));
-  const useOdkViewer = Boolean(formXml && !hasGroupSections && !hasChoiceQuestions && !hasBarcodeQuestions && !editingEntry && !entryId && checkpointAnswers === null && !resumePrimaryIdentifierValue);
+  const useOdkViewer = Boolean(formXml && !hasGroupSections && !hasChoiceQuestions && !hasBarcodeQuestions && !editingEntry && !entryId && checkpointAnswers === null && !resumePrimaryIdentifierValue && !resumeCheckpointIdentifier);
 
   useEffect(() => {
     setActiveGroupPage(0);
-  }, [form?.formId, entryId, checkpointAnswers]);
+  }, [form?.formId, entryId, checkpointAnswers, resumeCheckpointIdentifier]);
 
   useEffect(() => {
     const updateOnlineState = () => setIsOnline(navigator.onLine);
@@ -12274,9 +12429,35 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
             }
           }
         }
-        const resumedAnswers = checkpointAnswers && typeof checkpointAnswers === "object" ? checkpointAnswers : {};
+        let loadedCheckpointAnswers = checkpointAnswers && typeof checkpointAnswers === "object" ? checkpointAnswers : null;
+        let loadedCheckpointIdentifierValue = resumePrimaryIdentifierValue;
+        if (accessCode && resumeCheckpointIdentifier && !loadedCheckpointAnswers) {
+          try {
+            const checkpointData = await requestJson(`${formApiBase}/checkpoint`, {
+              method: "PUT",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ primaryIdentifierValue: resumeCheckpointIdentifier })
+            });
+            if (!checkpointData.checkpoint) throw new Error("Saved checkpoint not found.");
+            loadedCheckpointAnswers = checkpointData.checkpoint.answers || {};
+            loadedCheckpointIdentifierValue = checkpointData.primaryIdentifierValue || resumeCheckpointIdentifier;
+          } catch (checkpointError) {
+            const queued = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+            const normalizedIdentifier = resumeCheckpointIdentifier.trim().toLowerCase();
+            const localCheckpoint = queued.reverse().find((record) => (
+              String(record.path || "").endsWith("/checkpoint")
+                && normalizeAccessCodeInput(String(record.path || "").split("/forms/")[1]?.split("/")[0] || "")
+                  === normalizeAccessCodeInput(accessCode)
+                && String(record.payload?.primaryIdentifierValue || "").trim().toLowerCase() === normalizedIdentifier
+            ));
+            if (!localCheckpoint) throw checkpointError;
+            loadedCheckpointAnswers = localCheckpoint.payload.answers || {};
+            loadedCheckpointIdentifierValue = localCheckpoint.payload.primaryIdentifierValue || resumeCheckpointIdentifier;
+          }
+        }
+        const resumedAnswers = loadedCheckpointAnswers || {};
         let interruptedAnswers = {};
-        if (!entryId && !Object.keys(resumedAnswers).length && accessCode) {
+        if (!fresh && !entryId && !Object.keys(resumedAnswers).length && accessCode) {
           try {
             const drafts = await readEncryptedOfflineRecords("offlineDrafts");
             const saved = drafts.find((item) => item.id === offlineDraftId(accessCode, workspaceId, entryId));
@@ -12303,8 +12484,8 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
           ...interruptedAnswers,
           ...entryAnswers
         });
-        if (primaryIdentifierVariable && resumePrimaryIdentifierValue) {
-          seededAnswers[primaryIdentifierVariable] = resumePrimaryIdentifierValue;
+        if (primaryIdentifierVariable && loadedCheckpointIdentifierValue) {
+          seededAnswers[primaryIdentifierVariable] = loadedCheckpointIdentifierValue;
         }
         setEditingEntry(entryToEdit);
         setAnswers(seededAnswers);
@@ -12321,14 +12502,14 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
         }
         setSubmissionSuccess(false);
         setStatus(packageCached
-          ? { kind: "ok", message: loadedOffline ? "Offline form ready." : entryToEdit ? "Editing submitted entry." : checkpointAnswers ? "Loaded saved checkpoint." : "Ready" }
+          ? { kind: "ok", message: loadedOffline ? "Offline form ready." : entryToEdit ? "Editing submitted entry." : loadedCheckpointAnswers ? "Loaded saved checkpoint." : "Ready" }
           : { kind: "error", message: "Loaded online, but this device could not save an offline copy." });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
     loadPublishedForm();
-  }, [accessCode, checkpointAnswers, entryId, formApiBase, resumePrimaryIdentifierValue, workspaceId]);
+  }, [accessCode, checkpointAnswers, entryId, formApiBase, fresh, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
 
   function setAnswer(name, value) {
     setSubmissionSuccess(false);
@@ -12439,16 +12620,18 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
     return (
       <div className="fill-shell">
         <header className="fill-header">
-          <div>
-            <h1>ICPH Form</h1>
-            <p>{accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : "Loading workspace"}</p>
-          </div>
-          <div className="fill-header-actions">
+          <div className="fill-header-main">
             {onBackToRespondent ? (
-              <button className="secondary small" onClick={onBackToRespondent}>
-                <ChevronRight size={16} /> Change Code
+              <button className="secondary small fill-change-code" onClick={onBackToRespondent}>
+                <ChevronLeft size={16} /> Change Code
               </button>
             ) : null}
+            <div>
+            <h1>ICPH Form</h1>
+            <p>{accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : "Loading workspace"}</p>
+            </div>
+          </div>
+          <div className="fill-header-actions">
             <div className={`status-line ${status.kind}`}><AlertCircle size={16} /> <span>{status.message}</span></div>
           </div>
         </header>
@@ -12460,11 +12643,27 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
     <div className={`fill-shell ${useOdkViewer ? "odk-fill-shell" : ""}`}>
       <header className={`fill-header ${useOdkViewer ? "odk-view-header" : ""}`}>
         {!useOdkViewer ? (
-          <div>
-            <h1>{form.title}</h1>
-            <p>{editingEntry ? "Editing submitted entry" : accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
+          <div className="fill-header-main">
+            {onBackToRespondent ? (
+              <button className="secondary small fill-change-code" onClick={onBackToRespondent}>
+                <ChevronLeft size={16} /> Change Code
+              </button>
+            ) : null}
+            <div>
+              <h1>{form.title}</h1>
+              <p>{editingEntry ? "Editing submitted entry" : accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
+            </div>
           </div>
-        ) : <span className="odk-view-context">ICPH Form</span>}
+        ) : (
+          <div className="fill-header-main">
+            {onBackToRespondent ? (
+              <button className="secondary small fill-change-code" onClick={onBackToRespondent}>
+                <ChevronLeft size={16} /> Change Code
+              </button>
+            ) : null}
+            <span className="odk-view-context">ICPH Form</span>
+          </div>
+        )}
         <div className="fill-header-actions">
           {secondaryLanguage && !useOdkViewer ? (
             <div className="language-switcher">
@@ -12472,24 +12671,10 @@ function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = n
               <button className={languageMode === "secondary" ? "active" : ""} type="button" onClick={() => setLanguageMode("secondary")}>{secondaryLanguage}</button>
             </div>
           ) : null}
-          {onBackToRespondent ? (
-            <button className="secondary small" onClick={onBackToRespondent}>
-              <ChevronRight size={16} /> Change Code
-            </button>
-          ) : null}
           <div className={`status-line ${status.kind}`}>
             {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
             <span>{status.message}</span>
           </div>
-          {accessCode ? (
-            <div className={`offline-sync-indicator ${isOnline ? "online" : "offline"}`} aria-live="polite">
-              <span>{isOnline ? "Online" : "Offline"}</span>
-              {pendingSyncCount ? <span>{pendingSyncCount} item{pendingSyncCount === 1 ? "" : "s"} waiting to sync</span> : null}
-              {offlineReady ? <span>Form saved on this device</span> : null}
-              {localDraftSaved ? <span>Draft saved on this device</span> : null}
-              {pendingSyncCount && isOnline ? <button className="secondary small" type="button" onClick={retryPendingSync}><RefreshCw size={14} /> Sync now</button> : null}
-            </div>
-          ) : null}
         </div>
 	      </header>
 	      <main className={`fill-card ${useOdkViewer ? "odk-fill-card" : ""}`}>

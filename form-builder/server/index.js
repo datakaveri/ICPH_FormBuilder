@@ -1183,6 +1183,7 @@ async function listPublicForms() {
     if (!item.hasXml || !item.respondentAccessCode || item.collectionLocked) continue;
     const draft = (await loadDraft(item.workspaceId)).draft;
     const entries = await readEntries(item.workspaceId);
+    const checkpoints = await readRespondentCheckpoints(item.workspaceId);
     forms.push({
       workspaceId: item.workspaceId,
       title: item.title,
@@ -1191,6 +1192,13 @@ async function listPublicForms() {
       primaryIdentifierVariable: item.primaryIdentifierVariable,
       participantIdentifierVariable: item.participantIdentifierVariable || item.primaryIdentifierVariable,
       entryCount: entries.length,
+      checkpointCount: checkpoints.length,
+      checkpoints: checkpoints.map((checkpoint) => ({
+        id: checkpoint.id,
+        primaryIdentifierVariable: checkpoint.primaryIdentifierVariable,
+        primaryIdentifierValue: checkpoint.primaryIdentifierValue,
+        savedAt: checkpoint.savedAt
+      })),
       updatedAt: item.updatedAt,
       publishedAt: item.publishedAt,
       responseSettings: item.responseSettings,
