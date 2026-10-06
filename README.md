@@ -123,6 +123,20 @@ set `VITE_FORM_BUILDER_API` in `.env` to that origin (for example,
 docker compose up --build -d
 ```
 
+The repository also publishes the production image to GHCR from the `main`
+branch. To deploy the published image instead of building locally, set
+`ICPH_IMAGE` if a specific tag is required, then pull and start it:
+
+```bash
+export ICPH_IMAGE=ghcr.io/datakaveri/icph-form-builder:latest
+docker compose pull
+docker compose up -d
+```
+
+Version tags are also published when a Git tag such as `v1.0.0` is pushed.
+For a private GHCR package, authenticate the host first with `docker login
+ghcr.io` using a credential that has package-read access.
+
 ## Active Flow
 
 1. Build a form or import an XLSForm in `form-builder`.
