@@ -1,19 +1,18 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { migrate, query, withTransaction } from "./db.js";
+import * as store from "./store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, "..");
 const icphRoot = path.resolve(appRoot, "..");
-const outputRoot = path.join(icphRoot, "output", "forms");
-const foldersPath = path.join(outputRoot, "folders.json");
-const metaFormPrimariesPath = path.join(outputRoot, "meta-form-primaries.json");
-const participantRegistryPath = path.join(outputRoot, "participant-registry.json");
 const DEFAULT_FOLDER_BARCODE_VARIABLE = "participant_barcode";
 const odkVenvBin = path.join(icphRoot, "ODK", ".venv-xlsform", "bin");
 const pythonBin = path.join(odkVenvBin, "python");
@@ -44,6 +43,8 @@ const keycloakKeys = createRemoteJWKSet(new URL(`${keycloakUrl}/realms/${keycloa
 const ADMIN_ROLE = "icph-admin";
 const FIELD_AGENT_ROLE = "icph-field-agent";
 const activeSubmissionRequests = new Map();
+// Running terminology extractions by workspace: the child process and the scratch file it reports progress in.
+const terminologyRuns = new Map();
 const accessCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const structuralQuestionTypes = new Set(["begin_group", "end_group", "begin_repeat", "end_repeat", "begin group", "end group", "begin repeat", "end repeat"]);
 const nonPrimaryIdentifierTypes = new Set([
@@ -370,11 +371,9 @@ function primaryIdentifierProblem(questions = [], variable = "") {
   return `Primary identifier variable "${selected}" is not present in this form.`;
 }
 
-async function exposeStartGeopointsInXml(draft, xmlPath) {
-  if (!existsSync(xmlPath)) return;
+function withStartGeopointInputs(draft, xml) {
   const startQuestions = (draft.questions || []).filter((question) => normalizedQuestionType(question) === "start-geopoint" && String(question.name || "").trim());
-  if (!startQuestions.length) return;
-  let xml = await readFile(xmlPath, "utf8");
+  if (!startQuestions.length) return xml;
   let additions = "";
   for (const question of startQuestions) {
     const name = String(question.name || "").trim();
@@ -384,15 +383,10 @@ async function exposeStartGeopointsInXml(draft, xmlPath) {
     const appearance = String(question.appearance || "").trim() ? ` appearance="${escapeXmlAttribute(question.appearance)}"` : "";
     additions += `<input ref="/data/${escapeXmlAttribute(name)}"${appearance}><label>${label}</label>${hint}</input>`;
   }
-  if (!additions) return;
-  if (xml.includes("</h:body>")) {
-    xml = xml.replace("</h:body>", `${additions}</h:body>`);
-  } else if (xml.includes("</body>")) {
-    xml = xml.replace("</body>", `${additions}</body>`);
-  } else {
-    return;
-  }
-  await writeFile(xmlPath, xml, "utf8");
+  if (!additions) return xml;
+  if (xml.includes("</h:body>")) return xml.replace("</h:body>", `${additions}</h:body>`);
+  if (xml.includes("</body>")) return xml.replace("</body>", `${additions}</body>`);
+  return xml;
 }
 
 function contentTypeFor(fileName) {
@@ -446,22 +440,50 @@ async function writeSchemaManifest(manifest) {
   await writeFile(path.join(schemaProcessedDir, schemaManifestName), JSON.stringify(manifest, null, 2) + "\n", "utf8");
 }
 
-async function ensureWorkspace(workspaceId) {
-  const cleanId = cleanWorkspaceId(workspaceId);
-  const base = path.join(outputRoot, cleanId);
-  const dirs = ["drafts", "drafts/checkpoints", "xlsform", "xml", "data", "fhir_bundles", "logs", "attachments"];
-  await mkdir(base, { recursive: true });
-  await Promise.all(dirs.map((dir) => mkdir(path.join(base, dir), { recursive: true })));
-  return base;
+// Subprocesses (XLSForm tools, terminology extractor, FHIR mapper) work on files.
+// They get a scratch directory; results are read back into the database.
+async function withScratchDir(work) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "icph-"));
+  try {
+    return await work(dir);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+function draftAccessCode(draft) {
+  return String(draft?.respondentAccessCode || draft?.publicAccessCode || "").trim().toUpperCase() || null;
+}
+
+async function saveDraft(workspaceId, draft) {
+  try {
+    await store.saveDraft(workspaceId, draft, {
+      folderId: String(draft?.folderId || "").trim() || null,
+      respondentAccessCode: draftAccessCode(draft)
+    });
+  } catch (error) {
+    if (error.code === "23505" && error.constraint === "forms_respondent_access_code_key") {
+      const conflict = new Error("That respondent code is already used by another published form.");
+      conflict.statusCode = 409;
+      throw conflict;
+    }
+    throw error;
+  }
+}
+
+function withFormLock(workspaceId, work) {
+  return withTransaction(async () => {
+    await store.lockForm(cleanWorkspaceId(workspaceId));
+    return work();
+  });
 }
 
 async function requireWorkspace(workspaceId) {
   const cleanId = cleanWorkspaceId(workspaceId);
-  const outputDir = path.join(outputRoot, cleanId);
-  if (!existsSync(path.join(outputDir, "drafts", "form.json"))) {
+  if (!(await store.formExists(cleanId))) {
     throw new Error(`Form workspace not found: ${cleanId}`);
   }
-  return { cleanId, outputDir };
+  return { cleanId };
 }
 
 async function rebuildSchemaAggregate(manifest) {
@@ -801,12 +823,9 @@ async function exportFolderResponses(folderId) {
     }
   }
 
-  const exportDir = path.join(outputRoot, "folder_exports");
-  await mkdir(exportDir, { recursive: true });
-  const stem = `${slugify(folder.name)}_${timestampId()}_${Math.random().toString(36).slice(2, 8)}`;
-  const inputPath = path.join(exportDir, `${stem}.json`);
-  const outputPath = path.join(exportDir, `${stem}.xlsx`);
-  try {
+  return withScratchDir(async (dir) => {
+    const inputPath = path.join(dir, "responses.json");
+    const outputPath = path.join(dir, "responses.xlsx");
     await writeFile(inputPath, JSON.stringify({ columns, rows: [...rows.values()] }), "utf8");
     const result = await runCommand(pythonBin, [folderResponseExporterPath, inputPath, outputPath]);
     if (result.code !== 0 || !existsSync(outputPath)) {
@@ -818,10 +837,7 @@ async function exportFolderResponses(folderId) {
       formCount: descriptors.length,
       rowCount: rows.size
     };
-  } finally {
-    await rm(inputPath, { force: true });
-    await rm(outputPath, { force: true });
-  }
+  });
 }
 
 async function claimFolderPrimaryIdentifier(folderId, variable) {
@@ -843,10 +859,7 @@ async function claimFolderPrimaryIdentifier(folderId, variable) {
   if (existing && existing !== cleanVariable) {
     throw new Error(`Forms in this folder must use the shared primary identifier variable "${existing}".`);
   }
-  if (!existing) {
-    folders[index] = { ...folders[index], primaryIdentifierVariable: cleanVariable, updatedAt: isoStamp() };
-    await writeFolders(folders);
-  }
+  if (!existing) await store.updateFolderIdentifiers(cleanId, { primaryIdentifierVariable: cleanVariable });
 }
 
 function sharedBarcodeQuestion(variable) {
@@ -888,7 +901,7 @@ async function syncFolderBarcodeQuestions(folderId, variable, sourceWorkspaceId 
       updatedAt: isoStamp()
     };
     if (item.hasXml) await exportForm({ workspaceId: item.workspaceId, form: nextDraft });
-    else await writeFile(loaded.draftPath, JSON.stringify(nextDraft, null, 2) + "\n", "utf8");
+    else await saveDraft(item.workspaceId, nextDraft);
   }
 }
 
@@ -902,28 +915,15 @@ async function enableFolderBarcodeParticipantMode(folderId, requestedVariable = 
   if (index < 0) throw new Error("Folder not found.");
   const existingVariable = String(folders[index].participantIdentifierVariable || "").trim();
   if (existingVariable && existingVariable !== cleanVariable) throw new Error(`This folder already uses "${existingVariable}" as its barcode variable.`);
-  folders[index] = {
-    ...folders[index],
+  await store.updateFolderIdentifiers(cleanId, {
     participantIdentifierMode: "barcode",
-    participantIdentifierVariable: existingVariable || cleanVariable,
-    updatedAt: isoStamp()
-  };
-  await writeFolders(folders);
+    participantIdentifierVariable: existingVariable || cleanVariable
+  });
   await syncFolderBarcodeQuestions(cleanId, existingVariable || cleanVariable);
 }
 
-async function readMetaFormPrimaries() {
-  try {
-    const parsed = JSON.parse(await readFile(metaFormPrimariesPath, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-async function writeMetaFormPrimaries(primaries) {
-  await mkdir(outputRoot, { recursive: true });
-  await writeFile(metaFormPrimariesPath, JSON.stringify(primaries, null, 2) + "\n", "utf8");
+function readMetaFormPrimaries() {
+  return store.listMetaFormPrimaries();
 }
 
 async function claimMetaFormPrimary(fileName, variable) {
@@ -935,10 +935,7 @@ async function claimMetaFormPrimary(fileName, variable) {
   if (existing && existing !== cleanVariable) {
     throw new Error(`Forms linked to this MetaForm must use the shared primary identifier variable "${existing}".`);
   }
-  if (!existing) {
-    primaries[cleanName] = cleanVariable;
-    await writeMetaFormPrimaries(primaries);
-  }
+  if (!existing) await store.insertMetaFormPrimary(cleanName, cleanVariable);
 }
 
 async function releaseSharedIdentifiersForForm(draft) {
@@ -947,23 +944,16 @@ async function releaseSharedIdentifiersForForm(draft) {
     const folders = await readFolders();
     const folderIndex = folders.findIndex((item) => item.id === draft.folderId);
     if (folderIndex >= 0 && (folders[folderIndex].primaryIdentifierVariable || folders[folderIndex].participantIdentifierMode)) {
-      folders[folderIndex] = {
-        ...folders[folderIndex],
+      await store.updateFolderIdentifiers(draft.folderId, {
         primaryIdentifierVariable: "",
         participantIdentifierMode: "",
-        participantIdentifierVariable: "",
-        updatedAt: isoStamp()
-      };
-      await writeFolders(folders);
+        participantIdentifierVariable: ""
+      });
     }
   }
   const metaFileName = String(draft?.metaFormLink?.fileName || "").trim();
   if (metaFileName && !forms.forms.some((item) => item.metaFormLink?.fileName === metaFileName)) {
-    const primaries = await readMetaFormPrimaries();
-    if (Object.prototype.hasOwnProperty.call(primaries, metaFileName)) {
-      delete primaries[metaFileName];
-      await writeMetaFormPrimaries(primaries);
-    }
+    await store.deleteMetaFormPrimary(metaFileName);
   }
 }
 
@@ -972,7 +962,6 @@ async function createForm(payload) {
   const formId = slugify(payload.formId || title).replace(/-/g, "_");
   const versionBaseId = `${timestampId()}_${slugify(title)}`;
   const workspaceId = `${versionBaseId}_v1`;
-  const outputDir = await ensureWorkspace(workspaceId);
   const metaFormLink = normalizeMetaFormLink(payload);
   const linkedPrimary = metaFormLink ? await existingMetaFormPrimary(metaFormLink.fileName) : null;
   const folderId = String(payload.folderId || "").trim() || null;
@@ -1024,37 +1013,16 @@ async function createForm(payload) {
     createdAt: isoStamp(),
     updatedAt: isoStamp()
   };
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
-  return { workspaceId, outputDir, draftPath, draft };
+  await store.insertForm({ workspaceId, versionBaseId, versionNumber: 1, folderId, draft });
+  return { workspaceId, draft };
 }
 
-async function readFolders() {
-  try {
-    const parsed = JSON.parse(await readFile(foldersPath, "utf8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+function readFolders() {
+  return store.listFolders();
 }
 
-async function writeFolders(folders) {
-  await mkdir(outputRoot, { recursive: true });
-  await writeFile(foldersPath, JSON.stringify(folders, null, 2) + "\n", "utf8");
-}
-
-async function readParticipantRegistry() {
-  try {
-    const parsed = JSON.parse(await readFile(participantRegistryPath, "utf8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-async function writeParticipantRegistry(records) {
-  await mkdir(outputRoot, { recursive: true });
-  await writeFile(participantRegistryPath, JSON.stringify(records, null, 2) + "\n", "utf8");
+function readParticipantRegistry() {
+  return store.listParticipantRegistry();
 }
 
 async function createFolder(payload) {
@@ -1064,10 +1032,8 @@ async function createFolder(payload) {
   if (folders.some((folder) => folder.name.toLowerCase() === name.toLowerCase())) {
     throw new Error("A folder with that name already exists.");
   }
-  const folder = { id: `${timestampId()}_${slugify(name)}`, name, primaryIdentifierVariable: "", createdAt: isoStamp(), updatedAt: isoStamp() };
-  folders.push(folder);
-  await writeFolders(folders);
-  return { ok: true, folder, folders };
+  const folder = await store.insertFolder(`${timestampId()}_${slugify(name)}`, name);
+  return { ok: true, folder, folders: [...folders, folder] };
 }
 
 async function deleteFolder(folderId) {
@@ -1083,72 +1049,45 @@ async function deleteFolder(folderId) {
     .map((item) => item.workspaceId);
   for (const workspaceId of deletedWorkspaceIds) await deleteForm(workspaceId);
 
-  await writeFolders(folders.filter((item) => item.id !== cleanId));
+  await store.deleteFolder(cleanId);
   return { ok: true, deletedFolder: folder, deletedWorkspaceIds, folders: await readFolders() };
 }
 
 async function loadDraft(workspaceId) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  const draft = { ...JSON.parse(await readFile(draftPath, "utf8")), terminologyUseLlm: false };
-  return { workspaceId: cleanId, outputDir, draftPath, draft, ...(await workspaceMeta(cleanId)) };
+  const { cleanId } = await requireWorkspace(workspaceId);
+  const meta = await workspaceMeta(cleanId);
+  const draft = { ...(await store.getDraft(cleanId)), terminologyUseLlm: false };
+  return { workspaceId: cleanId, draft, ...meta };
 }
 
 async function findWorkspaceByRespondentCode(value) {
   const code = cleanRespondentAccessCode(value);
-  await mkdir(outputRoot, { recursive: true });
-  const names = await readdir(outputRoot);
-  for (const name of names) {
-    const workspaceId = cleanWorkspaceId(name);
-    const draftPath = path.join(outputRoot, workspaceId, "drafts", "form.json");
-    if (!existsSync(draftPath)) continue;
-    try {
-      const draft = JSON.parse(await readFile(draftPath, "utf8"));
-      if (draft.collectionLocked) continue;
-      const respondentAccessCode = String(draft.respondentAccessCode || draft.publicAccessCode || "").trim().toUpperCase();
-      if (respondentAccessCode === code) {
-        return {
-          code,
-          workspaceId,
-          outputDir: path.join(outputRoot, workspaceId),
-          draftPath,
-          draft
-        };
-      }
-    } catch {}
+  const found = await store.findOpenFormByAccessCode(code);
+  if (!found) {
+    const error = new Error("No published form matches that respondent code.");
+    error.statusCode = 404;
+    throw error;
   }
-  const error = new Error("No published form matches that respondent code.");
-  error.statusCode = 404;
-  throw error;
+  return { code, workspaceId: found.workspace_id, draft: found.draft };
 }
 
 async function generateUniqueRespondentAccessCode(workspaceId) {
   const currentWorkspaceId = cleanWorkspaceId(workspaceId);
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const code = randomRespondentAccessCode();
-    try {
-      const found = await findWorkspaceByRespondentCode(code);
-      if (found.workspaceId === currentWorkspaceId) return code;
-    } catch (error) {
-      if (error.statusCode === 404) return code;
-      throw error;
-    }
+    const owner = await store.accessCodeOwner(code);
+    if (!owner || owner === currentWorkspaceId) return code;
   }
   throw new Error("Could not generate a unique respondent form code.");
 }
 
 async function ensureUniqueRespondentAccessCode(code, workspaceId) {
   const cleanCode = cleanRespondentAccessCode(code);
-  const currentWorkspaceId = cleanWorkspaceId(workspaceId);
-  try {
-    const found = await findWorkspaceByRespondentCode(cleanCode);
-    if (found.workspaceId !== currentWorkspaceId) {
-      const error = new Error("That respondent code is already used by another published form.");
-      error.statusCode = 409;
-      throw error;
-    }
-  } catch (error) {
-    if (error.statusCode !== 404) throw error;
+  const owner = await store.accessCodeOwner(cleanCode);
+  if (owner && owner !== cleanWorkspaceId(workspaceId)) {
+    const error = new Error("That respondent code is already used by another published form.");
+    error.statusCode = 409;
+    throw error;
   }
   return cleanCode;
 }
@@ -1267,118 +1206,51 @@ async function submitPublicOdkEntry(value, payload) {
 
 async function loadFormXml(workspaceId) {
   const { cleanId } = await requireWorkspace(workspaceId);
-  const meta = await workspaceMeta(cleanId);
-  if (!meta.xmlPath || !existsSync(meta.xmlPath)) {
-    throw new Error("Published XML not found for this form.");
-  }
-  return {
-    ok: true,
-    workspaceId: cleanId,
-    xmlPath: meta.xmlPath,
-    xml: await readFile(meta.xmlPath, "utf8")
-  };
+  const xml = await store.getFormXml(cleanId);
+  if (!xml) throw new Error("Published XML not found for this form.");
+  return { ok: true, workspaceId: cleanId, xml };
 }
 
 async function loadFormXlsx(workspaceId) {
   const { cleanId } = await requireWorkspace(workspaceId);
-  const meta = await workspaceMeta(cleanId);
-  if (!meta.xlsxPath || !existsSync(meta.xlsxPath)) {
-    throw new Error("Generated ODK XLS not found for this form.");
-  }
-  return {
-    ok: true,
-    workspaceId: cleanId,
-    xlsxPath: meta.xlsxPath,
-    fileName: path.basename(meta.xlsxPath),
-    data: await readFile(meta.xlsxPath)
-  };
+  const workbook = await store.getFormXlsx(cleanId);
+  if (!workbook) throw new Error("Generated ODK XLS not found for this form.");
+  return { ok: true, workspaceId: cleanId, fileName: workbook.fileName, data: workbook.data };
 }
 
 async function listAttachments(workspaceId) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
-  const attachmentDir = path.join(outputDir, "attachments");
-  await mkdir(attachmentDir, { recursive: true });
-  let names = [];
-  try {
-    names = await readdir(attachmentDir);
-  } catch {}
-  const attachments = [];
-  for (const name of names.sort((a, b) => a.localeCompare(b))) {
-    const attachmentPath = path.join(attachmentDir, name);
-    try {
-      const info = await stat(attachmentPath);
-      if (!info.isFile()) continue;
-      attachments.push({
-        fileName: name,
-        sizeBytes: info.size,
-        updatedAt: info.mtime.toISOString(),
-        url: `/api/forms/${encodeURIComponent(cleanId)}/attachments/${encodeURIComponent(name)}`
-      });
-    } catch {}
-  }
-  return { ok: true, workspaceId: cleanId, attachmentDir, attachments };
+  const { cleanId } = await requireWorkspace(workspaceId);
+  const attachments = (await store.listFormAttachments(cleanId))
+    .sort((a, b) => a.fileName.localeCompare(b.fileName))
+    .map((attachment) => ({
+      ...attachment,
+      url: `/api/forms/${encodeURIComponent(cleanId)}/attachments/${encodeURIComponent(attachment.fileName)}`
+    }));
+  return { ok: true, workspaceId: cleanId, attachments };
 }
 
 async function uploadAttachment(workspaceId, payload) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
+  const { cleanId } = await requireWorkspace(workspaceId);
   const fileName = cleanAttachmentName(payload.filename);
   const data = Buffer.from(String(payload.dataBase64 || ""), "base64");
   if (!data.length) throw new Error("Uploaded attachment is empty.");
-  const attachmentDir = path.join(outputDir, "attachments");
-  await mkdir(attachmentDir, { recursive: true });
-  const attachmentPath = path.join(attachmentDir, fileName);
-  await writeFile(attachmentPath, data);
-  const xlsDir = path.join(outputDir, "xlsform");
-  await mkdir(xlsDir, { recursive: true });
-  await writeFile(path.join(xlsDir, fileName), data);
-  return { ok: true, workspaceId: cleanId, fileName, attachmentPath, ...(await listAttachments(cleanId)), ...(await workspaceMeta(cleanId)) };
+  await store.putFormAttachment(cleanId, fileName, data);
+  return { ok: true, workspaceId: cleanId, fileName, ...(await listAttachments(cleanId)), ...(await workspaceMeta(cleanId)) };
 }
 
 async function deleteAttachment(workspaceId, fileName) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
+  const { cleanId } = await requireWorkspace(workspaceId);
   const cleanName = cleanAttachmentName(fileName);
-  await rm(path.join(outputDir, "attachments", cleanName), { force: true });
-  await rm(path.join(outputDir, "xlsform", cleanName), { force: true });
+  await store.deleteFormAttachment(cleanId, cleanName);
   return { ok: true, workspaceId: cleanId, deleted: cleanName, ...(await listAttachments(cleanId)), ...(await workspaceMeta(cleanId)) };
 }
 
 async function loadAttachment(workspaceId, fileName) {
-  const { outputDir } = await requireWorkspace(workspaceId);
+  const { cleanId } = await requireWorkspace(workspaceId);
   const cleanName = cleanAttachmentName(fileName);
-  const attachmentPath = path.join(outputDir, "attachments", cleanName);
-  if (!existsSync(attachmentPath)) throw new Error(`Attachment not found: ${cleanName}`);
-  return {
-    fileName: cleanName,
-    contentType: contentTypeFor(cleanName),
-    data: await readFile(attachmentPath)
-  };
-}
-
-async function syncAttachmentsToXlsDir(workspaceId, xlsxPath) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
-  const attachmentInfo = await listAttachments(cleanId);
-  const xlsDir = path.dirname(xlsxPath);
-  await mkdir(xlsDir, { recursive: true });
-  for (const attachment of attachmentInfo.attachments) {
-    await copyFile(
-      path.join(outputDir, "attachments", attachment.fileName),
-      path.join(xlsDir, attachment.fileName)
-    );
-  }
-  return attachmentInfo.attachments.length;
-}
-
-function terminologyResultPath(outputDir) {
-  return path.join(outputDir, "terminology", "question_entities.json");
-}
-
-async function workspaceHasPublishedXml(outputDir) {
-  try {
-    const files = await readdir(path.join(outputDir, "xml"));
-    return files.some((name) => name.toLowerCase().endsWith(".xml"));
-  } catch {
-    return false;
-  }
+  const data = await store.getFormAttachment(cleanId, cleanName);
+  if (!data) throw new Error(`Attachment not found: ${cleanName}`);
+  return { fileName: cleanName, contentType: contentTypeFor(cleanName), data };
 }
 
 function latestSnomedLookupPath() {
@@ -1773,7 +1645,7 @@ async function searchSnomedTerms(query, options = {}) {
   return searchVocabularyTerms(query, { ...options, vocabulary: "snomed" });
 }
 
-async function defaultTerminologyStatus(workspaceId, outputDir, status = "not_started") {
+function defaultTerminologyStatus(workspaceId, status = "not_started") {
   return {
     ok: true,
     workspaceId,
@@ -1784,51 +1656,48 @@ async function defaultTerminologyStatus(workspaceId, outputDir, status = "not_st
     processedQuestionCount: 0,
     entityCount: 0,
     questions: [],
-    warnings: [],
-    terminologyPath: terminologyResultPath(outputDir)
+    warnings: []
   };
 }
 
 async function loadTerminology(workspaceId) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
-  const resultPath = terminologyResultPath(outputDir);
-  if (!existsSync(resultPath)) return defaultTerminologyStatus(cleanId, outputDir);
-  try {
-    const data = JSON.parse(await readFile(resultPath, "utf8"));
-    return { ok: data.ok !== false, workspaceId: cleanId, terminologyPath: resultPath, ...data };
-  } catch (error) {
-    return {
-      ...(await defaultTerminologyStatus(cleanId, outputDir, "error")),
-      ok: false,
-      error: `Could not read terminology extraction output: ${error.message || String(error)}`
-    };
+  const { cleanId } = await requireWorkspace(workspaceId);
+  const run = terminologyRuns.get(cleanId);
+  if (run) {
+    // The extractor rewrites its result file as it works; that is the live progress.
+    try {
+      const progress = JSON.parse(await readFile(run.resultPath, "utf8"));
+      return { ok: progress.ok !== false, workspaceId: cleanId, ...progress };
+    } catch {}
   }
+  let data = await store.getTerminology(cleanId);
+  if (!data) return defaultTerminologyStatus(cleanId);
+  if (data.status === "running" && !run) {
+    // The server restarted while the extractor was running.
+    data = { ...data, ok: false, status: "error", completedAt: isoStamp(), error: "Terminology extraction was interrupted. Run it again." };
+    await store.setTerminology(cleanId, data);
+  }
+  return { ok: data.ok !== false, workspaceId: cleanId, ...data };
 }
 
 async function startTerminologyExtraction(workspaceId, options = {}) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
-  if (await workspaceHasPublishedXml(outputDir)) {
+  const { cleanId } = await requireWorkspace(workspaceId);
+  if (await store.formHasXml(cleanId)) {
     throw new Error("Terminology review is locked after publishing. Create a new version to change mappings.");
   }
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  const resultPath = terminologyResultPath(outputDir);
-  const draft = JSON.parse(await readFile(draftPath, "utf8"));
-  draft.terminologyUseLlm = false;
-  draft.updatedAt = isoStamp();
-  await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  const draft = { ...(await store.getDraft(cleanId)), terminologyUseLlm: false, updatedAt: isoStamp() };
+  await saveDraft(cleanId, draft);
   const questionIds = Array.isArray(options.questionIds)
     ? [...new Set(options.questionIds.map((id) => String(id || "").trim()).filter(Boolean))]
     : [];
-  await mkdir(path.dirname(resultPath), { recursive: true });
 
-  if (!options.force && existsSync(resultPath)) {
-    try {
-      const existing = JSON.parse(await readFile(resultPath, "utf8"));
-      if (existing.status === "running") {
-        return { ok: true, workspaceId: cleanId, started: false, reason: "already_running", ...existing, terminologyPath: resultPath };
-      }
-    } catch {}
+  if (!options.force) {
+    const existing = await loadTerminology(cleanId);
+    if (existing.status === "running") {
+      return { ...existing, ok: true, workspaceId: cleanId, started: false, reason: "already_running" };
+    }
   }
+  terminologyRuns.get(cleanId)?.child.kill();
 
   const initial = {
     ok: true,
@@ -1841,79 +1710,78 @@ async function startTerminologyExtraction(workspaceId, options = {}) {
     processedQuestionCount: 0,
     entityCount: 0,
     questions: [],
-	    warnings: [],
-	    rerunQuestionIds: questionIds,
-	    terminologyPath: resultPath
-	  };
-  await writeFile(resultPath, JSON.stringify(initial, null, 2) + "\n", "utf8");
+    warnings: [],
+    rerunQuestionIds: questionIds
+  };
+  const failure = (message) => ({ ...initial, ok: false, status: "error", completedAt: isoStamp(), error: message });
+  await store.setTerminology(cleanId, initial);
 
   if (!existsSync(mapperPythonBin)) {
-    const failed = {
-      ...initial,
-      ok: false,
-      status: "error",
-      completedAt: isoStamp(),
-      error: `Mapper Python environment not found: ${mapperPythonBin}`
-    };
-    await writeFile(resultPath, JSON.stringify(failed, null, 2) + "\n", "utf8");
+    const failed = failure(`Mapper Python environment not found: ${mapperPythonBin}`);
+    await store.setTerminology(cleanId, failed);
     return { workspaceId: cleanId, started: false, ...failed };
   }
 
-	  const child = spawn(
-	    mapperPythonBin,
-	    [
-	      terminologyExtractorPath,
-	      draftPath,
-	      resultPath,
-	      "--mapper-root",
-	      mapperRoot,
-	      ...(questionIds.length ? ["--question-ids", questionIds.join(","), "--merge-existing"] : [])
-	    ],
-	    { cwd: mapperRoot, env: { ...process.env, PYTHONUNBUFFERED: "1" }, stdio: "ignore", detached: true }
-	  );
-  child.once("error", async (error) => {
-    const failed = {
-      ...initial,
-      ok: false,
-      status: "error",
-      completedAt: isoStamp(),
-      error: `Could not start terminology extraction: ${error.message || String(error)}`
-    };
-    try {
-      await writeFile(resultPath, JSON.stringify(failed, null, 2) + "\n", "utf8");
-    } catch {}
-  });
-  child.unref();
-  return { ok: true, workspaceId: cleanId, started: true, status: "running", terminologyPath: resultPath };
+  const dir = await mkdtemp(path.join(os.tmpdir(), "icph-terminology-"));
+  const draftPath = path.join(dir, "form.json");
+  const resultPath = path.join(dir, "question_entities.json");
+  await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  await writeFile(resultPath, JSON.stringify(initial, null, 2) + "\n", "utf8");
+
+  const child = spawn(
+    mapperPythonBin,
+    [
+      terminologyExtractorPath,
+      draftPath,
+      resultPath,
+      "--mapper-root",
+      mapperRoot,
+      ...(questionIds.length ? ["--question-ids", questionIds.join(","), "--merge-existing"] : [])
+    ],
+    { cwd: mapperRoot, env: { ...process.env, PYTHONUNBUFFERED: "1" }, stdio: "ignore" }
+  );
+  terminologyRuns.set(cleanId, { child, resultPath });
+  const finish = async (problem) => {
+    // A forced re-run replaces this run; only the current one records its result.
+    if (terminologyRuns.get(cleanId)?.child === child) {
+      let result = null;
+      try {
+        result = JSON.parse(await readFile(resultPath, "utf8"));
+      } catch {}
+      const final = result && result.status !== "running" ? result : failure(problem || "Terminology extraction stopped before it finished.");
+      try {
+        await store.setTerminology(cleanId, final);
+      } catch (error) {
+        console.error(`Could not save terminology result for ${cleanId}: ${error.message || error}`);
+      }
+      terminologyRuns.delete(cleanId);
+    }
+    await rm(dir, { recursive: true, force: true });
+  };
+  child.once("error", (error) => finish(`Could not start terminology extraction: ${error.message || String(error)}`));
+  child.once("close", (code) => finish(code === 0 ? "" : `Terminology extraction exited with code ${code}.`));
+  return { ok: true, workspaceId: cleanId, started: true, status: "running" };
 }
 
 async function saveTerminologyReview(workspaceId, payload) {
-  const { cleanId, outputDir } = await requireWorkspace(workspaceId);
-  if (await workspaceHasPublishedXml(outputDir)) {
+  const { cleanId } = await requireWorkspace(workspaceId);
+  if (await store.formHasXml(cleanId)) {
     throw new Error("Terminology review is locked after publishing. Create a new version to change mappings.");
   }
-  const resultPath = terminologyResultPath(outputDir);
   const terminology = payload?.terminology;
   if (!terminology || typeof terminology !== "object") throw new Error("Terminology review payload is required.");
-  if (!existsSync(resultPath) && terminology.status !== "skipped_unmapped") {
+  if (!(await store.getTerminology(cleanId)) && terminology.status !== "skipped_unmapped") {
     throw new Error("Run terminology extraction before saving vocabulary review.");
   }
   const body = {
     ...terminology,
     ok: terminology.ok !== false,
     workspaceId: cleanId,
-    reviewUpdatedAt: isoStamp(),
-    terminologyPath: resultPath
+    reviewUpdatedAt: isoStamp()
   };
-  await mkdir(path.dirname(resultPath), { recursive: true });
-  await writeFile(resultPath, JSON.stringify(body, null, 2) + "\n", "utf8");
-  return { ok: true, workspaceId: cleanId, terminologyPath: resultPath, ...body };
-}
-
-async function copyDirIfExists(source, target) {
-  if (!existsSync(source)) return;
-  await mkdir(target, { recursive: true });
-  await cp(source, target, { recursive: true, force: true });
+  delete body.terminologyPath;
+  await store.setTerminology(cleanId, body);
+  return { ...body, ok: true, workspaceId: cleanId };
 }
 
 async function createFormVersion(workspaceId) {
@@ -1922,14 +1790,11 @@ async function createFormVersion(workspaceId) {
   const sourceDraft = loaded.draft;
   const split = splitWorkspaceVersion(sourceDraft.versionBaseId || sourceId);
   const versionBaseId = sourceDraft.versionBaseId || split.baseId;
-  await mkdir(outputRoot, { recursive: true });
-  const existingNames = await readdir(outputRoot);
-  const nextVersionNumber = existingNames.reduce((max, name) => {
-    const match = name.match(new RegExp(`^${versionBaseId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}_v(\\d+)$`, "i"));
-    return match ? Math.max(max, Number(match[1])) : max;
-  }, splitWorkspaceVersion(sourceId).versionNumber) + 1;
+  const nextVersionNumber = Math.max(
+    await store.maxVersionNumber(versionBaseId),
+    splitWorkspaceVersion(sourceId).versionNumber
+  ) + 1;
   const nextWorkspaceId = `${versionBaseId}_v${nextVersionNumber}`;
-  const outputDir = await ensureWorkspace(nextWorkspaceId);
   const now = isoStamp();
   const nextDraft = {
     ...sourceDraft,
@@ -1948,32 +1813,31 @@ async function createFormVersion(workspaceId) {
   delete nextDraft.respondentAccessCode;
   delete nextDraft.publicAccessCode;
   delete nextDraft.respondentCodeMode;
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  await writeFile(draftPath, JSON.stringify(nextDraft, null, 2) + "\n", "utf8");
-  await copyDirIfExists(path.join(loaded.outputDir, "attachments"), path.join(outputDir, "attachments"));
-  const sourceTerminologyPath = terminologyResultPath(loaded.outputDir);
-  if (existsSync(sourceTerminologyPath)) {
-    const targetTerminologyPath = terminologyResultPath(outputDir);
-    const copiedTerminology = JSON.parse(await readFile(sourceTerminologyPath, "utf8"));
-    await mkdir(path.dirname(targetTerminologyPath), { recursive: true });
-    await writeFile(
-      targetTerminologyPath,
-      JSON.stringify({
-        ...copiedTerminology,
+  await withTransaction(async () => {
+    await store.insertForm({
+      workspaceId: nextWorkspaceId,
+      versionBaseId,
+      versionNumber: nextVersionNumber,
+      folderId: String(nextDraft.folderId || "").trim() || null,
+      draft: nextDraft
+    });
+    await store.copyFormAttachments(sourceId, nextWorkspaceId);
+    const sourceTerminology = await store.getTerminology(sourceId);
+    if (sourceTerminology) {
+      await store.setTerminology(nextWorkspaceId, {
+        ...sourceTerminology,
         workspaceId: nextWorkspaceId,
-        terminologyPath: targetTerminologyPath,
         copiedFromWorkspaceId: sourceId,
         copiedAt: now
-      }, null, 2) + "\n",
-      "utf8"
-    );
-  }
+      });
+    }
+  });
   return loadDraft(nextWorkspaceId);
 }
 
 async function updateResponseSettings(workspaceId, payload) {
   const loaded = await loadDraft(workspaceId);
-  if (!(await workspaceHasPublishedXml(loaded.outputDir))) {
+  if (!loaded.hasXml) {
     throw new Error("Participant identifier settings can be changed after the form is published.");
   }
   const responseSettings = normalizeResponseSettings(payload || {});
@@ -1989,7 +1853,7 @@ async function updateResponseSettings(workspaceId, payload) {
     ...responseSettings,
     updatedAt: isoStamp()
   };
-  await writeFile(loaded.draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  await saveDraft(loaded.workspaceId, draft);
   return { ok: true, workspaceId: loaded.workspaceId, draft, ...(await workspaceMeta(loaded.workspaceId)) };
 }
 
@@ -2000,13 +1864,13 @@ async function updateCollectionAccess(workspaceId, payload) {
     collectionLocked: Boolean(payload?.collectionLocked),
     updatedAt: isoStamp()
   };
-  await writeFile(loaded.draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  await saveDraft(loaded.workspaceId, draft);
   return { ok: true, workspaceId: loaded.workspaceId, draft, ...(await workspaceMeta(loaded.workspaceId)) };
 }
 
 async function updateTerminologySettings(workspaceId, payload) {
   const loaded = await loadDraft(workspaceId);
-  if (await workspaceHasPublishedXml(loaded.outputDir)) {
+  if (loaded.hasXml) {
     throw new Error("Terminology settings are locked after publishing. Create a new version to change them.");
   }
   const draft = {
@@ -2014,24 +1878,23 @@ async function updateTerminologySettings(workspaceId, payload) {
     terminologyUseLlm: false,
     updatedAt: isoStamp()
   };
-  await writeFile(loaded.draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  await saveDraft(loaded.workspaceId, draft);
   return { ok: true, workspaceId: loaded.workspaceId, draft, ...(await workspaceMeta(loaded.workspaceId)) };
 }
 
 async function checkpointForm(payload) {
-  const { cleanId: workspaceId, outputDir } = await requireWorkspace(payload.workspaceId);
+  const { cleanId: workspaceId } = await requireWorkspace(payload.workspaceId);
   const draft = { ...payload.form, terminologyUseLlm: false, updatedAt: isoStamp() };
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  const checkpointPath = path.join(outputDir, "drafts", "checkpoints", `${timestampId()}.json`);
-  const body = JSON.stringify(draft, null, 2) + "\n";
-  await writeFile(draftPath, body, "utf8");
-  await writeFile(checkpointPath, body, "utf8");
-  return { ok: true, workspaceId, outputDir, draftPath, checkpointPath, draft, ...(await workspaceMeta(workspaceId)) };
+  await withTransaction(async () => {
+    await saveDraft(workspaceId, draft);
+    await store.insertFormCheckpoint(workspaceId, draft);
+  });
+  return { ok: true, workspaceId, draft, ...(await workspaceMeta(workspaceId)) };
 }
 
 async function exportForm(payload) {
-  const { cleanId: workspaceId, outputDir } = await requireWorkspace(payload.workspaceId);
-  let draft = { ...payload.form, terminologyUseLlm: false, updatedAt: isoStamp() };
+  const { cleanId: workspaceId } = await requireWorkspace(payload.workspaceId);
+  const draft = { ...payload.form, terminologyUseLlm: false, updatedAt: isoStamp() };
   const existingMeta = await workspaceMeta(workspaceId);
   const firstPublish = !existingMeta.hasXml;
   const folderId = String(draft.folderId || "").trim();
@@ -2082,59 +1945,69 @@ async function exportForm(payload) {
   } else if (respondentAccessCode) {
     draft.respondentAccessCode = respondentAccessCode;
   }
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  const xlsxPath = path.join(outputDir, "xlsform", `${slugify(draft.formId || draft.title)}.xlsx`);
-  const xmlPath = path.join(outputDir, "xml", `${slugify(draft.formId || draft.title)}.xml`);
+  const baseName = slugify(draft.formId || draft.title);
 
-  await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
-  const exportResult = await runCommand(pythonBin, [exporterPath, draftPath, xlsxPath]);
-  const attachmentCount = await syncAttachmentsToXlsDir(workspaceId, xlsxPath);
+  await saveDraft(workspaceId, draft);
+  const built = await withScratchDir(async (dir) => {
+    const draftPath = path.join(dir, "form.json");
+    const xlsDir = path.join(dir, "xlsform");
+    const xlsxPath = path.join(xlsDir, `${baseName}.xlsx`);
+    const xmlPath = path.join(dir, `${baseName}.xml`);
+    await mkdir(xlsDir);
+    await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+    const exportResult = await runCommand(pythonBin, [exporterPath, draftPath, xlsxPath]);
+    const attachments = await store.readFormAttachments(workspaceId);
+    if (exportResult.code !== 0) return { exportResult, attachmentCount: attachments.length };
+    const xlsx = await readFile(xlsxPath);
+    // xls2xform looks for media and CSV lists beside the workbook.
+    for (const attachment of attachments) {
+      await writeFile(path.join(xlsDir, attachment.fileName), attachment.data);
+    }
+    let xmlResult = { code: 1, stdout: "", stderr: "xls2xform not found" };
+    if (existsSync(xls2xformBin)) {
+      xmlResult = await runCommand(xls2xformBin, [xlsxPath, xmlPath]);
+    }
+    const xml = xmlResult.code === 0 && existsSync(xmlPath)
+      ? withStartGeopointInputs(draft, await readFile(xmlPath, "utf8"))
+      : null;
+    return { exportResult, xmlResult, xlsx, xml, attachmentCount: attachments.length };
+  });
+  const { exportResult } = built;
   if (exportResult.code !== 0) {
     return {
       ok: false,
       stage: "xlsx",
-      outputDir,
-      draftPath,
-      xlsxPath,
-      xmlPath,
       stdout: exportResult.stdout,
       stderr: exportResult.stderr
     };
   }
 
-  let xmlResult = { code: 1, stdout: "", stderr: "xls2xform not found" };
-  if (existsSync(xls2xformBin)) {
-    xmlResult = await runCommand(xls2xformBin, [xlsxPath, xmlPath]);
-  }
-  let xmlOk = xmlResult.code === 0 && existsSync(xmlPath);
-  if (xmlOk) {
-    await exposeStartGeopointsInXml(draft, xmlPath);
-    xmlOk = existsSync(xmlPath);
-  }
-  if (firstPublish && xmlOk) {
-    if (folderId && draft.primaryIdentifierVariable) {
-      await claimFolderPrimaryIdentifier(folderId, draft.primaryIdentifierVariable);
+  const { xmlResult } = built;
+  const xmlOk = built.xml !== null;
+  await withTransaction(async () => {
+    await store.setFormXlsx(workspaceId, `${baseName}.xlsx`, built.xlsx);
+    if (xmlOk) await store.setFormXml(workspaceId, `${baseName}.xml`, built.xml);
+    if (firstPublish && xmlOk) {
+      if (folderId && draft.primaryIdentifierVariable) {
+        await claimFolderPrimaryIdentifier(folderId, draft.primaryIdentifierVariable);
+      }
+      if (draft.metaFormLink?.fileName && draft.primaryIdentifierVariable) {
+        await claimMetaFormPrimary(draft.metaFormLink.fileName, draft.primaryIdentifierVariable);
+      }
+      draft.respondentAccessCode = respondentAccessCode;
+      draft.respondentCodeMode = draft.respondentCodeMode === "custom" ? "custom" : "random";
+      draft.publishedAt = draft.publishedAt || isoStamp();
+      await saveDraft(workspaceId, draft);
     }
-    if (draft.metaFormLink?.fileName && draft.primaryIdentifierVariable) {
-      await claimMetaFormPrimary(draft.metaFormLink.fileName, draft.primaryIdentifierVariable);
-    }
-    draft.respondentAccessCode = respondentAccessCode;
-    draft.respondentCodeMode = draft.respondentCodeMode === "custom" ? "custom" : "random";
-    draft.publishedAt = draft.publishedAt || isoStamp();
-    await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
-  }
-  const terminology = xmlOk && existsSync(terminologyResultPath(outputDir))
+  });
+  const terminology = xmlOk && (await store.getTerminology(workspaceId))
     ? await loadTerminology(workspaceId)
     : null;
 
   return {
     ok: xmlOk,
     stage: xmlOk ? "complete" : "xml",
-    outputDir,
-    draftPath,
-    xlsxPath,
-    xmlPath,
-    attachmentCount,
+    attachmentCount: built.attachmentCount,
     terminology,
     draft,
     stdout: `${exportResult.stdout}\n${xmlResult.stdout}`.trim(),
@@ -2148,12 +2021,9 @@ async function inspectXlsx(payload) {
   const data = String(payload.dataBase64 || "");
   if (!data) throw new Error("Missing XLSX upload data.");
 
-  const tempDir = path.join(outputRoot, ".tmp_uploads");
-  await mkdir(tempDir, { recursive: true });
-  const tempPath = path.join(tempDir, `${timestampId()}_${originalName}`);
-  await writeFile(tempPath, Buffer.from(data, "base64"));
-
-  try {
+  return withScratchDir(async (dir) => {
+    const tempPath = path.join(dir, originalName);
+    await writeFile(tempPath, Buffer.from(data, "base64"));
     const inspectResult = await runCommand(pythonBin, [inspectorPath, tempPath]);
     if (inspectResult.code !== 0) {
       return {
@@ -2165,9 +2035,7 @@ async function inspectXlsx(payload) {
     }
     const inspected = JSON.parse(inspectResult.stdout || "{}");
     return { ok: true, filename: originalName, ...inspected };
-  } finally {
-    await rm(tempPath, { force: true });
-  }
+  });
 }
 
 function normalizeMetaFormLink(payload) {
@@ -2202,29 +2070,14 @@ async function existingMetaFormPrimary(fileName) {
     }
     return { variable: persistedVariable, question };
   }
-  await mkdir(outputRoot, { recursive: true });
-  let names = [];
-  try {
-    names = await readdir(outputRoot);
-  } catch {}
-  for (const name of names) {
-    const draftPath = path.join(outputRoot, name, "drafts", "form.json");
-    if (!existsSync(draftPath)) continue;
-    try {
-      const draft = JSON.parse(await readFile(draftPath, "utf8"));
-      if (draft?.metaFormLink?.fileName !== cleanName) continue;
-      let published = false;
-      try {
-        published = (await readdir(path.join(outputRoot, name, "xml"))).some((entry) => entry.endsWith(".xml"));
-      } catch {}
-      if (!published) continue;
-      const variable = String(draft.primaryIdentifierVariable || "").trim();
-      if (!variable) continue;
-      const question = (draft.questions || []).find((item) => item.name === variable) || null;
-      return { variable, question, workspaceId: name, title: draft.title || name };
-    } catch {}
-  }
-  return null;
+  const published = (await listForms()).forms.find((item) => (
+    item.metaFormLink?.fileName === cleanName && item.hasXml && String(item.primaryIdentifierVariable || "").trim()
+  ));
+  if (!published) return null;
+  const draft = await store.getDraft(published.workspaceId);
+  const variable = String(published.primaryIdentifierVariable).trim();
+  const question = (draft?.questions || []).find((item) => item.name === variable) || null;
+  return { variable, question, workspaceId: published.workspaceId, title: draft?.title || published.workspaceId };
 }
 
 async function metaFormVariableDetails(fileName, formIndex, variable) {
@@ -2292,29 +2145,25 @@ async function importXlsx(payload) {
   const title = originalName.replace(/\.[^.]+$/, "");
   const versionBaseId = `${timestampId()}_${slugify(title)}`;
   const workspaceId = `${versionBaseId}_v1`;
-  const outputDir = await ensureWorkspace(workspaceId);
-  const xlsxPath = path.join(outputDir, "xlsform", originalName);
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  const xmlPath = path.join(outputDir, "xml", `${slugify(title)}.xml`);
   const data = String(payload.dataBase64 || "");
   if (!data) throw new Error("Missing XLSX upload data.");
-  await writeFile(xlsxPath, Buffer.from(data, "base64"));
+  const xlsx = Buffer.from(data, "base64");
 
-  const importResult = await runCommand(pythonBin, [importerPath, xlsxPath, draftPath]);
+  const { importResult, draft } = await withScratchDir(async (dir) => {
+    const xlsxPath = path.join(dir, originalName);
+    const draftPath = path.join(dir, "form.json");
+    await writeFile(xlsxPath, xlsx);
+    const result = await runCommand(pythonBin, [importerPath, xlsxPath, draftPath]);
+    return { importResult: result, draft: result.code === 0 ? JSON.parse(await readFile(draftPath, "utf8")) : null };
+  });
   if (importResult.code !== 0) {
     return {
       ok: false,
       stage: "import",
-      workspaceId,
-      outputDir,
-      xlsxPath,
-      draftPath,
-      xmlPath,
       stdout: importResult.stdout,
       stderr: importResult.stderr
     };
   }
-  const draft = JSON.parse(await readFile(draftPath, "utf8"));
   const metaFormLink = normalizeMetaFormLink(payload);
   const linkedPrimary = metaFormLink ? await existingMetaFormPrimary(metaFormLink.fileName) : null;
   const folderId = String(payload.folderId || "").trim() || null;
@@ -2376,18 +2225,13 @@ async function importXlsx(payload) {
 	    createdAt: isoStamp(),
 	    updatedAt: isoStamp()
 	  };
-  await writeFile(draftPath, JSON.stringify(updatedDraft, null, 2) + "\n", "utf8");
-  const attachmentCount = await syncAttachmentsToXlsDir(workspaceId, xlsxPath);
+  await store.insertForm({ workspaceId, versionBaseId, versionNumber: 1, folderId, draft: updatedDraft, xlsxName: originalName, xlsx });
 
   return {
     ok: true,
     stage: "imported",
     workspaceId,
-    outputDir,
-    xlsxPath,
-    draftPath,
-    xmlPath,
-    attachmentCount,
+    attachmentCount: 0,
     draft: updatedDraft,
     stdout: importResult.stdout.trim(),
     stderr: importResult.stderr.trim(),
@@ -2434,15 +2278,8 @@ function entryInstanceName(draft, answers, submittedAt) {
   return String(answers?.instanceName || "").trim();
 }
 
-async function readEntries(workspaceId) {
-  const { outputDir } = await requireWorkspace(workspaceId);
-  const entriesPath = path.join(outputDir, "data", "entries.jsonl");
-  if (!existsSync(entriesPath)) return [];
-  const text = await readFile(entriesPath, "utf8");
-  return text
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
+function readEntries(workspaceId) {
+  return store.listEntries(cleanWorkspaceId(workspaceId));
 }
 
 function cleanCheckpointIdentifier(value) {
@@ -2459,23 +2296,8 @@ function checkpointIdentifierKey(value) {
   return cleanCheckpointIdentifier(value).toLowerCase();
 }
 
-async function readRespondentCheckpoints(workspaceId) {
-  const { outputDir } = await requireWorkspace(workspaceId);
-  const checkpointsPath = path.join(outputDir, "data", "checkpoints.jsonl");
-  if (!existsSync(checkpointsPath)) return [];
-  const text = await readFile(checkpointsPath, "utf8");
-  return text
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
-}
-
-async function writeRespondentCheckpoints(workspaceId, checkpoints) {
-  const { outputDir } = await requireWorkspace(workspaceId);
-  const checkpointsPath = path.join(outputDir, "data", "checkpoints.jsonl");
-  await mkdir(path.dirname(checkpointsPath), { recursive: true });
-  await writeFile(checkpointsPath, checkpoints.map((item) => JSON.stringify(item)).join("\n") + (checkpoints.length ? "\n" : ""), "utf8");
-  return checkpointsPath;
+function readRespondentCheckpoints(workspaceId) {
+  return store.listRespondentCheckpoints(cleanWorkspaceId(workspaceId));
 }
 
 async function loadRespondentCheckpoint(workspaceId, payload) {
@@ -2484,8 +2306,7 @@ async function loadRespondentCheckpoint(workspaceId, payload) {
   if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
   const primaryIdentifierValue = cleanCheckpointIdentifier(payload.primaryIdentifierValue);
   const key = checkpointIdentifierKey(primaryIdentifierValue);
-  const checkpoints = await readRespondentCheckpoints(workspaceId);
-  const checkpoint = checkpoints.find((item) => item.primaryIdentifierKey === key) || null;
+  const checkpoint = await store.getRespondentCheckpoint(loaded.workspaceId, key);
   return {
     workspaceId,
     primaryIdentifierVariable,
@@ -2495,12 +2316,8 @@ async function loadRespondentCheckpoint(workspaceId, payload) {
 }
 
 async function deleteRespondentCheckpoint(workspaceId, primaryIdentifierValue) {
-  if (!String(primaryIdentifierValue || "").trim()) return null;
-  const key = checkpointIdentifierKey(primaryIdentifierValue);
-  const checkpoints = await readRespondentCheckpoints(workspaceId);
-  const next = checkpoints.filter((item) => item.primaryIdentifierKey !== key);
-  if (next.length === checkpoints.length) return null;
-  return writeRespondentCheckpoints(workspaceId, next);
+  if (!String(primaryIdentifierValue || "").trim()) return;
+  await store.deleteRespondentCheckpoint(cleanWorkspaceId(workspaceId), checkpointIdentifierKey(primaryIdentifierValue));
 }
 
 async function saveRespondentCheckpoint(workspaceId, payload) {
@@ -2513,8 +2330,7 @@ async function saveRespondentCheckpoint(workspaceId, payload) {
   );
   const now = isoStamp();
   const key = checkpointIdentifierKey(primaryIdentifierValue);
-  const checkpoints = await readRespondentCheckpoints(workspaceId);
-  const previous = checkpoints.find((item) => item.primaryIdentifierKey === key);
+  const previous = await store.getRespondentCheckpoint(loaded.workspaceId, key);
   const checkpoint = {
     id: previous?.id || `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     workspaceId,
@@ -2527,24 +2343,8 @@ async function saveRespondentCheckpoint(workspaceId, payload) {
       [primaryIdentifierVariable]: primaryIdentifierValue
     }
   };
-  const next = [
-    ...checkpoints.filter((item) => item.primaryIdentifierKey !== key),
-    checkpoint
-  ];
-  const checkpointsPath = await writeRespondentCheckpoints(workspaceId, next);
-  return { workspaceId, primaryIdentifierVariable, primaryIdentifierValue, checkpoint, checkpointsPath };
-}
-
-async function saveEntriesCsv(workspaceId, draft, entries) {
-  const { outputDir } = await requireWorkspace(workspaceId);
-  const csvPath = path.join(outputDir, "data", `${slugify(draft.formId || draft.title)}_entries.csv`);
-  const headers = dataHeadersForDraft(draft);
-  const rows = [headers.map(csvEscape).join(",")];
-  for (const entry of entries) {
-    rows.push(headers.map((header) => csvEscape(entryValue(entry.answers?.[header]))).join(","));
-  }
-  await writeFile(csvPath, rows.join("\n") + "\n", "utf8");
-  return csvPath;
+  await store.putRespondentCheckpoint(loaded.workspaceId, key, checkpoint);
+  return { workspaceId, primaryIdentifierVariable, primaryIdentifierValue, checkpoint };
 }
 
 function decodeXmlEntities(value) {
@@ -2737,7 +2537,7 @@ async function assignParticipantBarcode(workspaceId, payload) {
     assignedAt: isoStamp()
   };
   const next = [...registry.filter((item) => item.id !== row.id), record];
-  await writeParticipantRegistry(next);
+  await store.putParticipantAssignment(record);
   return { ok: true, assignment: record, rows: demographicParticipantRows(loaded.draft, await readEntries(workspaceId), next) };
 }
 
@@ -2759,10 +2559,7 @@ function mapperHeadersForDraft(draft) {
   return dataHeadersForDraft(draft);
 }
 
-async function saveMapperCsv(workspaceId, draft, entries) {
-  const { outputDir } = await requireWorkspace(workspaceId);
-  const mapperDir = path.join(outputDir, "data", "mapper_input");
-  await mkdir(mapperDir, { recursive: true });
+function buildMapperCsv(workspaceId, draft, entries) {
   const headers = mapperHeadersForDraft(draft);
   const primaryIdentifierVariable = primaryIdentifierForDraft(draft);
   if (!primaryIdentifierVariable) {
@@ -2776,16 +2573,13 @@ async function saveMapperCsv(workspaceId, draft, entries) {
       throw new Error(`Every submitted entry must include the primary identifier "${primaryIdentifierVariable}" before FHIR creation.`);
     }
   }
-  const csvName = `${slugify(draft?.formId || draft?.title || workspaceId)}-generic-fhir.csv`;
-  const csvPath = path.join(mapperDir, csvName);
   const rows = [headers.map(csvEscape).join(",")];
   for (const entry of entries) {
     rows.push(headers.map((header) => csvEscape(entryValue(entry.answers?.[header]))).join(","));
   }
-  await writeFile(csvPath, rows.join("\n") + "\n", "utf8");
   return {
-    csvPath,
-    mode: "generic_form_mapper",
+    csvName: `${slugify(draft?.formId || draft?.title || workspaceId)}-generic-fhir.csv`,
+    csv: rows.join("\n") + "\n",
     primaryIdentifierVariable
   };
 }
@@ -2826,15 +2620,6 @@ async function assertEntryMutationAllowed(draft, entries, answers, entryId = "")
   }
 }
 
-async function writeEntries(workspaceId, draft, entries) {
-  const { outputDir } = await requireWorkspace(workspaceId);
-  const entriesPath = path.join(outputDir, "data", "entries.jsonl");
-  await mkdir(path.dirname(entriesPath), { recursive: true });
-  await writeFile(entriesPath, entries.map((item) => JSON.stringify(item)).join("\n") + (entries.length ? "\n" : ""), "utf8");
-  const csvPath = await saveEntriesCsv(workspaceId, draft, entries);
-  return { entriesPath, csvPath };
-}
-
 async function deleteEntries(workspaceId, payload) {
   const loaded = await loadDraft(workspaceId);
   const ids = new Set((Array.isArray(payload?.entryIds) ? payload.entryIds : [payload?.entryId])
@@ -2845,28 +2630,19 @@ async function deleteEntries(workspaceId, payload) {
     error.statusCode = 400;
     throw error;
   }
-  const existing = await readEntries(workspaceId);
+  const existing = await readEntries(loaded.workspaceId);
   const entries = existing.filter((entry) => !ids.has(String(entry.id || "")));
   if (entries.length === existing.length) {
     const error = new Error("No matching entries were found.");
     error.statusCode = 404;
     throw error;
   }
-  const { outputDir } = await requireWorkspace(workspaceId);
-  for (const id of ids) {
-    const instancePath = path.join(outputDir, "data", `${id}.xml`);
-    if (existsSync(instancePath)) {
-      await rm(instancePath, { force: true });
-    }
-  }
-  const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
+  await store.deleteEntries(loaded.workspaceId, [...ids]);
   return {
     ok: true,
     workspaceId: loaded.workspaceId,
     deletedCount: existing.length - entries.length,
-    entries,
-    entriesPath,
-    csvPath
+    entries
   };
 }
 
@@ -2884,11 +2660,12 @@ function runIdempotentSubmission(workspaceId, payload, submit) {
 }
 
 function submitEntry(workspaceId, payload) {
-  return runIdempotentSubmission(workspaceId, payload, () => submitEntryUnlocked(workspaceId, payload));
+  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitEntryUnlocked(workspaceId, payload)));
 }
 
-async function submitEntryUnlocked(workspaceId, payload) {
-  const loaded = await loadDraft(workspaceId);
+async function submitEntryUnlocked(requestedWorkspaceId, payload) {
+  const loaded = await loadDraft(requestedWorkspaceId);
+  const workspaceId = loaded.workspaceId;
   const submittedAt = isoStamp();
   const answers = payload.answers || {};
   const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
@@ -2915,11 +2692,11 @@ async function submitEntryUnlocked(workspaceId, payload) {
     };
     const entries = [...existing];
     entries[index] = entry;
-    const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
+    await store.updateEntry(workspaceId, entry);
     if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
       await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable]);
     }
-    return { ok: true, workspaceId, entry, entries, entriesPath, csvPath, updated: true };
+    return { ok: true, workspaceId, entry, entries, updated: true };
   }
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -2929,20 +2706,20 @@ async function submitEntryUnlocked(workspaceId, payload) {
     answers
   };
   const entries = [...existing, entry];
-  const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
+  await store.insertEntry(workspaceId, entry);
   if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
     await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable]);
   }
-  return { ok: true, workspaceId, entry, entries, entriesPath, csvPath };
+  return { ok: true, workspaceId, entry, entries };
 }
 
 function submitOdkEntry(workspaceId, payload) {
-  return runIdempotentSubmission(workspaceId, payload, () => submitOdkEntryUnlocked(workspaceId, payload));
+  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitOdkEntryUnlocked(workspaceId, payload)));
 }
 
-async function submitOdkEntryUnlocked(workspaceId, payload) {
-  const loaded = await loadDraft(workspaceId);
-  const outputDir = loaded.outputDir;
+async function submitOdkEntryUnlocked(requestedWorkspaceId, payload) {
+  const loaded = await loadDraft(requestedWorkspaceId);
+  const workspaceId = loaded.workspaceId;
   const instanceXml = String(payload.instanceXml || "").trim();
   if (!instanceXml) throw new Error("ODK submission XML is required.");
   const submittedAt = isoStamp();
@@ -2953,6 +2730,8 @@ async function submitOdkEntryUnlocked(workspaceId, payload) {
   if (previousSubmission) return { ok: true, workspaceId, entry: previousSubmission, entries: existing, duplicateRetry: true };
   const requestedEntryId = String(payload.entryId || "").trim();
   await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
+  const uploads = prepareSubmissionAttachments(payload.attachments);
+  const uploadSummaries = uploads.map(({ fileName, contentType, data }) => ({ fileName, contentType, sizeBytes: data.length }));
   if (requestedEntryId) {
     const index = existing.findIndex((item) => String(item.id || "") === requestedEntryId);
     if (index < 0) {
@@ -2971,14 +2750,12 @@ async function submitOdkEntryUnlocked(workspaceId, payload) {
       answers,
       instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt)
     };
-    const attachments = await persistSubmissionAttachments(outputDir, entry.id, payload.attachments);
-    if (attachments.length) entry.attachments = [...(entry.attachments || []), ...attachments];
+    if (uploadSummaries.length) entry.attachments = [...(entry.attachments || []), ...uploadSummaries];
     const entries = [...existing];
     entries[index] = entry;
-    const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
-    const instancePath = path.join(outputDir, "data", `${entry.id}.xml`);
-    await writeFile(instancePath, instanceXml + "\n", "utf8");
-    return { ok: true, workspaceId, entry, entries, entriesPath, instancePath, csvPath, updated: true };
+    await store.updateEntry(workspaceId, entry);
+    for (const upload of uploads) await store.putEntryAttachment(workspaceId, entry.id, upload);
+    return { ok: true, workspaceId, entry, entries, updated: true };
   }
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -2991,18 +2768,15 @@ async function submitOdkEntryUnlocked(workspaceId, payload) {
     answers,
     instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, submittedAt)
   };
-  const attachments = await persistSubmissionAttachments(outputDir, entry.id, payload.attachments);
-  if (attachments.length) entry.attachments = attachments;
+  if (uploadSummaries.length) entry.attachments = uploadSummaries;
   const entries = [...existing, entry];
-  const { entriesPath, csvPath } = await writeEntries(workspaceId, loaded.draft, entries);
-  const instancePath = path.join(outputDir, "data", `${entry.id}.xml`);
-  await writeFile(instancePath, instanceXml + "\n", "utf8");
-  return { ok: true, workspaceId, entry, entries, entriesPath, instancePath, csvPath };
+  await store.insertEntry(workspaceId, entry);
+  for (const upload of uploads) await store.putEntryAttachment(workspaceId, entry.id, upload);
+  return { ok: true, workspaceId, entry, entries };
 }
 
-async function persistSubmissionAttachments(outputDir, entryId, attachments = []) {
+function prepareSubmissionAttachments(attachments = []) {
   if (!Array.isArray(attachments) || !attachments.length) return [];
-  const directory = path.join(outputDir, "data", "submission_attachments", cleanAttachmentName(entryId));
   const prepared = attachments.map((attachment) => {
     const fileName = cleanAttachmentName(attachment?.fileName || attachment?.filename);
     const data = Buffer.from(String(attachment?.dataBase64 || ""), "base64");
@@ -3014,16 +2788,7 @@ async function persistSubmissionAttachments(outputDir, entryId, attachments = []
     error.statusCode = 413;
     throw error;
   }
-  if (!prepared.length) return [];
-  await mkdir(directory, { recursive: true });
-  for (const attachment of prepared) {
-    await writeFile(path.join(directory, attachment.fileName), attachment.data);
-  }
-  return prepared.map((attachment) => ({
-    fileName: attachment.fileName,
-    contentType: attachment.contentType,
-    sizeBytes: attachment.data.length
-  }));
+  return prepared;
 }
 
 async function loadSubmissionAttachment(workspaceId, entryId, fileName) {
@@ -3042,9 +2807,13 @@ async function loadSubmissionAttachment(workspaceId, entryId, fileName) {
     error.statusCode = 404;
     throw error;
   }
-  const outputDir = path.join(outputRoot, cleanId);
-  const data = await readFile(path.join(outputDir, "data", "submission_attachments", cleanAttachmentName(entryKey), safeFileName));
-  return { data, contentType: saved.contentType || "application/octet-stream" };
+  const stored = await store.getEntryAttachment(cleanId, entryKey, safeFileName);
+  if (!stored) {
+    const error = new Error("Submission attachment not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  return { data: stored.data, contentType: saved.contentType || stored.contentType };
 }
 
 function patientIdFromBundle(bundle, fallback) {
@@ -3055,93 +2824,78 @@ function patientIdFromBundle(bundle, fallback) {
 }
 
 async function listFhirBundles(workspaceId) {
-  const { outputDir } = await requireWorkspace(workspaceId);
-  const bundleDir = path.join(outputDir, "fhir_bundles");
-  let names = [];
-  try {
-    names = (await readdir(bundleDir)).filter((name) => name.endsWith(".json") && name !== "mapper_result.json");
-  } catch {}
-  const bundles = [];
-  for (const fileName of names.sort()) {
-    const bundlePath = path.join(bundleDir, fileName);
-    try {
-      const bundle = JSON.parse(await readFile(bundlePath, "utf8"));
-      bundles.push({
-        fileName,
-        bundlePath,
-        patientId: patientIdFromBundle(bundle, fileName.replace(/\.json$/, "")),
-        entryCount: Array.isArray(bundle.entry) ? bundle.entry.length : 0,
-        bundle,
-      });
-    } catch (error) {
-      bundles.push({ fileName, bundlePath, patientId: fileName.replace(/\.json$/, ""), entryCount: 0, error: error.message });
-    }
-  }
-  return bundles;
+  const { cleanId } = await requireWorkspace(workspaceId);
+  return (await store.listFhirBundles(cleanId)).map(({ fileName, bundle }) => ({
+    fileName,
+    patientId: patientIdFromBundle(bundle, fileName.replace(/\.json$/, "")),
+    entryCount: Array.isArray(bundle.entry) ? bundle.entry.length : 0,
+    bundle
+  }));
 }
 
-async function passToMapper(workspaceId) {
-  const loaded = await loadDraft(workspaceId);
+async function passToMapper(requestedWorkspaceId) {
+  const loaded = await loadDraft(requestedWorkspaceId);
+  const workspaceId = loaded.workspaceId;
   const entries = await readEntries(workspaceId);
   if (!entries.length) throw new Error("No filled form entries found. Submit at least one entry before passing to the entity mapper.");
 
-  const outputDir = loaded.outputDir;
-  const bundleDir = path.join(outputDir, "fhir_bundles");
-  await mkdir(bundleDir, { recursive: true });
-  const mapperResultPath = path.join(bundleDir, "mapper_result.json");
-  const terminologyPath = terminologyResultPath(outputDir);
-  const mapperInput = await saveMapperCsv(workspaceId, loaded.draft, entries);
-
+  const mapperInput = buildMapperCsv(workspaceId, loaded.draft, entries);
   if (!existsSync(mapperPythonBin)) throw new Error(`Mapper Python environment not found: ${mapperPythonBin}`);
-  if (!mapperInput.primaryIdentifierVariable) {
-    throw new Error("Choose a primary identifier variable before running the ICPH mapper.");
-  }
+  const terminology = await store.getTerminology(workspaceId);
 
-  const mapperArgs = [
-    mapperRunnerPath,
-    mapperInput.csvPath,
-    mapperResultPath,
-    "--primary-identifier",
-    mapperInput.primaryIdentifierVariable
-  ];
-  mapperArgs.push("--generic-form-draft", loaded.draftPath);
-  if (existsSync(terminologyPath)) {
-    mapperArgs.push("--terminology-review", terminologyPath);
-  }
-
-  const mapperResult = await runCommand(
-    mapperPythonBin,
-    mapperArgs,
-    { cwd: mapperRoot }
-  );
+  const run = await withScratchDir(async (dir) => {
+    const csvPath = path.join(dir, mapperInput.csvName);
+    const draftPath = path.join(dir, "form.json");
+    const terminologyPath = path.join(dir, "question_entities.json");
+    // The mapper writes its bundles beside the result file.
+    const bundleDir = path.join(dir, "fhir_bundles");
+    const mapperResultPath = path.join(bundleDir, "mapper_result.json");
+    await mkdir(bundleDir);
+    await writeFile(csvPath, mapperInput.csv, "utf8");
+    await writeFile(draftPath, JSON.stringify(loaded.draft, null, 2) + "\n", "utf8");
+    const mapperArgs = [
+      mapperRunnerPath,
+      csvPath,
+      mapperResultPath,
+      "--primary-identifier",
+      mapperInput.primaryIdentifierVariable,
+      "--generic-form-draft",
+      draftPath
+    ];
+    if (terminology) {
+      await writeFile(terminologyPath, JSON.stringify(terminology, null, 2) + "\n", "utf8");
+      mapperArgs.push("--terminology-review", terminologyPath);
+    }
+    const mapperResult = await runCommand(mapperPythonBin, mapperArgs, { cwd: mapperRoot });
+    if (mapperResult.code !== 0) return { mapperResult };
+    const result = JSON.parse(await readFile(mapperResultPath, "utf8"));
+    const bundles = [];
+    for (const bundleInfo of result.bundles || []) {
+      const sourcePath = bundleInfo.bundle_path;
+      if (!sourcePath || !existsSync(sourcePath)) continue;
+      bundles.push({ fileName: path.basename(sourcePath), bundle: JSON.parse(await readFile(sourcePath, "utf8")) });
+    }
+    return { mapperResult, result, bundles };
+  });
+  const { mapperResult } = run;
   if (mapperResult.code !== 0) {
     return {
       ok: false,
       workspaceId,
-      csvPath: mapperInput.csvPath,
       stdout: mapperResult.stdout,
       stderr: mapperResult.stderr || "ICPH entity mapper failed."
     };
   }
 
-  const result = JSON.parse(await readFile(mapperResultPath, "utf8"));
-  for (const bundleInfo of result.bundles || []) {
-    const sourcePath = bundleInfo.bundle_path;
-    if (!sourcePath || !existsSync(sourcePath)) continue;
-    const targetPath = path.join(bundleDir, path.basename(sourcePath));
-    if (path.resolve(sourcePath) !== path.resolve(targetPath)) {
-      await copyFile(sourcePath, targetPath);
-    }
-  }
+  await withTransaction(async () => {
+    for (const { fileName, bundle } of run.bundles) await store.putFhirBundle(workspaceId, fileName, bundle);
+  });
 
   const fhirBundles = await listFhirBundles(workspaceId);
   return {
     ok: true,
     workspaceId,
-    csvPath: mapperInput.csvPath,
-    terminologyPath: existsSync(terminologyPath) ? terminologyPath : null,
-    mapperResultPath,
-    result,
+    result: run.result,
     fhirBundles,
     stdout: mapperResult.stdout,
     stderr: mapperResult.stderr,
@@ -3151,156 +2905,97 @@ async function passToMapper(workspaceId) {
 
 async function workspaceMeta(workspaceId) {
   const cleanId = cleanWorkspaceId(workspaceId);
-  const outputDir = path.join(outputRoot, cleanId);
-  const draftPath = path.join(outputDir, "drafts", "form.json");
-  const xmlDir = path.join(outputDir, "xml");
-  const xlsDir = path.join(outputDir, "xlsform");
-  const attachmentDir = path.join(outputDir, "attachments");
-  const terminologyPath = terminologyResultPath(outputDir);
-  const entries = existsSync(path.join(outputDir, "data", "entries.jsonl")) ? await readEntries(cleanId) : [];
-  let xmlFiles = [];
-  let xlsxFiles = [];
-  let fhirFiles = [];
-  let attachmentFiles = [];
-  try {
-    xmlFiles = (await readdir(xmlDir)).filter((name) => name.endsWith(".xml"));
-  } catch {}
-  try {
-    xlsxFiles = (await readdir(xlsDir)).filter((name) => name.endsWith(".xlsx"));
-  } catch {}
-  try {
-    fhirFiles = (await readdir(path.join(outputDir, "fhir_bundles")))
-      .filter((name) => name.endsWith(".json") && name !== "mapper_result.json");
-  } catch {}
-  try {
-    const names = await readdir(attachmentDir);
-    for (const name of names) {
-      try {
-        if ((await stat(path.join(attachmentDir, name))).isFile()) attachmentFiles.push(name);
-      } catch {}
-    }
-  } catch {}
-  let draft = null;
-  if (existsSync(draftPath)) {
-    try {
-      draft = JSON.parse(await readFile(draftPath, "utf8"));
-    } catch {}
-  }
-  if (draft && !xmlFiles.length && (draft.respondentAccessCode || draft.publicAccessCode || draft.publishedAt)) {
+  return formMeta(cleanId, await store.formSummary(cleanId), await readFolders());
+}
+
+async function formMeta(cleanId, row, folders) {
+  let draft = row?.draft || null;
+  const hasXml = Boolean(row?.has_xml);
+  if (draft && !hasXml && (draft.respondentAccessCode || draft.publicAccessCode || draft.publishedAt)) {
+    draft = { ...draft, updatedAt: isoStamp() };
     delete draft.respondentAccessCode;
     delete draft.publicAccessCode;
     delete draft.respondentCodeMode;
     delete draft.publishedAt;
-    draft.updatedAt = isoStamp();
-    await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+    await saveDraft(cleanId, draft);
   }
-  if (draft && xmlFiles.length && !draft.respondentAccessCode && !draft.publicAccessCode) {
-    draft.respondentAccessCode = await generateUniqueRespondentAccessCode(cleanId);
-    draft.respondentCodeMode = draft.respondentCodeMode === "custom" ? "custom" : "random";
-    draft.publishedAt = draft.publishedAt || isoStamp();
-    draft.updatedAt = draft.updatedAt || isoStamp();
-    await writeFile(draftPath, JSON.stringify(draft, null, 2) + "\n", "utf8");
+  if (draft && hasXml && !draft.respondentAccessCode && !draft.publicAccessCode) {
+    draft = {
+      ...draft,
+      respondentAccessCode: await generateUniqueRespondentAccessCode(cleanId),
+      respondentCodeMode: draft.respondentCodeMode === "custom" ? "custom" : "random",
+      publishedAt: draft.publishedAt || isoStamp(),
+      updatedAt: draft.updatedAt || isoStamp()
+    };
+    await saveDraft(cleanId, draft);
   }
-  let terminology = null;
-  if (existsSync(terminologyPath)) {
-    try {
-      terminology = JSON.parse(await readFile(terminologyPath, "utf8"));
-    } catch {}
-  }
-  let mtime = new Date(0);
-  try {
-    mtime = (await stat(outputDir)).mtime;
-  } catch {}
+  const entryCount = row?.entry_count || 0;
+  const fhirBundleCount = row?.fhir_bundle_count || 0;
+  const attachmentNames = [...(row?.attachment_names || [])].sort((a, b) => a.localeCompare(b));
+  const folder = draft?.folderId ? folders.find((item) => item.id === draft.folderId) : null;
   const versionInfo = splitWorkspaceVersion(draft?.versionBaseId || cleanId);
   let pipelineStage = "Building";
-  if (fhirFiles.length) pipelineStage = "FHIR";
-  else if (entries.length) pipelineStage = "Data collection";
-  else if (xmlFiles.length) pipelineStage = "Publishing";
+  if (fhirBundleCount) pipelineStage = "FHIR";
+  else if (entryCount) pipelineStage = "Data collection";
+  else if (hasXml) pipelineStage = "Publishing";
   else if (draft?.buildFinishedAt) pipelineStage = "Terminology";
   return {
     workspaceId: cleanId,
-    outputDir,
-    title: draft?.title || workspaceId,
+    title: draft?.title || cleanId,
     formId: draft?.formId || "",
     pipelineStage,
     questionCount: draft?.questions?.length || 0,
-    entryCount: entries.length,
-    fhirBundleCount: fhirFiles.length,
-    hasXml: xmlFiles.length > 0,
-    hasXlsx: xlsxFiles.length > 0,
-    hasFhir: fhirFiles.length > 0,
-	    hasTerminology: Boolean(terminology),
-	    terminologyStatus: terminology?.status || "not_started",
-	    terminologyEntityCount: terminology?.entityCount || 0,
-	    terminologyPath: existsSync(terminologyPath) ? terminologyPath : null,
-	    buildFinishedAt: draft?.buildFinishedAt || null,
+    entryCount,
+    fhirBundleCount,
+    hasXml,
+    hasXlsx: Boolean(row?.has_xlsx),
+    hasFhir: fhirBundleCount > 0,
+    hasTerminology: Boolean(row?.has_terminology),
+    terminologyStatus: row?.terminology_status || "not_started",
+    terminologyEntityCount: Number(row?.terminology_entity_count) || 0,
     versionNumber: draft?.versionNumber || versionInfo.versionNumber,
     versionBaseId: draft?.versionBaseId || versionInfo.baseId,
     previousVersionWorkspaceId: draft?.previousVersionWorkspaceId || null,
     previousVersionNumber: draft?.previousVersionNumber || null,
     versionChangeSummary: draft?.versionChangeSummary || [],
     hasVersionChanges: formHasVersionChanges(draft || {}),
-    attachmentCount: attachmentFiles.length,
-    attachmentNames: attachmentFiles.sort((a, b) => a.localeCompare(b)),
-    xmlPath: xmlFiles[0] ? path.join(xmlDir, xmlFiles[0]) : null,
-    xlsxPath: xlsxFiles[0] ? path.join(xlsDir, xlsxFiles[0]) : null,
-    fhirBundlePaths: fhirFiles.map((name) => path.join(outputDir, "fhir_bundles", name)),
-    updatedAt: draft?.updatedAt || mtime.toISOString(),
+    attachmentCount: attachmentNames.length,
+    attachmentNames,
+    updatedAt: draft?.updatedAt || (row?.updated_at || new Date(0)).toISOString(),
     importedFrom: draft?.importedFrom || null,
     metaFormLink: draft?.metaFormLink || null,
     folderId: draft?.folderId || null,
     primaryIdentifierVariable: draft?.primaryIdentifierVariable || null,
     participantIdentifierVariable: draft?.participantIdentifierVariable || draft?.primaryIdentifierVariable || null,
-    folderPrimaryIdentifierVariable: draft?.folderId
-      ? (String((await readFolders()).find((folder) => folder.id === draft.folderId)?.primaryIdentifierVariable || "").trim() || null)
-      : null,
-    folderParticipantIdentifierVariable: draft?.folderId
-      ? (String((await readFolders()).find((folder) => folder.id === draft.folderId)?.participantIdentifierVariable || "").trim() || null)
-      : null,
+    folderPrimaryIdentifierVariable: String(folder?.primaryIdentifierVariable || "").trim() || null,
+    folderParticipantIdentifierVariable: String(folder?.participantIdentifierVariable || "").trim() || null,
     responseSettings: normalizeResponseSettings(draft || {}),
     collectionLocked: Boolean(draft?.collectionLocked),
     buildFinishedAt: draft?.buildFinishedAt || null,
     publishedAt: draft?.publishedAt || null,
-    respondentAccessCode: draft?.respondentAccessCode || draft?.publicAccessCode || null,
+    respondentAccessCode: draft?.respondentAccessCode || draft?.publicAccessCode || null
   };
 }
 
 async function listForms() {
-  await mkdir(outputRoot, { recursive: true });
-  const names = await readdir(outputRoot);
+  const folders = await readFolders();
   const forms = [];
-  for (const name of names) {
-    const fullPath = path.join(outputRoot, name);
-    try {
-      if (!(await stat(fullPath)).isDirectory()) continue;
-      if (!existsSync(path.join(fullPath, "drafts", "form.json"))) continue;
-      forms.push(await workspaceMeta(name));
-    } catch {}
+  for (const row of await store.formSummaries()) {
+    forms.push(await formMeta(row.workspace_id, row, folders));
   }
   forms.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
-  return { ok: true, forms, outputRoot };
+  return { ok: true, forms };
 }
 
 async function deleteForm(workspaceId) {
   const cleanId = cleanWorkspaceId(workspaceId);
-  const outputDir = path.resolve(outputRoot, cleanId);
-  const safeRoot = path.resolve(outputRoot) + path.sep;
-  if (!outputDir.startsWith(safeRoot)) {
-    throw new Error("Refusing to delete a folder outside the ICPH forms output directory.");
-  }
-  if (!existsSync(path.join(outputDir, "drafts", "form.json"))) {
-    throw new Error("Refusing to delete this folder because it does not look like a form workspace.");
-  }
-  let draft = null;
-  try {
-    draft = JSON.parse(await readFile(path.join(outputDir, "drafts", "form.json"), "utf8"));
-  } catch {}
-  await rm(outputDir, { recursive: true, force: false });
-  const registry = await readParticipantRegistry();
-  const remainingRegistry = registry.filter((item) => item.workspaceId !== cleanId);
-  if (remainingRegistry.length !== registry.length) await writeParticipantRegistry(remainingRegistry);
+  const draft = await store.getDraft(cleanId);
+  if (!draft) throw new Error(`Form workspace not found: ${cleanId}`);
+  terminologyRuns.get(cleanId)?.child.kill();
+  // Entries, attachments, checkpoints, FHIR bundles and barcode assignments go with the form.
+  await store.deleteForm(cleanId);
   await releaseSharedIdentifiersForForm(draft);
-  return { ok: true, workspaceId: cleanId, deletedPath: outputDir };
+  return { ok: true, workspaceId: cleanId };
 }
 
 const server = createServer(async (req, res) => {
@@ -3309,7 +3004,8 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const pathname = url.pathname;
     if (req.method === "GET" && pathname === "/api/health") {
-      return jsonResponse(res, 200, { ok: true, outputRoot });
+      await query("SELECT 1");
+      return jsonResponse(res, 200, { ok: true });
     }
     if (req.method === "GET" && pathname === "/api/auth/config") {
       return jsonResponse(res, 200, { ok: true, url: keycloakPublicUrl, realm: keycloakRealm, clientId: keycloakClientId });
@@ -3554,7 +3250,7 @@ const server = createServer(async (req, res) => {
   }
 });
 
+await migrate();
 server.listen(port, "0.0.0.0", () => {
   console.log(`ICPH form-builder API listening on http://localhost:${port}`);
-  console.log(`Output root: ${outputRoot}`);
 });

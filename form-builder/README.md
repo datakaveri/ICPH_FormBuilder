@@ -58,13 +58,13 @@ http://localhost:5173
 ```
 
 The Docker image builds the frontend first and then serves the built app on
-port `5173`. The compose setup persists generated forms and submissions to
-`output/forms/` on the host.
+port `5173`. The compose setup stores forms and submissions in its `postgres`
+service.
 
 ## Current Flow
 
-The app opens on a home dashboard. It shows every form workspace under
-`../output/forms`, including the current pipeline stage:
+The app opens on a home dashboard. It shows every form workspace, including the
+current pipeline stage:
 
 - `Building`: draft exists, XML has not been generated yet
 - `Publishing`: XLSForm/XML exist and the form can be filled locally
@@ -84,39 +84,28 @@ Inside the builder you can:
 - save a checkpoint
 - export XLSForm `.xlsx` and XForm `.xml`
 
-The fill-form tab writes local entries back into the same workspace:
-
-```text
-data/entries.jsonl
-data/<form-id>_entries.csv
-```
+The fill-form tab stores each submission as a row in the `entries` table for
+the same workspace.
 
 ## Workspace Contract
 
-Clicking `Create New Form` creates a dedicated folder under:
+Clicking `Create New Form` creates a row in the `forms` table. A workspace is
+that row plus the rows that reference it:
 
-```text
-../output/forms/
-```
+| Data | Table |
+|---|---|
+| Draft, generated XLSForm and XForm XML, terminology review | `forms` |
+| Draft snapshot per save | `form_checkpoints` |
+| Form media and CSV lists | `form_attachments` |
+| Submissions | `entries` |
+| Files uploaded with a submission | `entry_attachments` |
+| Partly filled responses | `respondent_checkpoints` |
+| FHIR bundles | `fhir_bundles` |
 
-Each form workspace contains:
-
-```text
-drafts/form.json
-drafts/checkpoints/<timestamp>.json
-xlsform/<form-id>.xlsx
-xml/<form-id>.xml
-data/
-fhir_bundles/
-logs/
-```
-
-The `data/` and `fhir_bundles/` folders are written by the local collection and
-FHIR handoff stages:
-
-1. local form visualization/data entry
-2. collected CSV export
-3. agentic entity mapper FHIR generation
+Folders, barcode assignments and MetaForm primary identifiers are in `folders`,
+`participant_registry` and `meta_form_primaries`. The schema is in
+`server/migrations/`; the server applies new migration files on start. Set
+`DATABASE_URL` to point the API at a database.
 
 ## Test Exporter Directly
 

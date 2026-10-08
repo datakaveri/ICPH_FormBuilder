@@ -55,11 +55,10 @@ The complete `agentic-entity-mapper/SchemaTerminologies/` directory is mounted
 from the host into the container. Terminology data and uploaded MetaForms stay
 on the host, are not baked into the image, and are available without rebuilding.
 
-Before starting, create the host data directory and match the container user to
-your account so the app can write persisted data without running as root:
+Before starting, match the container user to your account so the app can write
+MetaForm data without running as root:
 
 ```bash
-mkdir -p output
 export ICPH_UID="$(id -u)"
 export ICPH_GID="$(id -g)"
 docker compose up --build -d
@@ -94,10 +93,13 @@ shared hosting, put an HTTPS reverse proxy in front of ports `5173` and `8787`;
 HTTPS is required for browser camera and geolocation permissions. Do not expose
 the API directly to the public internet.
 
-Generated form workspaces and submissions are persisted on the host at:
+Forms, checkpoints, attachments, submissions, terminology reviews and FHIR
+bundles are stored in the `postgres` service (database `icph`, Docker volume
+`postgres-data`). The app creates and migrates its schema on start from
+`form-builder/server/migrations/`. Back it up with:
 
-```text
-output/forms/
+```bash
+docker compose exec postgres pg_dump -U icph icph > icph-backup.sql
 ```
 
 Terminology data, uploaded MetaForm documents, and generated metadata persist in
@@ -109,8 +111,9 @@ Stop the containers with:
 docker compose down
 ```
 
-This stops/removes the container but leaves both host data directories intact.
-Do not delete `output/` or the MetaForm data directory when redeploying.
+This stops and removes the containers but keeps the database volume and the
+MetaForm data directory. `docker compose down -v` also deletes the database
+volume, and with it every form and submission.
 
 By default, the browser calls the API on the same hostname as the web app, port
 `8787`. When using a reverse proxy that serves both paths on one HTTPS origin,
@@ -139,21 +142,25 @@ ghcr.io` using a credential that has package-read access.
 ## Active Flow
 
 1. Build a form or import an XLSForm in `form-builder`.
-2. Save checkpoints while editing. The canonical draft is
-   `output/forms/<workspace-id>/drafts/form.json`.
-3. Run terminology extraction/review if desired. Results are written to
-   `output/forms/<workspace-id>/terminology/question_entities.json`.
-4. Publish the form. The server exports XLSForm `.xlsx` and XForm `.xml`.
+2. Save checkpoints while editing. The canonical draft is the form's row in the
+   `forms` table; each save also adds a row to `form_checkpoints`.
+3. Run terminology extraction/review if desired. Results are stored with the
+   form.
+4. Publish the form. The server exports XLSForm `.xlsx` and XForm `.xml` and
+   stores both with the form.
 5. Fill the published form locally in the browser.
-6. The server stores entries under `output/forms/<workspace-id>/data`.
-7. Click the FHIR handoff action. The server writes a mapper CSV and runs
-   `form-builder/scripts/run_icph_mapper.py`.
-8. The runner imports `agentic-entity-mapper/generic_form_fhir_agent.py` and
-   writes per-patient FHIR bundles under
-   `output/forms/<workspace-id>/fhir_bundles`.
+6. The server stores each submission as a row in `entries`.
+7. Click the FHIR handoff action. The server writes a mapper CSV to a scratch
+   directory and runs `form-builder/scripts/run_icph_mapper.py`.
+8. The runner imports `agentic-entity-mapper/generic_form_fhir_agent.py`; the
+   per-patient FHIR bundles it produces are stored in `fhir_bundles`.
+
+The XLSForm tools, terminology extractor and FHIR mapper work on files, so the
+server hands them a temporary directory and reads the results back into the
+database. Nothing is kept on disk.
 
 If reviewed terminology exists for the workspace, the FHIR handoff passes
-`question_entities.json` into the mapper. Admin-approved SNOMED CT, LOINC,
+it into the mapper. Admin-approved SNOMED CT, LOINC,
 ICD-10, and RxNorm mappings are written into the generated FHIR as question
 codings; unreviewed suggestions are ignored.
 
@@ -289,14 +296,8 @@ Without them, the app still runs and admins can skip terminology mapping or add
 reviewed mappings manually. Add the lookup folders only if a deployment needs
 automatic SNOMED CT, ICD-10, LOINC, or RxNorm suggestions.
 
-Generated form workspaces:
-
-```text
-output/forms/
-```
-
-Each workspace contains draft JSON, checkpoints, attachments, XLSForm, XML,
-submitted entries, mapper CSV, and generated FHIR bundles.
+Form workspaces live in Postgres. Each one holds its draft, checkpoints,
+attachments, XLSForm, XML, submitted entries, and generated FHIR bundles.
 
 ## Run Form Builder
 
@@ -344,11 +345,15 @@ development defaults: Keycloak runs in `start-dev` mode and must not be exposed
 as is. The init script is safe to re-run; it does not reset the password of a
 user that already exists.
 
-When running the app with `npm run dev`, start only the identity services:
+When running the app with `npm run dev`, start only the database and identity
+services:
 
 ```bash
-docker compose up -d keycloak keycloak-setup
+docker compose up -d postgres keycloak keycloak-setup
 ```
+
+The API connects with `DATABASE_URL`, which defaults to the compose database
+on `localhost:5432`.
 
 The API reads `KEYCLOAK_URL` (how the server reaches Keycloak),
 `KEYCLOAK_PUBLIC_URL` (how browsers reach it; also the token issuer),

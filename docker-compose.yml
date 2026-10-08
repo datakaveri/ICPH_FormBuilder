@@ -13,22 +13,23 @@ services:
     environment:
       NODE_ENV: production
       ICPH_FORM_BUILDER_API_PORT: "8787"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-icph}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-icph}"
       KEYCLOAK_URL: http://keycloak:8080                                   # token keys, inside compose network
       KEYCLOAK_PUBLIC_URL: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}" # browser-visible URL (login + token issuer)
       KEYCLOAK_REALM: icph
       KEYCLOAK_CLIENT_ID: icph-form-builder
     depends_on:
+      postgres:
+        condition: service_healthy
       keycloak-setup:
         condition: service_completed_successfully
     volumes:
       - type: bind
-        source: ./output
-        target: /app/output
-      - type: bind
         source: ./agentic-entity-mapper/SchemaTerminologies
         target: /app/agentic-entity-mapper/SchemaTerminologies
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m
+      # Scratch space for the XLSForm, terminology and FHIR tools, which work on files.
+      - /tmp:rw,noexec,nosuid,size=512m
     read_only: true
     cap_drop:
       - ALL
@@ -45,6 +46,24 @@ services:
       start_period: 20s
       retries: 3
     stop_grace_period: 30s
+    restart: unless-stopped
+
+  # Form builder database. The app creates and migrates its schema on start.
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-icph}"
+      POSTGRES_USER: "${POSTGRES_USER:-icph}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-password}"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
 
   # Local development identity provider. start-dev is not a production setup.
@@ -78,3 +97,4 @@ services:
 
 volumes:
   keycloak-data:
+  postgres-data:

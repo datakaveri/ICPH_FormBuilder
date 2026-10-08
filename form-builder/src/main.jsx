@@ -4286,7 +4286,7 @@ function DashboardApp({ onLogout }) {
       setSelectedId(null);
       setView("builder");
       await refreshForms();
-      setStatus({ kind: "ok", message: data.draft?.primaryIdentifierVariable ? `Workspace created with ${data.draft.primaryIdentifierVariable} as the first question.` : `Workspace created: ${data.outputDir}` });
+      setStatus({ kind: "ok", message: data.draft?.primaryIdentifierVariable ? `Workspace created with ${data.draft.primaryIdentifierVariable} as the first question.` : `Workspace created: ${data.workspaceId}` });
     } catch (error) {
       handleRequestError(error);
     }
@@ -4323,7 +4323,7 @@ function DashboardApp({ onLogout }) {
       setWorkspace(data);
       setForm(normalizeFormDraft(data.draft));
       await refreshForms();
-      setStatus({ kind: "ok", message: `Checkpoint saved: ${data.checkpointPath}` });
+      setStatus({ kind: "ok", message: "Checkpoint saved." });
     } catch (error) {
       handleRequestError(error);
     }
@@ -4522,7 +4522,7 @@ function DashboardApp({ onLogout }) {
         kind: data.ok ? "ok" : "error",
         message: data.ok
           ? alreadyPublished
-            ? `Exported XLSForm and XML: ${data.outputDir}`
+            ? "Exported XLSForm and XML."
             : `Form moved to Publish. Respondent code: ${data.respondentAccessCode || "not generated"}`
           : data.stderr || "XML conversion failed."
       });
@@ -4549,7 +4549,7 @@ function DashboardApp({ onLogout }) {
       await refreshForms();
       setStatus({
         kind: "ok",
-        message: `Generated ${data.fhirBundles?.length || 0} FHIR bundle(s): ${data.mapperResultPath}`
+        message: `Generated ${data.fhirBundles?.length || 0} FHIR bundle(s).`
       });
     } catch (error) {
       handleRequestError(error);
@@ -4959,7 +4959,7 @@ function DashboardApp({ onLogout }) {
         message: data.ok
           ? importedResourceRequirements.length
             ? `Imported XLSForm. ${importedResourceRequirements.filter((item) => !item.uploaded).length} referenced file(s) need upload before publishing.`
-            : `Imported XLSForm: ${data.outputDir}`
+            : `Imported XLSForm: ${data.workspaceId}`
           : data.stderr || "Import failed."
       });
     } catch (error) {
@@ -5057,7 +5057,7 @@ function DashboardApp({ onLogout }) {
         setView("home");
       }
       await refreshForms();
-      setStatus({ kind: "ok", message: `Deleted: ${data.deletedPath}` });
+      setStatus({ kind: "ok", message: `Deleted: ${data.workspaceId}` });
     } catch (error) {
       handleRequestError(error);
     }
@@ -5682,7 +5682,7 @@ function HomePage({
                       <span>Hidden from respondents and field agents</span>
                     </div>
                   ) : null}
-                  <p className="mono">{item.outputDir}</p>
+                  <p className="mono">{item.workspaceId}</p>
                   <div className="card-actions">
                     <button className="secondary" onClick={() => openWorkspace(item.workspaceId)}>
                       <FolderOpen size={16} /> Open
@@ -6917,7 +6917,7 @@ function BuilderPage(props) {
                 <FileSpreadsheet size={18} />
                 Workspace
               </div>
-              <p className="mono">{workspace?.outputDir || "No workspace loaded"}</p>
+              <p className="mono">{workspace?.workspaceId || "No workspace loaded"}</p>
               <div className="mini-metrics">
                 <span>{entries.length} entries</span>
                 <span>{fhirBundles.length} FHIR bundles</span>
@@ -6935,7 +6935,7 @@ function BuilderPage(props) {
                 <FileSpreadsheet size={18} />
                 <span>Workspace</span>
               </div>
-              <p className="mono">{workspace?.outputDir || "No workspace loaded"}</p>
+              <p className="mono">{workspace?.workspaceId || "No workspace loaded"}</p>
               <div className="mini-metrics">
                 <span>{entries.length} entries</span>
                 <span>{fhirBundles.length} FHIR bundles</span>
@@ -8259,7 +8259,7 @@ function FhirPanel({ fhirBundles, form }) {
               <span>{item.patientId}</span>
               <em>{item.entryCount} resources</em>
             </summary>
-            <p className="mono">{item.bundlePath}</p>
+            <p className="mono">{item.fileName}</p>
             {item.error ? (
               <p className="muted">{item.error}</p>
             ) : (
