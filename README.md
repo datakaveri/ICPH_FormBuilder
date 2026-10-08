@@ -41,10 +41,9 @@ the unzipped folder to `ICPH`, open that folder in Terminal, and then run:
 cp .env.example .env
 ```
 
-Edit `.env` and replace the `ICPH_ADMIN_PASSWORD` placeholder with a private,
-random secret of at least 16 characters. The production server refuses the
-sample placeholder and the old default password. Keep `.env` private; it is
-excluded from the Docker build context.
+The defaults in `.env` start a local Keycloak for sign-in (see
+[Sign-in](#sign-in)). Keep `.env` private; it is excluded from the Docker build
+context.
 
 ## Add Client Terminology Assets
 
@@ -315,17 +314,47 @@ Open:
 http://localhost:5173
 ```
 
-The admin workspace is password-gated. The default password is:
+### Sign-in
 
-```text
-ICPH2026
-```
+Admins and field agents sign in through Keycloak. Respondents filling a form
+with a form code do not sign in.
 
-For deployments, set a different password before starting the API:
+`docker compose up` starts a local Keycloak on `http://localhost:8080` and runs
+`keycloak/setup.py`, which creates the `icph` realm, the `icph-form-builder`
+client, the roles `icph-admin` and `icph-field-agent`, and two users:
+
+| User | Password | Role |
+|---|---|---|
+| `admin` | `password` | `icph-admin` |
+| `fieldagent` | `password` | `icph-field-agent` |
+
+The login page uses the `icph` theme in `keycloak/themes/icph/login/`
+(templates, `resources/css/custom.css`, logos in `resources/img/`). It is
+mounted into the Keycloak container, so edits show on the next page reload.
+
+For a deployed Keycloak, `keycloak/Dockerfile` builds a production-mode image
+with the theme copied in (`docker build -t <image> keycloak`). It needs a
+Postgres database and serves under `/auth`; set `KC_DB_URL`, `KC_DB_USERNAME`,
+`KC_DB_PASSWORD`, `KC_HOSTNAME`, and `KC_BOOTSTRAP_ADMIN_USERNAME` /
+`KC_BOOTSTRAP_ADMIN_PASSWORD` for the first start. Point the app at it with
+`KEYCLOAK_URL` and `KEYCLOAK_PUBLIC_URL` ending in `/auth`.
+
+The Keycloak console login is also `admin` / `password`. These are local
+development defaults: Keycloak runs in `start-dev` mode and must not be exposed
+as is. The init script is safe to re-run; it does not reset the password of a
+user that already exists.
+
+When running the app with `npm run dev`, start only the identity services:
 
 ```bash
-ICPH_ADMIN_PASSWORD='replace-this' npm run server
+docker compose up -d keycloak keycloak-setup
 ```
+
+The API reads `KEYCLOAK_URL` (how the server reaches Keycloak),
+`KEYCLOAK_PUBLIC_URL` (how browsers reach it; also the token issuer),
+`KEYCLOAK_REALM` and `KEYCLOAK_CLIENT_ID`. Set `ICPH_APP_URLS` to the origins
+the app is opened from so Keycloak accepts the login redirect. Sign-in needs a
+secure browser context: `localhost` or HTTPS.
 
 When an admin moves a form to Publish, the API generates a 5-character
 alphanumeric respondent form code. Respondents can fill a published form from:

@@ -5,6 +5,7 @@ import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from "nod
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, "..");
@@ -32,17 +33,17 @@ const schemaPreprocessorPath = path.join(mapperRoot, "preprocess_icph_metaforms.
 const schemaManifestName = "icph_metaforms_manifest.json";
 const schemaAggregateChunksName = "icph_metaform_chunks.jsonl";
 const port = Number(process.env.ICPH_FORM_BUILDER_API_PORT || 8787);
-const configuredAdminPassword = String(process.env.ICPH_ADMIN_PASSWORD || "");
-if (
-  process.env.NODE_ENV === "production"
-  && (configuredAdminPassword.length < 16 || configuredAdminPassword === "ICPH2026" || /replace[_ -]?with/i.test(configuredAdminPassword))
-) {
-  throw new Error("Set ICPH_ADMIN_PASSWORD to a private secret of at least 16 characters before running in production.");
-}
-const adminPassword = configuredAdminPassword || "ICPH2026";
-const adminTokens = new Map();
+// KEYCLOAK_URL is how this server reaches Keycloak (token signing keys);
+// KEYCLOAK_PUBLIC_URL is how browsers reach it (login pages, token issuer).
+const keycloakUrl = String(process.env.KEYCLOAK_URL || "http://localhost:8080").replace(/\/+$/, "");
+const keycloakPublicUrl = String(process.env.KEYCLOAK_PUBLIC_URL || keycloakUrl).replace(/\/+$/, "");
+const keycloakRealm = process.env.KEYCLOAK_REALM || "icph";
+const keycloakClientId = process.env.KEYCLOAK_CLIENT_ID || "icph-form-builder";
+const keycloakIssuer = `${keycloakPublicUrl}/realms/${keycloakRealm}`;
+const keycloakKeys = createRemoteJWKSet(new URL(`${keycloakUrl}/realms/${keycloakRealm}/protocol/openid-connect/certs`));
+const ADMIN_ROLE = "icph-admin";
+const FIELD_AGENT_ROLE = "icph-field-agent";
 const activeSubmissionRequests = new Map();
-const adminTokenTtlMs = 12 * 60 * 60 * 1000;
 const accessCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const structuralQuestionTypes = new Set(["begin_group", "end_group", "begin_repeat", "end_repeat", "begin group", "end group", "begin repeat", "end repeat"]);
 const nonPrimaryIdentifierTypes = new Set([
@@ -65,7 +66,7 @@ const nonPrimaryIdentifierTypes = new Set([
 const corsHeaders = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "access-control-allow-headers": "content-type,x-admin-token,x-admin-password,authorization"
+  "access-control-allow-headers": "content-type,authorization"
 };
 
 function jsonResponse(res, status, payload) {
@@ -126,54 +127,48 @@ function isoStamp() {
   return new Date().toISOString();
 }
 
-function cleanupAdminTokens() {
-  const now = Date.now();
-  for (const [token, expiresAt] of adminTokens) {
-    if (!expiresAt || expiresAt <= now) adminTokens.delete(token);
-  }
-}
-
-function createAdminToken() {
-  cleanupAdminTokens();
-  const token = randomBytes(24).toString("hex");
-  adminTokens.set(token, Date.now() + adminTokenTtlMs);
-  return token;
-}
-
-function adminTokenFromRequest(req) {
-  const explicit = req.headers["x-admin-token"];
-  if (explicit) return String(explicit).trim();
-  const authorization = String(req.headers.authorization || "");
-  const match = authorization.match(/^Bearer\s+(.+)$/i);
+function bearerTokenFromRequest(req) {
+  const match = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
   return match ? match[1].trim() : "";
 }
 
-function isAdminRequest(req) {
-  cleanupAdminTokens();
-  const token = adminTokenFromRequest(req);
-  const password = String(req.headers["x-admin-password"] || "");
-  return Boolean((token && adminTokens.has(token)) || (password && password === adminPassword));
+async function authenticateRequest(req) {
+  const token = bearerTokenFromRequest(req);
+  if (!token) return null;
+  let claims;
+  try {
+    ({ payload: claims } = await jwtVerify(token, keycloakKeys, { issuer: keycloakIssuer, algorithms: ["RS256"] }));
+  } catch (error) {
+    // A key-fetch failure is an outage, not a bad token: report it as such.
+    const code = String(error?.code || "");
+    if (!code.startsWith("ERR_J") || code === "ERR_JWKS_TIMEOUT" || code === "ERR_JOSE_GENERIC") {
+      const unavailable = new Error("The login service is unavailable. Try again shortly.");
+      unavailable.statusCode = 503;
+      throw unavailable;
+    }
+    return null;
+  }
+  if (claims.azp !== keycloakClientId) return null;
+  return {
+    id: String(claims.sub || ""),
+    username: String(claims.preferred_username || ""),
+    roles: Array.isArray(claims.realm_access?.roles) ? claims.realm_access.roles : []
+  };
 }
 
-function assertAdmin(req) {
-  if (isAdminRequest(req)) return;
-  const error = new Error("Admin login required.");
-  error.statusCode = 401;
-  throw error;
-}
-
-async function loginAdmin(payload) {
-  const password = String(payload?.password || "");
-  if (password !== adminPassword) {
-    const error = new Error("Incorrect admin password.");
+async function requireRole(req, ...roles) {
+  const user = await authenticateRequest(req);
+  if (!user) {
+    const error = new Error("Login required.");
     error.statusCode = 401;
     throw error;
   }
-  return {
-    ok: true,
-    token: createAdminToken(),
-    expiresInSeconds: Math.floor(adminTokenTtlMs / 1000)
-  };
+  if (!roles.some((role) => user.roles.includes(role))) {
+    const error = new Error("Your account does not have access to this.");
+    error.statusCode = 403;
+    throw error;
+  }
+  return user;
 }
 
 function cleanRespondentAccessCode(value) {
@@ -3316,11 +3311,8 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/health") {
       return jsonResponse(res, 200, { ok: true, outputRoot });
     }
-    if (req.method === "POST" && pathname === "/api/admin/login") {
-      return jsonResponse(res, 200, await loginAdmin(await requestBody(req)));
-    }
-    if (req.method === "GET" && pathname === "/api/admin/session") {
-      return jsonResponse(res, 200, { ok: true, authenticated: isAdminRequest(req) });
+    if (req.method === "GET" && pathname === "/api/auth/config") {
+      return jsonResponse(res, 200, { ok: true, url: keycloakPublicUrl, realm: keycloakRealm, clientId: keycloakClientId });
     }
     const publicFormMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)$/);
     const publicXmlMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/xml$/);
@@ -3331,6 +3323,7 @@ const server = createServer(async (req, res) => {
     const publicAttachmentFileMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments\/([^/]+)$/);
     const publicSubmissionAttachmentMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries\/([^/]+)\/attachments\/([^/]+)$/);
     if (req.method === "GET" && pathname === "/api/public/forms") {
+      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       return jsonResponse(res, 200, await listPublicForms());
     }
     if (req.method === "GET" && publicFormMatch) {
@@ -3340,6 +3333,7 @@ const server = createServer(async (req, res) => {
       return jsonResponse(res, 200, await loadPublicAttachmentList(decodeURIComponent(publicAttachmentListMatch[1])));
     }
     if (req.method === "GET" && publicSubmissionAttachmentMatch) {
+      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       const attachment = await loadSubmissionAttachment(
         (await findWorkspaceByRespondentCode(decodeURIComponent(publicSubmissionAttachmentMatch[1]))).workspaceId,
         decodeURIComponent(publicSubmissionAttachmentMatch[2]),
@@ -3358,9 +3352,11 @@ const server = createServer(async (req, res) => {
       return jsonResponse(res, 200, await submitPublicEntry(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
     }
     if (req.method === "GET" && publicEntriesMatch) {
+      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       return jsonResponse(res, 200, await loadPublicFormEntries(decodeURIComponent(publicEntriesMatch[1])));
     }
     if (req.method === "DELETE" && publicEntriesMatch) {
+      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       return jsonResponse(res, 200, await deletePublicEntries(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
     }
     if (req.method === "POST" && publicCheckpointMatch) {
@@ -3372,7 +3368,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && publicOdkSubmissionMatch) {
       return jsonResponse(res, 200, await submitPublicOdkEntry(decodeURIComponent(publicOdkSubmissionMatch[1]), await requestBody(req)));
     }
-    assertAdmin(req);
+    await requireRole(req, ADMIN_ROLE);
     if (req.method === "GET" && pathname === "/api/forms") {
       return jsonResponse(res, 200, await listForms());
     }

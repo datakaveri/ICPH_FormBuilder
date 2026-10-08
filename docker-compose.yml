@@ -12,8 +12,14 @@ services:
       - "127.0.0.1:8787:8787"
     environment:
       NODE_ENV: production
-      ICPH_ADMIN_PASSWORD: "${ICPH_ADMIN_PASSWORD:?Set ICPH_ADMIN_PASSWORD to a strong secret before starting}"
       ICPH_FORM_BUILDER_API_PORT: "8787"
+      KEYCLOAK_URL: http://keycloak:8080                                   # token keys, inside compose network
+      KEYCLOAK_PUBLIC_URL: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}" # browser-visible URL (login + token issuer)
+      KEYCLOAK_REALM: icph
+      KEYCLOAK_CLIENT_ID: icph-form-builder
+    depends_on:
+      keycloak-setup:
+        condition: service_completed_successfully
     volumes:
       - type: bind
         source: ./output
@@ -40,3 +46,35 @@ services:
       retries: 3
     stop_grace_period: 30s
     restart: unless-stopped
+
+  # Local development identity provider. start-dev is not a production setup.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.0
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: "${KEYCLOAK_ADMIN_USERNAME:-admin}"
+      KC_BOOTSTRAP_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:-password}"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+      - ./keycloak/themes/icph:/opt/keycloak/themes/icph:ro
+    restart: unless-stopped
+
+  # One-shot init: creates the icph realm, roles, client and users. Safe to re-run.
+  keycloak-setup:
+    image: python:3.12-alpine
+    depends_on:
+      - keycloak
+    volumes:
+      - ./keycloak:/setup:ro
+    environment:
+      KC_URL: http://keycloak:8080
+      KC_PUBLIC_URL: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}"
+      KC_ADMIN_USERNAME: "${KEYCLOAK_ADMIN_USERNAME:-admin}"
+      KC_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:-password}"
+      APP_URLS: "${ICPH_APP_URLS:-http://localhost:5173}"
+    command: python /setup/setup.py
+
+volumes:
+  keycloak-data:

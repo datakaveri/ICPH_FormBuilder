@@ -47,6 +47,7 @@ import {
   X
 } from "lucide-react";
 import "./styles.css";
+import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, configureAuth, forgetSession, initAuth, login, logout } from "./auth.js";
 import cdpgLogo from "./assets/cdpg-logo.png";
 import icphLogo from "./assets/icph-logo.png";
 
@@ -54,11 +55,9 @@ const DEFAULT_API_BASE = typeof window === "undefined"
   ? "http://localhost:8787"
   : `${window.location.protocol}//${window.location.hostname}:8787`;
 const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
-const ADMIN_TOKEN_KEY = "icph_admin_token";
+configureAuth(API_BASE);
 const OFFLINE_DATABASE_NAME = "icph-offline-v1";
 const OFFLINE_DATABASE_VERSION = 1;
-let runtimeAdminToken = "";
-let runtimeAdminPassword = "";
 let odkWebFormsLoader = null;
 let offlineDatabasePromise = null;
 let submissionSyncPromise = null;
@@ -102,28 +101,6 @@ function loadOdkWebForms() {
   return odkWebFormsLoader;
 }
 
-function getAdminToken() {
-  if (runtimeAdminToken) return runtimeAdminToken;
-  try {
-    runtimeAdminToken = window.localStorage.getItem(ADMIN_TOKEN_KEY) || "";
-    return runtimeAdminToken;
-  } catch {
-    return "";
-  }
-}
-
-function saveAdminToken(token) {
-  runtimeAdminToken = token || "";
-  try {
-    if (token) window.localStorage.setItem(ADMIN_TOKEN_KEY, token);
-    else window.localStorage.removeItem(ADMIN_TOKEN_KEY);
-  } catch {}
-}
-
-function saveAdminPassword(password) {
-  runtimeAdminPassword = password || "";
-}
-
 function BrandLogos({ variant = "topbar" }) {
   const logoClass = variant === "access" ? "access-logo" : "topbar-logo";
   return (
@@ -132,14 +109,6 @@ function BrandLogos({ variant = "topbar" }) {
       <img className={logoClass} src={cdpgLogo} alt="CDPG" />
     </div>
   );
-}
-
-function adminAuthHeaders() {
-  const token = getAdminToken();
-  return {
-    ...(token ? { "x-admin-token": token } : {}),
-    ...(runtimeAdminPassword ? { "x-admin-password": runtimeAdminPassword } : {})
-  };
 }
 
 function normalizeAccessCodeInput(value) {
@@ -1250,7 +1219,7 @@ function validateAnswers(form, answers, questionSubset = null) {
 
 async function requestJson(path, options = {}) {
   const headers = {
-    ...adminAuthHeaders(),
+    ...(await authHeaders()),
     ...(options.headers || {})
   };
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
@@ -2685,7 +2654,7 @@ function App() {
     return <RespondentPortal initialCode={initialCode} />;
   }
   if (path === "/field-agent") {
-    return <FieldAgentPortal />;
+    return <FieldAgentApp />;
   }
   if (path.startsWith("/public-fill/")) {
     const params = new URLSearchParams(window.location.search);
@@ -2781,7 +2750,7 @@ function FolderVisualizationPage({ folderId }) {
     setStatus({ kind: "busy", message: "Preparing folder response workbook..." });
     try {
       const response = await fetch(`${API_BASE}/api/folders/${encodeURIComponent(folderId)}/responses.xlsx`, {
-        headers: adminAuthHeaders()
+        headers: await authHeaders()
       });
       if (!response.ok) {
         const text = await response.text();
@@ -3036,65 +3005,69 @@ function FolderVisualizationPage({ folderId }) {
   );
 }
 
-function AdminApp() {
-  const [token, setToken] = useState(getAdminToken());
+function useAuthSession() {
+  const [session, setSession] = useState(null);
   const [authMessage, setAuthMessage] = useState("");
 
-  function handleAuthenticated(nextToken) {
-    saveAdminToken(nextToken);
-    setToken(nextToken);
-    setAuthMessage("");
+  useEffect(() => {
+    let cancelled = false;
+    initAuth()
+      .then((nextSession) => { if (!cancelled) setSession(nextSession); })
+      .catch((error) => {
+        if (cancelled) return;
+        setSession({ authenticated: false, username: "", roles: [] });
+        setAuthMessage(`Sign-in is unavailable: ${error.message || String(error)}`);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  function expireSession() {
+    forgetSession();
+    setSession({ authenticated: false, username: "", roles: [] });
+    setAuthMessage("Your session has ended. Sign in again.");
   }
 
-  function handleLogout(message = "Signed out.") {
-    saveAdminToken("");
-    saveAdminPassword("");
-    setToken("");
-    setAuthMessage(message);
-  }
-
-  if (!token) {
-    return <AccessLanding message={authMessage} onAuthenticated={handleAuthenticated} />;
-  }
-
-  return <DashboardApp onLogout={handleLogout} />;
+  return { session, authMessage, expireSession };
 }
 
-function AccessLanding({ message = "", onAuthenticated }) {
+function AdminApp() {
+  const { session, authMessage } = useAuthSession();
+
+  if (!session) {
+    return <div className="access-shell"><main className="access-card"><p>Loading...</p></main></div>;
+  }
+
+  if (!session.authenticated || !session.roles.includes(ADMIN_ROLE)) {
+    return <AccessLanding message={authMessage} session={session} />;
+  }
+
+  return <DashboardApp onLogout={() => logout("/")} />;
+}
+
+function AccessLanding({ message = "", session }) {
   const [activeRole, setActiveRole] = useState("");
-  const [password, setPassword] = useState("");
   const [respondentSession, setRespondentSession] = useState(null);
-  const [status, setStatus] = useState({ kind: message ? "ok" : "idle", message });
-  const canAdminLogin = password.trim().length > 0 && status.kind !== "busy";
+  const [status, setStatus] = useState({ kind: message ? "error" : "idle", message });
+  const signedInWithoutAdmin = session.authenticated && !session.roles.includes(ADMIN_ROLE);
 
   function selectRole(role) {
     setActiveRole((current) => (current === role ? "" : role));
     if (status.kind !== "busy") setStatus({ kind: "idle", message: "" });
   }
 
-  async function submitAdminLogin(event) {
-    event.preventDefault();
-    if (!canAdminLogin) return;
-    setStatus({ kind: "busy", message: "Checking admin password..." });
+  async function signIn(returnPath) {
+    setStatus({ kind: "busy", message: "Opening sign-in..." });
     try {
-      const response = await fetch(`${API_BASE}/api/admin/login`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ password })
-      });
-      const data = await response.json();
-      if (!response.ok || data.ok === false) throw new Error(data.error || "Admin login failed.");
-      saveAdminPassword(password);
-      onAuthenticated(data.token);
+      await login(returnPath);
     } catch (error) {
-      setStatus({ kind: "error", message: error.message || String(error) });
+      setStatus({ kind: "error", message: `Sign-in is unavailable: ${error.message || String(error)}` });
     }
   }
 
-  function openRespondentSession(session) {
-    setRespondentSession(session);
+  function openRespondentSession(nextSession) {
+    setRespondentSession(nextSession);
     setStatus({ kind: "idle", message: "" });
-    window.history.replaceState(null, "", `/respondent/${encodeURIComponent(session.accessCode)}`);
+    window.history.replaceState(null, "", `/respondent/${encodeURIComponent(nextSession.accessCode)}`);
   }
 
   if (respondentSession) {
@@ -3155,26 +3128,24 @@ function AccessLanding({ message = "", onAuthenticated }) {
 
         <div className="access-collapse-area">
           {activeRole === "admin" ? (
-            <form className="access-panel access-panel-open" onSubmit={submitAdminLogin}>
+            <div className="access-panel access-panel-open">
               <div>
                 <h2>Admin</h2>
                 <p>Build, publish, review terminology, and generate FHIR bundles.</p>
               </div>
-              <label className="field">
-                <span>Admin password</span>
-                <input
-                  type="password"
-                  value={password}
-                  autoComplete="current-password"
-                  onChange={(event) => setPassword(event.target.value)}
-                  placeholder="Enter password"
-                  autoFocus
-                />
-              </label>
-              <button className="primary" disabled={!canAdminLogin} type="submit">
-                <Check size={16} /> Open Admin
-              </button>
-            </form>
+              {signedInWithoutAdmin ? (
+                <>
+                  <p>Signed in as {session.username}, which does not have admin access.</p>
+                  <button className="secondary" type="button" onClick={() => logout("/")}>
+                    <X size={16} /> Sign out
+                  </button>
+                </>
+              ) : (
+                <button className="primary" disabled={status.kind === "busy"} type="button" onClick={() => signIn("/")}>
+                  <Check size={16} /> Sign in
+                </button>
+              )}
+            </div>
           ) : null}
 
           {activeRole === "respondent" ? (
@@ -3187,8 +3158,13 @@ function AccessLanding({ message = "", onAuthenticated }) {
                 <h2>Field Agent</h2>
                 <p>Review published forms and submitted entries.</p>
               </div>
-              <button className="primary" type="button" onClick={() => window.location.assign("/field-agent")}>
-                <Forward size={16} /> Enter
+              <button
+                className="primary"
+                disabled={status.kind === "busy"}
+                type="button"
+                onClick={() => (session.authenticated ? window.location.assign("/field-agent") : signIn("/field-agent"))}
+              >
+                <Forward size={16} /> {session.authenticated ? "Enter" : "Sign in"}
               </button>
             </div>
           ) : null}
@@ -3289,7 +3265,64 @@ function PwaInstallButton() {
   );
 }
 
-function FieldAgentPortal() {
+function FieldAgentApp() {
+  const { session, authMessage, expireSession } = useAuthSession();
+  const [status, setStatus] = useState({ kind: "idle", message: "" });
+
+  if (!session) {
+    return <div className="access-shell"><main className="access-card"><p>Loading...</p></main></div>;
+  }
+
+  if (session.authenticated && [FIELD_AGENT_ROLE, ADMIN_ROLE].some((role) => session.roles.includes(role))) {
+    return <FieldAgentPortal onLogout={() => logout("/")} onSessionExpired={expireSession} />;
+  }
+
+  async function signIn() {
+    setStatus({ kind: "busy", message: "Opening sign-in..." });
+    try {
+      await login("/field-agent");
+    } catch (error) {
+      setStatus({ kind: "error", message: `Sign-in is unavailable: ${error.message || String(error)}` });
+    }
+  }
+
+  const message = status.message || authMessage;
+  return (
+    <div className="access-shell">
+      <main className="access-card">
+        <div className="access-head">
+          <div>
+            <h1>Field Agent</h1>
+            <p>Sign in to review published forms and submitted entries.</p>
+          </div>
+          <BrandLogos variant="access" />
+        </div>
+        <div className="access-panel access-panel-open">
+          {session.authenticated ? (
+            <>
+              <p>Signed in as {session.username}, which does not have field agent access.</p>
+              <button className="secondary" type="button" onClick={() => logout("/field-agent")}>
+                <X size={16} /> Sign out
+              </button>
+            </>
+          ) : (
+            <button className="primary" disabled={status.kind === "busy"} type="button" onClick={signIn}>
+              <Check size={16} /> Sign in
+            </button>
+          )}
+        </div>
+        {message ? (
+          <div className={`status-line ${status.kind === "busy" ? "busy" : "error"}`}>
+            <AlertCircle size={16} />
+            <span>{message}</span>
+          </div>
+        ) : null}
+      </main>
+    </div>
+  );
+}
+
+function FieldAgentPortal({ onLogout, onSessionExpired }) {
   const [forms, setForms] = useState([]);
   const [selectedCode, setSelectedCode] = useState("");
   const [displayFieldByCode, setDisplayFieldByCode] = useState({});
@@ -3341,6 +3374,10 @@ function FieldAgentPortal() {
         : nextForms[0]?.respondentAccessCode || "");
       setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
     } catch (error) {
+      if (error?.status === 401) {
+        onSessionExpired?.();
+        return;
+      }
       const savedForms = await listOfflineFormPackages().catch(() => []);
       const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
       if (savedForms.length) {
@@ -3444,6 +3481,9 @@ function FieldAgentPortal() {
         <div className="topbar-actions">
           <button className="secondary topbar-home" onClick={() => window.location.assign("/")}>
             <Home size={18} /> Home
+          </button>
+          <button className="secondary topbar-logout" onClick={() => onLogout?.()}>
+            <X size={14} /> Logout
           </button>
         </div>
         <div className="topbar-title">
@@ -4075,7 +4115,7 @@ function DashboardApp({ onLogout }) {
   function handleRequestError(error) {
     const message = error?.message || String(error);
     if (error?.status === 401) {
-      setStatus({ kind: "error", message: "Admin request was not authorized. Please log out and sign in again if this keeps happening." });
+      setStatus({ kind: "error", message: "Your session has ended or lacks access. Log out and sign in again." });
       return;
     }
     if (error?.status === 404 && /workspace not found/i.test(message)) {
@@ -5059,7 +5099,7 @@ function DashboardApp({ onLogout }) {
     setStatus({ kind: "busy", message: "Downloading ODK XLS..." });
     try {
       const response = await fetch(`${API_BASE}/api/forms/${encodeURIComponent(id)}/xlsx`, {
-        headers: adminAuthHeaders()
+        headers: await authHeaders()
       });
       if (!response.ok) {
         const text = await response.text();
@@ -5508,7 +5548,7 @@ function HomePage({
     <>
       <header className="topbar home-topbar">
         <div className="topbar-actions">
-          <button className="secondary topbar-logout" onClick={() => onLogout?.("Signed out.")}>
+          <button className="secondary topbar-logout" onClick={() => onLogout?.()}>
             <X size={14} /> Logout
           </button>
         </div>
@@ -6491,7 +6531,7 @@ function PublishSettings({
           <div className="respondent-code-callout">
             <span>Respondent form code</span>
             <strong>{fixedCode}</strong>
-            <p>Share this code with respondents. They can enter it from the respondent page without an admin password.</p>
+            <p>Share this code with respondents. They can enter it from the respondent page without signing in.</p>
           </div>
         ) : respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM ? (
           <label className="publish-custom-code-field">
@@ -6656,7 +6696,7 @@ function BuilderPage(props) {
       <header className="topbar form-topbar">
         <div className="topbar-actions">
           <button className="secondary topbar-home" onClick={backHome}><Home size={18} /> Home</button>
-          <button className="secondary topbar-logout" onClick={() => onLogout?.("Signed out.")}>
+          <button className="secondary topbar-logout" onClick={() => onLogout?.()}>
             <X size={14} /> Logout
           </button>
         </div>
@@ -9326,7 +9366,7 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
                 const fileName = String(resource?.href || resource || "").split(/[\\/]/).filter(Boolean).pop() || "";
                 const cachedUrl = cachedAttachmentUrls[resourceFileKey(fileName)];
                 if (cachedUrl) return fetch(cachedUrl);
-                return fetch(`${API_BASE}${apiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: adminAuthHeaders() });
+                return fetch(`${API_BASE}${apiBase}/attachments/${encodeURIComponent(fileName)}`, { headers: await authHeaders() });
               },
               onSubmit: (payload, done) => {
                 const completion = submitOdkPayload(payload)
