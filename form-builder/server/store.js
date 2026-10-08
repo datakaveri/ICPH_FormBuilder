@@ -195,8 +195,8 @@ export async function listEntries(workspaceId) {
 
 export async function insertEntry(workspaceId, entry) {
   await query(
-    "INSERT INTO entries (workspace_id, id, client_submission_id, data, submitted_at) VALUES ($1, $2, $3, $4, $5)",
-    [workspaceId, entry.id, entry.clientSubmissionId || null, json(entry), entry.submittedAt]
+    "INSERT INTO entries (workspace_id, id, client_submission_id, user_id, data, submitted_at) VALUES ($1, $2, $3, $4, $5, $6)",
+    [workspaceId, entry.id, entry.clientSubmissionId || null, entry.userId, json(entry), entry.submittedAt]
   );
 }
 

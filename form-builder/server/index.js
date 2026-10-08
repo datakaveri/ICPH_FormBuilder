@@ -1174,9 +1174,9 @@ async function loadPublicAttachmentList(value) {
   return { ok: true, accessCode: found.code, attachments: data.attachments };
 }
 
-async function submitPublicEntry(value, payload) {
+async function submitPublicEntry(value, payload, user) {
   const found = await findWorkspaceByRespondentCode(value);
-  const data = await submitEntry(found.workspaceId, payload);
+  const data = await submitEntry(found.workspaceId, payload, user);
   return { ok: true, accessCode: found.code, entry: data.entry };
 }
 
@@ -1198,9 +1198,9 @@ async function savePublicCheckpoint(value, payload) {
   return { ok: true, accessCode: found.code, ...data };
 }
 
-async function submitPublicOdkEntry(value, payload) {
+async function submitPublicOdkEntry(value, payload, user) {
   const found = await findWorkspaceByRespondentCode(value);
-  const data = await submitOdkEntry(found.workspaceId, payload);
+  const data = await submitOdkEntry(found.workspaceId, payload, user);
   return { ok: true, accessCode: found.code, entry: data.entry };
 }
 
@@ -2659,11 +2659,11 @@ function runIdempotentSubmission(workspaceId, payload, submit) {
   return pending;
 }
 
-function submitEntry(workspaceId, payload) {
-  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitEntryUnlocked(workspaceId, payload)));
+function submitEntry(workspaceId, payload, user) {
+  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitEntryUnlocked(workspaceId, payload, user)));
 }
 
-async function submitEntryUnlocked(requestedWorkspaceId, payload) {
+async function submitEntryUnlocked(requestedWorkspaceId, payload, user) {
   const loaded = await loadDraft(requestedWorkspaceId);
   const workspaceId = loaded.workspaceId;
   const submittedAt = isoStamp();
@@ -2687,6 +2687,7 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload) {
       ...existing[index],
       ...(clientSubmissionId ? { clientSubmissionId } : {}),
       updatedAt,
+      updatedByUserId: user.id,
       instanceName: entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt),
       answers
     };
@@ -2701,6 +2702,7 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload) {
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     ...(clientSubmissionId ? { clientSubmissionId } : {}),
+    userId: user.id,
     submittedAt,
     instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
     answers
@@ -2713,11 +2715,11 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload) {
   return { ok: true, workspaceId, entry, entries };
 }
 
-function submitOdkEntry(workspaceId, payload) {
-  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitOdkEntryUnlocked(workspaceId, payload)));
+function submitOdkEntry(workspaceId, payload, user) {
+  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitOdkEntryUnlocked(workspaceId, payload, user)));
 }
 
-async function submitOdkEntryUnlocked(requestedWorkspaceId, payload) {
+async function submitOdkEntryUnlocked(requestedWorkspaceId, payload, user) {
   const loaded = await loadDraft(requestedWorkspaceId);
   const workspaceId = loaded.workspaceId;
   const instanceXml = String(payload.instanceXml || "").trim();
@@ -2743,6 +2745,7 @@ async function submitOdkEntryUnlocked(requestedWorkspaceId, payload) {
       ...existing[index],
       ...(clientSubmissionId ? { clientSubmissionId } : {}),
       updatedAt: isoStamp(),
+      updatedByUserId: user.id,
       source: "odk-web-forms",
       payloadType: payload?.payloadType || "monolithic",
       submissionMeta: payload?.submissionMeta || null,
@@ -2760,6 +2763,7 @@ async function submitOdkEntryUnlocked(requestedWorkspaceId, payload) {
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     ...(clientSubmissionId ? { clientSubmissionId } : {}),
+    userId: user.id,
     submittedAt,
     source: "odk-web-forms",
     payloadType: payload.payloadType || "monolithic",
@@ -3010,6 +3014,8 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/auth/config") {
       return jsonResponse(res, 200, { ok: true, url: keycloakPublicUrl, realm: keycloakRealm, clientId: keycloakClientId });
     }
+    // Collection routes: filling in and reviewing published forms by form code.
+    const collector = pathname.startsWith("/api/public/") ? await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE) : null;
     const publicFormMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)$/);
     const publicXmlMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/xml$/);
     const publicEntriesMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries$/);
@@ -3019,7 +3025,6 @@ const server = createServer(async (req, res) => {
     const publicAttachmentFileMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments\/([^/]+)$/);
     const publicSubmissionAttachmentMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries\/([^/]+)\/attachments\/([^/]+)$/);
     if (req.method === "GET" && pathname === "/api/public/forms") {
-      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       return jsonResponse(res, 200, await listPublicForms());
     }
     if (req.method === "GET" && publicFormMatch) {
@@ -3029,7 +3034,6 @@ const server = createServer(async (req, res) => {
       return jsonResponse(res, 200, await loadPublicAttachmentList(decodeURIComponent(publicAttachmentListMatch[1])));
     }
     if (req.method === "GET" && publicSubmissionAttachmentMatch) {
-      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       const attachment = await loadSubmissionAttachment(
         (await findWorkspaceByRespondentCode(decodeURIComponent(publicSubmissionAttachmentMatch[1]))).workspaceId,
         decodeURIComponent(publicSubmissionAttachmentMatch[2]),
@@ -3045,14 +3049,12 @@ const server = createServer(async (req, res) => {
       return binaryResponse(res, 200, attachment.data, attachment.contentType);
     }
     if (req.method === "POST" && publicEntriesMatch) {
-      return jsonResponse(res, 200, await submitPublicEntry(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
+      return jsonResponse(res, 200, await submitPublicEntry(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req), collector));
     }
     if (req.method === "GET" && publicEntriesMatch) {
-      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       return jsonResponse(res, 200, await loadPublicFormEntries(decodeURIComponent(publicEntriesMatch[1])));
     }
     if (req.method === "DELETE" && publicEntriesMatch) {
-      await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE);
       return jsonResponse(res, 200, await deletePublicEntries(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
     }
     if (req.method === "POST" && publicCheckpointMatch) {
@@ -3062,9 +3064,9 @@ const server = createServer(async (req, res) => {
       return jsonResponse(res, 200, await loadPublicCheckpoint(decodeURIComponent(publicCheckpointMatch[1]), await requestBody(req)));
     }
     if (req.method === "POST" && publicOdkSubmissionMatch) {
-      return jsonResponse(res, 200, await submitPublicOdkEntry(decodeURIComponent(publicOdkSubmissionMatch[1]), await requestBody(req)));
+      return jsonResponse(res, 200, await submitPublicOdkEntry(decodeURIComponent(publicOdkSubmissionMatch[1]), await requestBody(req), collector));
     }
-    await requireRole(req, ADMIN_ROLE);
+    const admin = await requireRole(req, ADMIN_ROLE);
     if (req.method === "GET" && pathname === "/api/forms") {
       return jsonResponse(res, 200, await listForms());
     }
@@ -3197,7 +3199,7 @@ const server = createServer(async (req, res) => {
       return binaryResponse(res, 200, attachment.data, attachment.contentType);
     }
     if (req.method === "POST" && entriesMatch) {
-      return jsonResponse(res, 200, await submitEntry(decodeURIComponent(entriesMatch[1]), await requestBody(req)));
+      return jsonResponse(res, 200, await submitEntry(decodeURIComponent(entriesMatch[1]), await requestBody(req), admin));
     }
     if (req.method === "DELETE" && entriesMatch) {
       return jsonResponse(res, 200, await deleteEntries(decodeURIComponent(entriesMatch[1]), await requestBody(req)));
@@ -3209,7 +3211,7 @@ const server = createServer(async (req, res) => {
       return jsonResponse(res, 200, await deleteAttachment(decodeURIComponent(attachmentFileMatch[1]), decodeURIComponent(attachmentFileMatch[2])));
     }
     if (req.method === "POST" && odkSubmissionMatch) {
-      return jsonResponse(res, 200, await submitOdkEntry(decodeURIComponent(odkSubmissionMatch[1]), await requestBody(req)));
+      return jsonResponse(res, 200, await submitOdkEntry(decodeURIComponent(odkSubmissionMatch[1]), await requestBody(req), admin));
     }
     if (req.method === "POST" && mapperMatch) {
       return jsonResponse(res, 200, await passToMapper(decodeURIComponent(mapperMatch[1])));

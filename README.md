@@ -171,15 +171,17 @@ access; it can use admin-approved terminology mappings when available.
 
 ## PWA and Offline Collection
 
-The respondent experience is installable as a Progressive Web App on supported
+The field agent experience is installable as a Progressive Web App on supported
 Android browsers. The app shell is cached, and a published form is saved on a
 device after it is opened successfully online. The cached copy includes its
-XForm, form definition, choice lists, and uploaded form media. Respondents can
-then reopen that form and submit while disconnected.
+XForm, form definition, choice lists, and uploaded form media. A signed-in
+field agent can then reopen that form and submit while disconnected.
 
 Completed submissions and checkpoints are written to encrypted IndexedDB
-before upload. The browser retries them when connectivity returns, when the app
-is reopened, and through Android Background Sync where the browser supports it.
+before upload. The app uploads them with the field agent's sign-in when
+connectivity returns or the app is reopened; Android Background Sync prompts an
+open app to do so. If the sign-in has expired by then, they stay queued on the
+device until the field agent signs in again.
 The server uses an idempotency key so a retry after an interrupted response
 does not create a duplicate. ODK submission attachments are queued with their
 instance XML. A visible sync count and a manual **Sync now** action are shown
@@ -317,8 +319,10 @@ http://localhost:5173
 
 ### Sign-in
 
-Admins and field agents sign in through Keycloak. Respondents filling a form
-with a form code do not sign in.
+Admins and field agents sign in through Keycloak. Nothing can be filled in or
+submitted without a sign-in: collecting a response by form code is part of the
+field agent screens. Each entry records the Keycloak user ID (`sub`) of whoever
+submitted it, in `entries.user_id`.
 
 `docker compose up` starts a local Keycloak on `http://localhost:8080` and runs
 `keycloak/setup.py`, which creates the `icph` realm, the `icph-form-builder`
@@ -362,7 +366,8 @@ the app is opened from so Keycloak accepts the login redirect. Sign-in needs a
 secure browser context: `localhost` or HTTPS.
 
 When an admin moves a form to Publish, the API generates a 5-character
-alphanumeric respondent form code. Respondents can fill a published form from:
+alphanumeric respondent form code. A signed-in field agent fills a published
+form from the Field Agent screen, or by entering the code at:
 
 ```text
 http://localhost:5173/respondent

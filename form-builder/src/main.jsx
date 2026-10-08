@@ -2639,30 +2639,34 @@ function App() {
   useEffect(() => {
     if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
     navigator.serviceWorker.register("/service-worker.js")
-      .then((registration) => {
-        const configure = (worker) => worker?.postMessage({ type: "icph:configure", apiBase: API_BASE });
-        configure(registration.active || registration.waiting || registration.installing);
-        navigator.serviceWorker.ready.then((readyRegistration) => configure(readyRegistration.active));
-      })
       .catch((error) => console.warn("ICPH offline app setup failed:", error));
+    const syncOnRequest = (event) => {
+      if (event.data?.type === "icph:sync-queue") void syncPendingSubmissions().catch(() => {});
+    };
+    navigator.serviceWorker.addEventListener("message", syncOnRequest);
+    return () => navigator.serviceWorker.removeEventListener("message", syncOnRequest);
   }, []);
   if (path.startsWith("/folder-visualization/")) {
     return <FolderVisualizationPage folderId={decodeURIComponent(path.replace("/folder-visualization/", "").split("/")[0] || "")} />;
   }
   if (path.startsWith("/respondent")) {
     const initialCode = decodeURIComponent(path.replace(/^\/respondent\/?/, "").split("/")[0] || "");
-    return <RespondentPortal initialCode={initialCode} />;
+    return <FieldAgentGate>{() => <RespondentPortal initialCode={initialCode} />}</FieldAgentGate>;
   }
   if (path === "/field-agent") {
-    return <FieldAgentApp />;
+    return <FieldAgentGate>{(sessionActions) => <FieldAgentPortal {...sessionActions} />}</FieldAgentGate>;
   }
   if (path.startsWith("/public-fill/")) {
     const params = new URLSearchParams(window.location.search);
-    return <FillForm
-      accessCode={decodeURIComponent(path.replace("/public-fill/", "").split("/")[0])}
-      entryId={params.get("entryId") || ""}
-      resumeCheckpointIdentifier={params.get("checkpoint") || ""}
-    />;
+    return (
+      <FieldAgentGate>
+        {() => <FillForm
+          accessCode={decodeURIComponent(path.replace("/public-fill/", "").split("/")[0])}
+          entryId={params.get("entryId") || ""}
+          resumeCheckpointIdentifier={params.get("checkpoint") || ""}
+        />}
+      </FieldAgentGate>
+    );
   }
   if (path.startsWith("/fill/")) {
     const params = new URLSearchParams(window.location.search);
@@ -3046,7 +3050,6 @@ function AdminApp() {
 
 function AccessLanding({ message = "", session }) {
   const [activeRole, setActiveRole] = useState("");
-  const [respondentSession, setRespondentSession] = useState(null);
   const [status, setStatus] = useState({ kind: message ? "error" : "idle", message });
   const signedInWithoutAdmin = session.authenticated && !session.roles.includes(ADMIN_ROLE);
 
@@ -3062,27 +3065,6 @@ function AccessLanding({ message = "", session }) {
     } catch (error) {
       setStatus({ kind: "error", message: `Sign-in is unavailable: ${error.message || String(error)}` });
     }
-  }
-
-  function openRespondentSession(nextSession) {
-    setRespondentSession(nextSession);
-    setStatus({ kind: "idle", message: "" });
-    window.history.replaceState(null, "", `/respondent/${encodeURIComponent(nextSession.accessCode)}`);
-  }
-
-  if (respondentSession) {
-    return (
-      <FillForm
-        accessCode={respondentSession.accessCode}
-        checkpointAnswers={respondentSession.checkpoint?.answers || null}
-        resumePrimaryIdentifierValue={respondentSession.primaryIdentifierValue || ""}
-        onBackToRespondent={() => {
-          setRespondentSession(null);
-          setStatus({ kind: "idle", message: "" });
-          window.history.replaceState(null, "", "/");
-        }}
-      />
-    );
   }
 
   return (
@@ -3104,15 +3086,6 @@ function AccessLanding({ message = "", session }) {
             onClick={() => selectRole("admin")}
           >
             <span>Admin</span>
-            <ChevronDown size={18} />
-          </button>
-          <button
-            className={`access-role-button ${activeRole === "respondent" ? "active" : ""}`}
-            aria-expanded={activeRole === "respondent"}
-            type="button"
-            onClick={() => selectRole("respondent")}
-          >
-            <span>Respondent</span>
             <ChevronDown size={18} />
           </button>
           <button
@@ -3148,15 +3121,11 @@ function AccessLanding({ message = "", session }) {
             </div>
           ) : null}
 
-          {activeRole === "respondent" ? (
-            <RespondentAccessPanel onOpen={openRespondentSession} />
-          ) : null}
-
           {activeRole === "field-agent" ? (
             <div className="access-panel access-panel-open">
               <div>
                 <h2>Field Agent</h2>
-                <p>Review published forms and submitted entries.</p>
+                <p>Collect responses and review submitted entries for published forms.</p>
               </div>
               <button
                 className="primary"
@@ -3222,11 +3191,14 @@ function RespondentPortal({ initialCode = "" }) {
         <div className="access-head">
           <div>
             <h1>ICPH Form</h1>
-            <p>Enter the form code shared by the study team.</p>
+            <p>Enter the form code to start or resume a response.</p>
           </div>
           <BrandLogos variant="access" />
         </div>
         <RespondentAccessPanel initialCode={initialCode} onOpen={openSession} />
+        <button className="secondary small" type="button" onClick={() => window.location.assign("/field-agent")}>
+          <Home size={16} /> Back to Field Agent
+        </button>
         <PwaInstallButton />
         {status.message ? (
           <div className={`status-line ${status.kind}`}>
@@ -3265,8 +3237,11 @@ function PwaInstallButton() {
   );
 }
 
-function FieldAgentApp() {
+// Everything a field agent does, including filling in a form by its code,
+// sits behind this sign-in. It returns to the page that asked for it.
+function FieldAgentGate({ children }) {
   const { session, authMessage, expireSession } = useAuthSession();
+  const returnPath = `${window.location.pathname}${window.location.search}`;
   const [status, setStatus] = useState({ kind: "idle", message: "" });
 
   if (!session) {
@@ -3274,13 +3249,13 @@ function FieldAgentApp() {
   }
 
   if (session.authenticated && [FIELD_AGENT_ROLE, ADMIN_ROLE].some((role) => session.roles.includes(role))) {
-    return <FieldAgentPortal onLogout={() => logout("/")} onSessionExpired={expireSession} />;
+    return children({ onLogout: () => logout("/"), onSessionExpired: expireSession });
   }
 
   async function signIn() {
     setStatus({ kind: "busy", message: "Opening sign-in..." });
     try {
-      await login("/field-agent");
+      await login(returnPath);
     } catch (error) {
       setStatus({ kind: "error", message: `Sign-in is unavailable: ${error.message || String(error)}` });
     }
@@ -3293,7 +3268,7 @@ function FieldAgentApp() {
         <div className="access-head">
           <div>
             <h1>Field Agent</h1>
-            <p>Sign in to review published forms and submitted entries.</p>
+            <p>Sign in to collect responses and review submitted entries.</p>
           </div>
           <BrandLogos variant="access" />
         </div>
@@ -3301,7 +3276,7 @@ function FieldAgentApp() {
           {session.authenticated ? (
             <>
               <p>Signed in as {session.username}, which does not have field agent access.</p>
-              <button className="secondary" type="button" onClick={() => logout("/field-agent")}>
+              <button className="secondary" type="button" onClick={() => logout(returnPath)}>
                 <X size={16} /> Sign out
               </button>
             </>
@@ -3481,6 +3456,9 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
         <div className="topbar-actions">
           <button className="secondary topbar-home" onClick={() => window.location.assign("/")}>
             <Home size={18} /> Home
+          </button>
+          <button className="secondary topbar-home" onClick={() => window.location.assign("/respondent")}>
+            <Forward size={16} /> Enter form code
           </button>
           <button className="secondary topbar-logout" onClick={() => onLogout?.()}>
             <X size={14} /> Logout
@@ -6531,7 +6509,7 @@ function PublishSettings({
           <div className="respondent-code-callout">
             <span>Respondent form code</span>
             <strong>{fixedCode}</strong>
-            <p>Share this code with respondents. They can enter it from the respondent page without signing in.</p>
+            <p>Field agents open this form with this code after signing in.</p>
           </div>
         ) : respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM ? (
           <label className="publish-custom-code-field">
