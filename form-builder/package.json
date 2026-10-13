@@ -18,7 +18,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "@zxing/browser": "^0.2.1",
     "@zxing/library": "^0.23.0",
-    "concurrently": "^9.1.2",
+    "concurrently": "^9.2.5",
     "jose": "^6.2.12",
     "keycloak-js": "^26.2.4",
     "lucide-react": "^0.468.0",
