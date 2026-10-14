@@ -115,11 +115,13 @@ This stops and removes the containers but keeps the database volume and the
 MetaForm data directory. `docker compose down -v` also deletes the database
 volume, and with it every form and submission.
 
-By default, the browser calls the API on the same hostname as the web app, port
-`8787`. When using a reverse proxy that serves both paths on one HTTPS origin,
-set `VITE_FORM_BUILDER_API` in `.env` to that origin (for example,
-`https://forms.example.org`) and rebuild. The proxy should route `/` to port
-`5173` and `/api/` to port `8787`.
+The browser picks the API address from the page's own address. When the app is
+opened on an explicit port (such as `http://localhost:5173`), it calls port
+`8787` on the same host. When it is opened on a standard port, as behind a
+reverse proxy that serves both paths on one HTTPS origin, it calls `/api` on
+that same origin. The proxy should route `/` to port `5173` and `/api/` to port
+`8787`. Set `VITE_FORM_BUILDER_API` in `.env` and rebuild only if the API lives
+somewhere else.
 
 ```bash
 docker compose up --build -d
@@ -197,8 +199,7 @@ Browser storage can still be removed by the user or operating system, so it is
 not a backup.
 
 For AWS, serve the app and `/api/` on the **same HTTPS origin** through the
-reverse proxy. Set `VITE_FORM_BUILDER_API` to that public HTTPS origin before
-building the Docker image (for example, `https://forms.example.org`). HTTPS is
+reverse proxy; the app then calls `/api` on its own origin. HTTPS is
 required for PWA installation and for camera, geolocation, and secure browser
 storage APIs. Android camera/file permissions remain controlled by the browser
 and the device. Forms must be opened online once on each device before they

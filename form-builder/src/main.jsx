@@ -51,9 +51,14 @@ import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, configureAuth, forgetSession
 import cdpgLogo from "./assets/cdpg-logo.png";
 import icphLogo from "./assets/icph-logo.png";
 
+// Opened on a standard port (behind an ingress or reverse proxy), the API shares
+// the page's origin under /api. Opened on an explicit port (dev server, docker
+// compose on :5173), the API listens on port 8787 of the same host.
 const DEFAULT_API_BASE = typeof window === "undefined"
   ? "http://localhost:8787"
-  : `${window.location.protocol}//${window.location.hostname}:8787`;
+  : window.location.port
+    ? `${window.location.protocol}//${window.location.hostname}:8787`
+    : window.location.origin;
 const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
 configureAuth(API_BASE);
 const OFFLINE_DATABASE_NAME = "icph-offline-v1";

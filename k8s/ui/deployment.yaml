@@ -7,9 +7,8 @@
 #   /api  -> Service icph-form-builder-api, port 8787
 #   /     -> Service icph-form-builder-ui,  port 80
 #
-# Before deploying, build the image with the public origin baked into the web
-# app, or the browser will call port 8787 on the public hostname:
-#   docker build --build-arg VITE_FORM_BUILDER_API=https://sangam.icph.iisc.ac.in -t <image> .
+# Served on https://sangam.icph.iisc.ac.in (no explicit port), the web app calls
+# the API at /api on the same origin, so no build setting is needed.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
