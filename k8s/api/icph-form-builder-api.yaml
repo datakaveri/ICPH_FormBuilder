@@ -4,15 +4,15 @@
 # Every line marked "CHANGE:" needs a value for your cluster.
 # The API and the web app use the same image; they differ only in the command.
 #
-# Routing (not defined here): one public HTTPS hostname must send
+# Routing (ingress.yaml): one public HTTPS hostname sends
 #   /api  -> Service icph-form-builder-api, port 8787
 #   /     -> Service icph-form-builder-ui,  port 80
 #
 # Before deploying:
 #   1. In Keycloak, the icph-form-builder client must list the public origin as
-#      a valid redirect URI (https://forms.example.org/*) and web origin, and
+#      a valid redirect URI (https://sangam.icph.iisc.ac.in/*) and web origin, and
 #      the roles icph-admin and icph-field-agent must exist. keycloak/setup.py
-#      does this when run with APP_URLS=https://forms.example.org.
+#      does this when run with APP_URLS=https://sangam.icph.iisc.ac.in.
 #   2. Create the database named in DATABASE_URL. The API creates its tables
 #      on first start.
 #   3. Apply secret.yaml (or create the Secret by hand) before this file;

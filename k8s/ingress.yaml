@@ -1,0 +1,45 @@
+# Public routing for the ICPH Form Builder on one hostname:
+#   https://sangam.icph.iisc.ac.in/      -> web app  (Service icph-form-builder-ui,  port 80)
+#   https://sangam.icph.iisc.ac.in/api/  -> backend  (Service icph-form-builder-api, port 8787)
+# The backend serves its routes under /api itself, so no path rewrite is needed.
+#
+# Written for ingress-nginx; the annotations below are specific to it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: icph-form-builder
+  namespace: icph                                   # CHANGE: namespace (both Services must be in it)
+  annotations:
+    # Form media, XLSForm uploads and submissions with photos are sent as JSON
+    # bodies; the API accepts up to 160 MB. The ingress-nginx default is 1 MB.
+    nginx.ingress.kubernetes.io/proxy-body-size: "160m"
+    # Publishing a form and generating FHIR bundles run external tools and can
+    # take longer than the default 60 s.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # CHANGE (optional): if certificates come from cert-manager, name the issuer.
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx                           # CHANGE: your ingress class
+  tls:
+    - hosts:
+        - sangam.icph.iisc.ac.in
+      secretName: sangam-icph-tls                   # CHANGE: TLS certificate Secret for this host
+  rules:
+    - host: sangam.icph.iisc.ac.in
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: icph-form-builder-api
+                port:
+                  number: 8787
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: icph-form-builder-ui
+                port:
+                  number: 80
