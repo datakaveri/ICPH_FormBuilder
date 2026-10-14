@@ -1,0 +1,59 @@
+# Public routing for the ICPH Form Builder via Envoy Gateway (Gateway API).
+#   https://sangam.icph.iisc.ac.in/      -> web app  (Service icph-form-builder-ui,  port 80)
+#   https://sangam.icph.iisc.ac.in/api/  -> backend  (Service icph-form-builder-api, port 8787)
+#   https://sangam.icph.iisc.ac.in/auth/ -> Keycloak (separate HTTPRoute in namespace keycloak)
+#
+# Attaches to Gateway envoy/eg. TLS is terminated on the Gateway's "https" listener
+# (cert sangam.icph.iisc.ac.in-cert, managed by cert-manager), so nothing TLS-related here.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+    name: icph-form-builder
+    namespace: icph
+spec:
+    parentRefs:
+        - name: eg
+          namespace: envoy
+          sectionName: https
+    hostnames:
+        - sangam.icph.iisc.ac.in
+    rules:
+        # Backend serves its routes under /api itself, so no rewrite.
+        # Publishing forms and generating FHIR bundles can take up to 5 minutes.
+        - matches:
+              - path:
+                    type: PathPrefix
+                    value: /api
+          backendRefs:
+              - name: icph-form-builder-api
+                port: 8787
+          timeouts:
+              request: 300s
+        - matches:
+              - path:
+                    type: PathPrefix
+                    value: /
+          backendRefs:
+              - name: icph-form-builder-ui
+                port: 80
+---
+# Redirect plain HTTP to HTTPS on the Gateway's "http" listener.
+# cert-manager's ACME challenge routes use more specific matches, so renewals keep working.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+    name: icph-form-builder-redirect
+    namespace: icph
+spec:
+    parentRefs:
+        - name: eg
+          namespace: envoy
+          sectionName: http
+    hostnames:
+        - sangam.icph.iisc.ac.in
+    rules:
+        - filters:
+              - type: RequestRedirect
+                requestRedirect:
+                    scheme: https
+                    statusCode: 301
