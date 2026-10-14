@@ -15,6 +15,8 @@
 #      does this when run with APP_URLS=https://forms.example.org.
 #   2. Create the database named in DATABASE_URL. The API creates its tables
 #      on first start.
+#   3. Apply secret.yaml (or create the Secret by hand) before this file;
+#      the pod will not start without it.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,8 +46,10 @@ spec:
             - name: ICPH_FORM_BUILDER_API_PORT
               value: "8787"
             - name: DATABASE_URL
-              # CHANGE: user, password, host and database.
-              value: "postgres://USER:PASSWORD@psql-postgresql-ha-pgpool.postgres.svc.cluster.local:5432/icph?sslmode=disable"
+              valueFrom:
+                secretKeyRef:
+                  name: icph-form-builder-api       # defined in secret.yaml
+                  key: DATABASE_URL
             - name: KEYCLOAK_URL
               # CHANGE: how the API reaches Keycloak to fetch token signing keys.
               # The public URL works; an in-cluster Service URL avoids the round trip.
