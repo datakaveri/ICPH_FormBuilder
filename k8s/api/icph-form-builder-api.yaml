@@ -1,0 +1,107 @@
+# ICPH Form Builder backend API (Deployment + Service).
+# Keycloak and Postgres are expected to be running in the cluster already.
+#
+# Every line marked "CHANGE:" needs a value for your cluster.
+# The API and the web app use the same image; they differ only in the command.
+#
+# Routing (not defined here): one public HTTPS hostname must send
+#   /api  -> Service icph-form-builder-api, port 8787
+#   /     -> Service icph-form-builder-ui,  port 80
+#
+# Before deploying:
+#   1. In Keycloak, the icph-form-builder client must list the public origin as
+#      a valid redirect URI (https://forms.example.org/*) and web origin, and
+#      the roles icph-admin and icph-field-agent must exist. keycloak/setup.py
+#      does this when run with APP_URLS=https://forms.example.org.
+#   2. Create the database named in DATABASE_URL. The API creates its tables
+#      on first start.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: icph-form-builder-api
+  namespace: icph                                   # CHANGE: namespace
+  labels:
+    app: icph-form-builder-api
+spec:
+  # Keep at 1: terminology extraction progress is held in the API process.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: icph-form-builder-api
+  template:
+    metadata:
+      labels:
+        app: icph-form-builder-api
+    spec:
+      containers:
+        - name: icph-form-builder-api
+          image: ghcr.io/datakaveri/icph-form-builder:latest   # CHANGE: image tag
+          imagePullPolicy: Always
+          command: ["node", "server/index.js"]
+          env:
+            - name: ICPH_FORM_BUILDER_API_PORT
+              value: "8787"
+            - name: DATABASE_URL
+              # CHANGE: user, password, host and database.
+              value: "postgres://USER:PASSWORD@psql-postgresql-ha-pgpool.postgres.svc.cluster.local:5432/icph?sslmode=disable"
+            - name: KEYCLOAK_URL
+              # CHANGE: how the API reaches Keycloak to fetch token signing keys.
+              # The public URL works; an in-cluster Service URL avoids the round trip.
+              # Include /auth if your Keycloak is served under it.
+              value: "https://keycloak.example.org/auth"
+            - name: KEYCLOAK_PUBLIC_URL
+              # CHANGE: the URL browsers use for Keycloak. Tokens are accepted only
+              # if their issuer is exactly <this>/realms/<KEYCLOAK_REALM>.
+              value: "https://keycloak.example.org/auth"
+            - name: KEYCLOAK_REALM
+              value: "icph"                         # CHANGE: realm
+            - name: KEYCLOAK_CLIENT_ID
+              value: "icph-form-builder"            # CHANGE: client id, if different
+          ports:
+            - name: http
+              containerPort: 8787
+          readinessProbe:
+            httpGet:
+              path: /api/health                     # also checks the database connection
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:                                # CHANGE: size for your workload
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+      # CHANGE (optional): uploaded MetaForm documents and the terminology lookup
+      # data live in this folder, not in Postgres. Without a volume the app still
+      # runs, but uploaded MetaForms are lost when the pod restarts and automatic
+      # terminology suggestions are unavailable. To keep them, create a PVC and
+      # uncomment both blocks (volumeMounts goes under the container above).
+      #     volumeMounts:
+      #       - name: schema-terminologies
+      #         mountPath: /app/agentic-entity-mapper/SchemaTerminologies
+      # securityContext:
+      #   fsGroup: 1000                             # the image runs as uid 1000
+      # volumes:
+      #   - name: schema-terminologies
+      #     persistentVolumeClaim:
+      #       claimName: icph-schema-terminologies  # CHANGE: your PVC name
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: icph-form-builder-api
+  namespace: icph                                   # CHANGE: namespace
+  labels:
+    app: icph-form-builder-api
+spec:
+  type: ClusterIP
+  selector:
+    app: icph-form-builder-api
+  ports:
+    - name: http
+      port: 8787
+      targetPort: http

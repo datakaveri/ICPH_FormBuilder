@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: icph-form-builder-ui
+  namespace: icph                                   # CHANGE: namespace
+  labels:
+    app: icph-form-builder-ui
+spec:
+  type: ClusterIP
+  selector:
+    app: icph-form-builder-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,0 +1,54 @@
+# ICPH Form Builder web app.
+#
+# Every line marked "CHANGE:" needs a value for your cluster.
+# The API and the web app use the same image; they differ only in the command.
+#
+# Routing (not defined here): one public HTTPS hostname must send
+#   /api  -> Service icph-form-builder-api, port 8787
+#   /     -> Service icph-form-builder-ui,  port 80
+#
+# Before deploying, build the image with the public origin baked into the web
+# app, or the browser will call port 8787 on the public hostname:
+#   docker build --build-arg VITE_FORM_BUILDER_API=https://forms.example.org -t <image> .
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: icph-form-builder-ui
+  namespace: icph                                   # CHANGE: namespace
+  labels:
+    app: icph-form-builder-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: icph-form-builder-ui
+  template:
+    metadata:
+      labels:
+        app: icph-form-builder-ui
+    spec:
+      containers:
+        - name: icph-form-builder-ui
+          image: ghcr.io/datakaveri/icph-form-builder:latest   # CHANGE: image tag (same image as the API)
+          imagePullPolicy: Always
+          command: ["node", "node_modules/vite/bin/vite.js", "preview", "--host", "0.0.0.0", "--port", "5173"]
+          env:
+            - name: __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS
+              # CHANGE: the public hostname, without scheme or path. Requests for
+              # any other hostname get a 403 from the web server.
+              value: "forms.example.org"
+          ports:
+            - name: http
+              containerPort: 5173
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 128Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
