@@ -1889,7 +1889,10 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
       requiredExpression,
       relevant: bind.relevant || "",
       appearance: control.getAttribute("appearance") || "",
-      defaultValue: defaults.get(name) || "",
+      // XLSForm defaults such as now() are emitted by xls2xform as a
+      // first-load setvalue rather than as text in the instance node. Keep
+      // the authored draft default when that instance node is empty.
+      defaultValue: defaults.get(name) || fallbackQuestion.defaultValue || "",
       constraint: bind.constraint || "",
       constraintMessage: bind.constraintMessage || "",
       calculation: bind.calculation || "",
@@ -5520,57 +5523,29 @@ function DashboardApp({ onLogout }) {
     return { terminology: nextTerminology, question: savedQuestion, entityIndex: savedEntityIndex >= 0 ? savedEntityIndex : addedEntityIndex };
   }
 
-  async function importXlsx(event, folderId = "") {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    setStatus({ kind: "busy", message: `Inspecting ${file.name}...` });
-    try {
-      const dataBase64 = await fileToBase64(file);
-      const data = await postJson("/api/forms/inspect-xlsx", { filename: file.name, dataBase64 });
-      setPendingXlsxImport({
-        filename: file.name,
-        dataBase64,
-        title: data.title,
-        formId: data.formId,
-        variables: data.variables || [],
-        variableCount: data.variableCount || 0,
-        folderId: String(folderId || "").trim() || "",
-        folderName: folders.find((folder) => folder.id === folderId)?.name || "",
-        folderPrimaryIdentifier: folders.find((folder) => folder.id === folderId)?.primaryIdentifierVariable
-          || forms.find((item) => item.folderId === folderId && item.hasXml && item.primaryIdentifierVariable)?.primaryIdentifierVariable
-          || ""
-      });
-      setStatus({
-        kind: "ok",
-        message: `Inspected ${file.name}. Choose its primary identifier and optional MetaForm link.`
-      });
-    } catch (error) {
-      handleRequestError(error);
-    }
-  }
-
-  async function confirmXlsxImport(linkage) {
-    if (!pendingXlsxImport) return;
-    setStatus({ kind: "busy", message: `Importing ${pendingXlsxImport.filename}...` });
+  async function completeXlsxImport(pending, linkage = {}) {
+    if (!pending) return;
+    setStatus({ kind: "busy", message: `Importing ${pending.filename}...` });
     try {
       const data = await postJson("/api/forms/import-xlsx", {
-        filename: pendingXlsxImport.filename,
-        dataBase64: pendingXlsxImport.dataBase64,
+        filename: pending.filename,
+        dataBase64: pending.dataBase64,
         linkedMetaFormFileName: linkage.linkedMetaFormFileName,
         primaryIdentifierVariable: linkage.primaryIdentifierVariable,
         metaFormFormIndex: linkage.metaFormFormIndex,
         metaFormFormTitle: linkage.metaFormFormTitle,
         primaryIdentifierAcknowledged: linkage.primaryIdentifierAcknowledged,
         addMissingPrimaryIdentifier: linkage.addMissingPrimaryIdentifier,
-        folderId: pendingXlsxImport.folderId
+        folderId: pending.folderId
       });
       setPendingXlsxImport(null);
-	      const importedForm = normalizeFormDraft({
-	        ...data.draft,
-	        primaryIdentifierVariable: data.draft?.primaryIdentifierVariable || linkage.primaryIdentifierVariable,
-	        instanceName: data.draft?.instanceName || instanceNameForPrimaryIdentifier(linkage.primaryIdentifierVariable)
-	      });
+      const importedForm = normalizeFormDraft({
+        ...data.draft,
+        primaryIdentifierVariable: data.draft?.primaryIdentifierVariable || linkage.primaryIdentifierVariable || "",
+        instanceName: data.draft?.instanceName || (linkage.primaryIdentifierVariable
+          ? instanceNameForPrimaryIdentifier(linkage.primaryIdentifierVariable)
+          : "")
+      });
       const importedAttachments = data.attachments || [];
       const importedResourceRequirements = formResourceRequirements(
         importedForm,
@@ -5597,6 +5572,51 @@ function DashboardApp({ onLogout }) {
     } catch (error) {
       handleRequestError(error);
     }
+  }
+
+  async function importXlsx(event, folderId = "") {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setStatus({ kind: "busy", message: `Inspecting ${file.name}...` });
+    try {
+      const dataBase64 = await fileToBase64(file);
+      const data = await postJson("/api/forms/inspect-xlsx", { filename: file.name, dataBase64 });
+      const pending = {
+        filename: file.name,
+        dataBase64,
+        title: data.title,
+        formId: data.formId,
+        variables: data.variables || [],
+        variableCount: data.variableCount || 0,
+        folderId: String(folderId || "").trim() || "",
+        folderName: folders.find((folder) => folder.id === folderId)?.name || "",
+        folderPrimaryIdentifier: folders.find((folder) => folder.id === folderId)?.primaryIdentifierVariable
+          || forms.find((item) => item.folderId === folderId && item.hasXml && item.primaryIdentifierVariable)?.primaryIdentifierVariable
+          || ""
+      };
+      if (pending.folderId) {
+        await completeXlsxImport(pending, {
+          linkedMetaFormFileName: "",
+          primaryIdentifierVariable: pending.folderPrimaryIdentifier,
+          primaryIdentifierAcknowledged: false,
+          addMissingPrimaryIdentifier: Boolean(pending.folderPrimaryIdentifier)
+        });
+        return;
+      }
+      setPendingXlsxImport(pending);
+      setStatus({
+        kind: "ok",
+        message: `Inspected ${file.name}. Choose its primary identifier and optional MetaForm link.`
+      });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
+  async function confirmXlsxImport(linkage) {
+    if (!pendingXlsxImport) return;
+    await completeXlsxImport(pendingXlsxImport, linkage);
   }
 
   async function uploadSchemaDocument(event) {
@@ -8915,7 +8935,7 @@ function PreviewPanel({ form, collapsible = false }) {
   const content = (
     <>
       {previewQuestions.slice(0, 5).map((question) => (
-        <PreviewField key={question.id} question={question} />
+        <PreviewField key={question.id} question={question} value={browserDefaultValue(question)} />
       ))}
       {form.questions.length > previewQuestions.length ? (
         <p className="muted">{form.questions.length - previewQuestions.length} conditional questions hidden in this preview.</p>
@@ -8939,6 +8959,17 @@ function PreviewPanel({ form, collapsible = false }) {
       {content}
     </div>
   );
+}
+
+function browserDefaultValue(question = {}) {
+  const defaultValue = String(question.defaultValue || "").trim();
+  if (defaultValue === "now()") {
+    return question.type === "dateTime" ? localTimestamp().slice(0, 16) : "";
+  }
+  if (defaultValue === "today()") {
+    return question.type === "date" ? todayString() : "";
+  }
+  return defaultValue;
 }
 
 function parseLocationPoints(value) {
@@ -13199,10 +13230,8 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         setOfflineReady(Boolean(accessCode && packageCached));
         const defaults = {};
         for (const question of publishedForm.questions || []) {
-          if (question.defaultValue && question.defaultValue !== "now()") defaults[question.name] = question.defaultValue;
-          if (question.defaultValue === "now()" && question.type === "dateTime") {
-            defaults[question.name] = new Date().toISOString().slice(0, 16);
-          }
+          const browserDefault = browserDefaultValue(question);
+          if (browserDefault) defaults[question.name] = browserDefault;
           if (question.type === "today" && !defaults[question.name]) defaults[question.name] = todayString();
           if (question.type === "start" && !defaults[question.name]) defaults[question.name] = localTimestamp();
           if (question.type === "deviceid" && !defaults[question.name]) {

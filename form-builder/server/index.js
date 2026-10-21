@@ -2172,12 +2172,18 @@ async function importXlsx(payload) {
   if (folderPrimary?.variable && requestedPrimaryIdentifier && requestedPrimaryIdentifier !== folderPrimary.variable && !folderBarcodeVariable) {
     throw new Error(`Forms in this folder must use the shared primary identifier variable "${folderPrimary.variable}".`);
   }
-  if (folderId && !folderPrimary?.variable && !folderBarcodeVariable && !payload.primaryIdentifierAcknowledged) {
-    throw new Error("Acknowledge that this primary identifier is common to every form created in this folder.");
-  }
   const primaryIdentifierVariable = String(folderBarcodeVariable || linkedPrimary?.variable || folderPrimary?.variable || requestedPrimaryIdentifier || "").trim();
-  if (!primaryIdentifierVariable) throw new Error("Choose the primary identifier variable for this XLSForm.");
-  if (!variableNames.has(primaryIdentifierVariable)) {
+  const deferredFolderPrimary = Boolean(
+    folderId
+    && !folderPrimary?.variable
+    && !folderBarcodeVariable
+    && !metaFormLink
+    && !primaryIdentifierVariable
+  );
+  if (!primaryIdentifierVariable && !deferredFolderPrimary) {
+    throw new Error("Choose the primary identifier variable for this XLSForm.");
+  }
+  if (primaryIdentifierVariable && !variableNames.has(primaryIdentifierVariable)) {
     if (folderBarcodeVariable) {
       draft.questions = [sharedBarcodeQuestion(folderBarcodeVariable), ...(draft.questions || [])];
       variableNames.add(folderBarcodeVariable);
@@ -2208,7 +2214,7 @@ async function importXlsx(payload) {
 	    primaryIdentifierVariable: effectivePrimaryIdentifierVariable,
 	    participantIdentifierVariable: folderBarcodeVariable || "",
 	    terminologyUseLlm: false,
-	    instanceName: instanceNameForPrimaryIdentifier(primaryIdentifierVariable),
+	    instanceName: effectivePrimaryIdentifierVariable ? instanceNameForPrimaryIdentifier(effectivePrimaryIdentifierVariable) : "",
 		    versionNumber: 1,
 	    versionBaseId,
 	    createdAt: isoStamp(),
