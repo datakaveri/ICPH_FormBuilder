@@ -1,5 +1,26 @@
 const CACHE_NAME = "icph-app-shell-v1";
 const PRECACHE_URLS = __ICPH_PRECACHE_URLS__;
+// On a weak connection that never quite fails, open the saved app after this long.
+const NAVIGATION_TIMEOUT_MS = 4000;
+
+// The server answers with "Vary: Origin" and the page loads its scripts and
+// styles with crossorigin, so the page's requests carry an Origin header the
+// precache requests did not. A strict match would then miss every saved file.
+function fromCache(request) {
+  return caches.match(request, { ignoreVary: true });
+}
+
+// Every page of the app is the same index.html, saved as "/".
+async function openApp(request) {
+  const savedApp = await fromCache("/");
+  if (!savedApp) return fetch(request);
+  if (!self.navigator.onLine) return savedApp;
+  const network = fetch(request)
+    .then((response) => (response.status >= 500 ? savedApp : response))
+    .catch(() => savedApp);
+  const slow = new Promise((resolve) => setTimeout(() => resolve(savedApp), NAVIGATION_TIMEOUT_MS));
+  return Promise.race([network, slow]);
+}
 
 // Submissions carry the signed-in field agent's token, which only a page holds,
 // so background sync hands the queue to an open page instead of posting it here.
@@ -24,10 +45,10 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET" || new URL(request.url).origin !== self.location.origin) return;
   if (request.mode === "navigate") {
-    event.respondWith(fetch(request).catch(async () => (await caches.match("/")) || (await caches.match("/index.html")) || Response.error()));
+    event.respondWith(openApp(request));
     return;
   }
-  event.respondWith(caches.match(request).then((cached) => cached || fetch(request)));
+  event.respondWith(fromCache(request).then((cached) => cached || fetch(request)));
 });
 
 // Sent by a page loaded with a hard reload, which bypasses the worker.

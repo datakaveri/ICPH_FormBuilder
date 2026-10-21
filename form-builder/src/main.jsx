@@ -1224,6 +1224,9 @@ function validateAnswers(form, answers, questionSubset = null) {
 }
 
 async function requestJson(path, options = {}) {
+  // Offline, fail at once instead of trying the network. Callers already fall
+  // back to what this device has saved when a request fails.
+  if (!navigator.onLine) throw new Error("You are offline. Connect to the internet and try again.");
   const headers = {
     ...(await authHeaders()),
     ...(options.headers || {})
