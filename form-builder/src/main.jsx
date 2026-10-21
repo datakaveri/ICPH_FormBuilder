@@ -2695,6 +2695,10 @@ function App() {
       resumeCheckpointIdentifier={params.get("checkpoint") || ""}
     />;
   }
+  if (path.startsWith("/public-entry/")) {
+    const parts = path.replace("/public-entry/", "").split("/");
+    return <EntryViewer accessCode={decodeURIComponent(parts[0] || "")} entryId={decodeURIComponent(parts[1] || "")} />;
+  }
   if (path.startsWith("/fill/")) {
     const params = new URLSearchParams(window.location.search);
     return <FillForm workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])} entryId={params.get("entryId") || ""} />;
@@ -3414,6 +3418,12 @@ function FieldAgentPortal() {
     window.open(`/public-fill/${encodeURIComponent(code)}${query}`, "_blank");
   }
 
+  function viewEntry(form, entryId = "") {
+    const code = normalizeAccessCodeInput(form?.respondentAccessCode);
+    if (!code || !entryId) return;
+    window.open(`/public-entry/${encodeURIComponent(code)}/${encodeURIComponent(entryId)}`, "_blank", "noopener,noreferrer");
+  }
+
   function toggleFieldAgentEntry(entryId, checked) {
     setSelectedEntryIds((current) => checked
       ? [...new Set([...current, entryId])]
@@ -3580,6 +3590,9 @@ function FieldAgentPortal() {
                               <TextCursorInput size={14} /> Edit
                             </button>
                           ) : null}
+                          <button className="secondary small icon-text-button" onClick={() => viewEntry(selectedForm, entry.id)} title="View entry">
+                            <ExternalLink size={14} /> View
+                          </button>
                           <button className="secondary small danger-action" disabled={status.kind === "busy"} onClick={() => deleteFieldAgentEntries([entry.id])}>
                             <Trash2 size={14} /> Delete
                           </button>
@@ -12761,7 +12774,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   );
 }
 
-function EntryViewer({ workspaceId, entryId }) {
+function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
   const [form, setForm] = useState(null);
   const [entry, setEntry] = useState(null);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading entry..." });
@@ -12771,27 +12784,31 @@ function EntryViewer({ workspaceId, entryId }) {
   useEffect(() => {
     async function loadEntry() {
       try {
+        const formRouteId = accessCode
+          ? encodeURIComponent(normalizeAccessCodeInput(accessCode))
+          : encodeURIComponent(workspaceRouteId(workspaceId));
+        const formApiBase = accessCode ? `/api/public/forms/${formRouteId}` : `/api/forms/${formRouteId}`;
         const [formData, entryData] = await Promise.all([
-          requestJson(`/api/forms/${encodeURIComponent(workspaceId)}`),
-          requestJson(`/api/forms/${encodeURIComponent(workspaceId)}/entries`)
+          requestJson(formApiBase),
+          requestJson(`${formApiBase}/entries`)
         ]);
-        const found = (entryData.entries || []).find((item) => item.id === entryId);
+        const found = (entryData.entries || []).find((item) => String(item.id || "") === String(entryId));
         if (!found) throw new Error("Entry not found.");
         const draft = normalizeFormDraft(formData.draft);
         if (formData.hasXml) {
-          const xmlData = await requestJson(`/api/forms/${encodeURIComponent(workspaceId)}/xml`);
+          const xmlData = await requestJson(`${formApiBase}/xml`);
           setForm(parseXFormXml(xmlData.xml, draft));
         } else {
           setForm(draft);
         }
         setEntry(found);
-        setStatus({ kind: "ok", message: formData.hasXml ? "Read-only XML entry view" : "Read-only entry view" });
+        setStatus({ kind: "ok", message: accessCode ? "Read-only public entry view" : formData.hasXml ? "Read-only XML entry view" : "Read-only entry view" });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
     loadEntry();
-  }, [workspaceId, entryId]);
+  }, [accessCode, workspaceId, entryId]);
 
   if (!form || !entry) {
     return (
@@ -12821,6 +12838,7 @@ function EntryViewer({ workspaceId, entryId }) {
             value={answers[questionAnswerKey(question)] || ""}
             forceDisabled
             workspaceId={workspaceId}
+            accessCode={accessCode}
           />
         ))}
       </main>
