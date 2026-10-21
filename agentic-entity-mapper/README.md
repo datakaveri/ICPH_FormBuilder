@@ -9,7 +9,7 @@ only the pieces that are called by that app:
 | --- | --- |
 | `generic_form_fhir_agent.py` | Converts a saved form draft plus submitted answer CSV into per-patient FHIR R4 bundles. |
 | `preprocess_icph_metaforms.py` | Converts ICPH MetaForm DOCX files into Markdown plus JSONL chunks. |
-| `SchemaTerminologies/` | Stores the tracked FHIR schema plus ICPH MetaForm source/processed metadata folders. |
+| `SchemaTerminologies/` | Stores the tracked FHIR schema and optional terminology lookup data. |
 
 The old clinical-text agent stack, standalone FastAPI backend, prompt files,
 Docker/Kubernetes wrappers, and agent-specific tests were removed from this ICPH
@@ -41,11 +41,14 @@ The runner imports `generic_form_fhir_agent.py` with this directory as its
 working directory.
 
 The MetaForms document processor is called by form-builder when the user clicks
-the process action for uploaded schema metadata:
+the process action for uploaded schema metadata. The form builder writes the
+DOCX files from its database to a scratch directory, runs:
 
 ```bash
-<mapper>/.venv/bin/python preprocess_icph_metaforms.py
+<mapper>/.venv/bin/python preprocess_icph_metaforms.py --input-dir <scratch>/originalDocx --output-dir <scratch>/processedMD
 ```
+
+and stores the Markdown and chunks it produces back in the database.
 
 ## FHIR Output
 

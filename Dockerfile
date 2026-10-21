@@ -47,7 +47,8 @@ COPY --chown=node:node form-builder/package.json ./form-builder/package.json
 COPY --chown=node:node form-builder/server/ ./form-builder/server/
 COPY --chown=node:node form-builder/scripts/ ./form-builder/scripts/
 
-RUN mkdir -p /app/agentic-entity-mapper/SchemaTerminologies
+RUN mkdir -p /app/agentic-entity-mapper/SchemaTerminologies \
+    && chown node:node /app/agentic-entity-mapper/SchemaTerminologies
 
 USER node
 WORKDIR /app/form-builder

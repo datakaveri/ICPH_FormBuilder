@@ -1,13 +1,13 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { migrate, query, withTransaction } from "./db.js";
+import { logTablePrivileges, migrate, query, withTransaction } from "./db.js";
 import * as store from "./store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -25,12 +25,10 @@ const terminologyExtractorPath = path.join(appRoot, "scripts", "extract_form_ter
 const mapperRoot = path.join(icphRoot, "agentic-entity-mapper");
 const mapperPythonBin = path.join(mapperRoot, ".venv", "bin", "python");
 const mapperRunnerPath = path.join(appRoot, "scripts", "run_icph_mapper.py");
-const metaFormsRoot = path.join(mapperRoot, "SchemaTerminologies", "schemas", "ICPH_MetaForms");
-const schemaOriginalDir = path.join(metaFormsRoot, "originalDocx");
-const schemaProcessedDir = path.join(metaFormsRoot, "processedMD");
+// MetaForms are stored in Postgres. They used to be files here; see importLegacyMetaForms.
+const legacyMetaFormsRoot = path.join(mapperRoot, "SchemaTerminologies", "schemas", "ICPH_MetaForms");
 const schemaPreprocessorPath = path.join(mapperRoot, "preprocess_icph_metaforms.py");
 const schemaManifestName = "icph_metaforms_manifest.json";
-const schemaAggregateChunksName = "icph_metaform_chunks.jsonl";
 const port = Number(process.env.ICPH_FORM_BUILDER_API_PORT || 8787);
 // KEYCLOAK_URL is how this server reaches Keycloak (token signing keys);
 // KEYCLOAK_PUBLIC_URL is how browsers reach it (login pages, token issuer).
@@ -135,7 +133,10 @@ function bearerTokenFromRequest(req) {
 
 async function authenticateRequest(req) {
   const token = bearerTokenFromRequest(req);
-  if (!token) return null;
+  if (!token) {
+    console.warn(`[auth] ${req.method} ${req.url}: no bearer token`);
+    return null;
+  }
   let claims;
   try {
     ({ payload: claims } = await jwtVerify(token, keycloakKeys, { issuer: keycloakIssuer, algorithms: ["RS256"] }));
@@ -147,9 +148,13 @@ async function authenticateRequest(req) {
       unavailable.statusCode = 503;
       throw unavailable;
     }
+    console.warn(`[auth] ${req.method} ${req.url}: token rejected (${code}: ${error.message})`);
     return null;
   }
-  if (claims.azp !== keycloakClientId) return null;
+  if (claims.azp !== keycloakClientId) {
+    console.warn(`[auth] ${req.method} ${req.url}: token azp "${claims.azp}" is not client "${keycloakClientId}"`);
+    return null;
+  }
   return {
     id: String(claims.sub || ""),
     username: String(claims.preferred_username || ""),
@@ -164,7 +169,9 @@ async function requireRole(req, ...roles) {
     error.statusCode = 401;
     throw error;
   }
+  req.user = user;
   if (!roles.some((role) => user.roles.includes(role))) {
+    console.warn(`[auth] ${req.method} ${req.url}: user "${user.username}" has roles [${user.roles.join(", ")}], needs one of [${roles.join(", ")}]`);
     const error = new Error("Your account does not have access to this.");
     error.statusCode = 403;
     throw error;
@@ -187,11 +194,6 @@ function randomRespondentAccessCode() {
   let code = "";
   for (const byte of bytes) code += accessCodeAlphabet[byte % accessCodeAlphabet.length];
   return code;
-}
-
-function safeSchemaStem(fileName) {
-  const stem = path.basename(String(fileName || "document"), path.extname(String(fileName || "")));
-  return stem.replace(/[^0-9A-Za-z._-]+/g, "_").replace(/^_+|_+$/g, "") || "document";
 }
 
 function cleanSchemaDocName(fileName) {
@@ -413,31 +415,30 @@ async function uniqueSchemaDocName(fileName) {
   const stem = path.basename(cleanName, ext);
   let candidate = cleanName;
   let index = 1;
-  while (existsSync(path.join(schemaOriginalDir, candidate))) {
+  while (await store.metaFormExists(candidate)) {
     candidate = `${stem}_${timestampId()}${index > 1 ? `_${index}` : ""}${ext}`;
     index += 1;
   }
   return candidate;
 }
 
-function mapperRelative(fullPath) {
-  return path.relative(mapperRoot, fullPath);
+function sha256Hex(data) {
+  return createHash("sha256").update(data).digest("hex");
 }
 
-async function readSchemaManifest() {
-  const manifestPath = path.join(schemaProcessedDir, schemaManifestName);
-  if (!existsSync(manifestPath)) return { processed_at: null, documents: {} };
-  try {
-    return JSON.parse(await readFile(manifestPath, "utf8"));
-  } catch {
-    return { processed_at: null, documents: {} };
-  }
+function parseJsonLines(text) {
+  return text.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 }
 
-async function writeSchemaManifest(manifest) {
-  await mkdir(schemaProcessedDir, { recursive: true });
-  manifest.processed_at = isoStamp().replace(/\.\d{3}Z$/, "Z");
-  await writeFile(path.join(schemaProcessedDir, schemaManifestName), JSON.stringify(manifest, null, 2) + "\n", "utf8");
+// The preprocessor's manifest entry for a document, with its Markdown and chunks
+// read from wherever it wrote them.
+async function readPreprocessedMetaForm(info) {
+  return {
+    markdown: await readFile(path.resolve(mapperRoot, info.markdown_path), "utf8"),
+    chunks: parseJsonLines(await readFile(path.resolve(mapperRoot, info.chunks_path), "utf8")),
+    formCount: info.form_count || 0,
+    variableCount: info.variable_count || 0
+  };
 }
 
 // Subprocesses (XLSForm tools, terminology extractor, FHIR mapper) work on files.
@@ -486,128 +487,95 @@ async function requireWorkspace(workspaceId) {
   return { cleanId };
 }
 
-async function rebuildSchemaAggregate(manifest) {
-  await mkdir(schemaProcessedDir, { recursive: true });
-  const records = [];
-  for (const info of Object.values(manifest.documents || {}).sort((a, b) => String(a.source_path || "").localeCompare(String(b.source_path || "")))) {
-    if (!info.chunks_path) continue;
-    const chunksPath = path.join(mapperRoot, info.chunks_path);
-    if (!existsSync(chunksPath)) continue;
-    const lines = (await readFile(chunksPath, "utf8")).split(/\r?\n/).filter(Boolean);
-    records.push(...lines);
+// Groups a MetaForm's chunks into the forms it describes, with their variables.
+function metaFormFormOptions(chunks) {
+  const byForm = new Map();
+  for (const chunk of chunks || []) {
+    const formIndex = Number(chunk.form_index || 0);
+    if (!formIndex) continue;
+    if (!byForm.has(formIndex)) {
+      byForm.set(formIndex, {
+        formIndex,
+        title: chunk.form_title || `Form ${formIndex}`,
+        variableCount: 0,
+        variables: []
+      });
+    }
+    const formOption = byForm.get(formIndex);
+    if (chunk.chunk_type === "form") {
+      formOption.title = chunk.form_title || formOption.title;
+      formOption.variableCount = Array.isArray(chunk.variables) ? chunk.variables.length : formOption.variableCount;
+    }
+    if (chunk.chunk_type === "variable" && chunk.variable) {
+      formOption.variables.push({
+        name: chunk.variable,
+        label: chunk.question || "",
+        formatOptions: chunk.format_options || "",
+        instructions: chunk.instructions || ""
+      });
+    }
   }
-  const aggregatePath = path.join(schemaProcessedDir, schemaAggregateChunksName);
-  await writeFile(aggregatePath, records.length ? `${records.join("\n")}\n` : "", "utf8");
-  manifest.aggregate_chunks_path = mapperRelative(aggregatePath);
-  manifest.aggregate_chunk_count = records.length;
-  return records.length;
+  return [...byForm.values()].sort((a, b) => a.formIndex - b.formIndex);
 }
 
 async function listSchemaDocuments() {
-  await mkdir(schemaOriginalDir, { recursive: true });
-  await mkdir(schemaProcessedDir, { recursive: true });
-  const manifest = await readSchemaManifest();
-  const metaFormPrimaries = await readMetaFormPrimaries();
-  const originalNames = new Set();
-  try {
-    for (const name of await readdir(schemaOriginalDir)) {
-      if (name.toLowerCase().endsWith(".docx") && !name.startsWith("~$")) originalNames.add(name);
-    }
-  } catch {}
-  for (const name of Object.keys(manifest.documents || {})) originalNames.add(name);
-
-  const documents = [];
-  for (const name of [...originalNames].sort((a, b) => a.localeCompare(b))) {
-    const sourcePath = path.join(schemaOriginalDir, name);
-    const stem = safeSchemaStem(name);
-    const markdownPath = path.join(schemaProcessedDir, `${stem}.md`);
-    const chunksPath = path.join(schemaProcessedDir, `${stem}.chunks.jsonl`);
-    const info = manifest.documents?.[name] || {};
-    const formOptions = [];
-    if (info.chunks_path) {
-      const manifestChunksPath = path.join(mapperRoot, info.chunks_path);
-      if (existsSync(manifestChunksPath)) {
-        try {
-          const lines = (await readFile(manifestChunksPath, "utf8")).split(/\r?\n/).filter(Boolean);
-          const byForm = new Map();
-          for (const line of lines) {
-            const chunk = JSON.parse(line);
-            const formIndex = Number(chunk.form_index || 0);
-            if (!formIndex) continue;
-            if (!byForm.has(formIndex)) {
-              byForm.set(formIndex, {
-                formIndex,
-                title: chunk.form_title || `Form ${formIndex}`,
-                variableCount: 0,
-                variables: []
-              });
-            }
-            const formOption = byForm.get(formIndex);
-            if (chunk.chunk_type === "form") {
-              formOption.title = chunk.form_title || formOption.title;
-              formOption.variableCount = Array.isArray(chunk.variables) ? chunk.variables.length : formOption.variableCount;
-            }
-            if (chunk.chunk_type === "variable" && chunk.variable) {
-              formOption.variables.push({
-                name: chunk.variable,
-                label: chunk.question || "",
-                formatOptions: chunk.format_options || "",
-                instructions: chunk.instructions || ""
-              });
-            }
-          }
-          formOptions.push(...byForm.values());
-        } catch {}
-      }
-    }
-    let sourceStat = null;
-    try {
-      sourceStat = await stat(sourcePath);
-    } catch {}
-    documents.push({
-      fileName: name,
-      status: info.chunk_count && existsSync(markdownPath) && existsSync(chunksPath) ? "Processed" : sourceStat ? "Needs processing" : "Source missing",
-      sourcePath: sourceStat ? sourcePath : null,
-      markdownPath: existsSync(markdownPath) ? markdownPath : null,
-      chunksPath: existsSync(chunksPath) ? chunksPath : null,
-      sourceSizeBytes: sourceStat?.size || info.source_size_bytes || 0,
-      updatedAt: sourceStat?.mtime?.toISOString?.() || info.processed_at || null,
-      processedAt: info.processed_at || null,
-      formCount: info.form_count || 0,
-      primaryIdentifierVariable: metaFormPrimaries[name] || null,
-      formOptions: formOptions.sort((a, b) => Number(a.formIndex || 0) - Number(b.formIndex || 0)),
-      variableCount: info.variable_count || 0,
-      chunkCount: info.chunk_count || 0,
-      sha256: info.sha256 || null
-    });
-  }
-
+  const [metaForms, metaFormPrimaries] = await Promise.all([store.listMetaForms(), readMetaFormPrimaries()]);
+  const documents = metaForms.map((item) => ({
+    fileName: item.fileName,
+    status: item.processedAt && item.chunkCount ? "Processed" : "Needs processing",
+    sourceSizeBytes: item.sizeBytes,
+    updatedAt: item.uploadedAt,
+    processedAt: item.processedAt,
+    formCount: item.formCount,
+    primaryIdentifierVariable: metaFormPrimaries[item.fileName] || null,
+    formOptions: metaFormFormOptions(item.chunks),
+    variableCount: item.variableCount,
+    chunkCount: item.chunkCount,
+    sha256: item.sha256
+  }));
+  const processedTimes = documents.map((item) => item.processedAt).filter(Boolean).sort();
   return {
     ok: true,
     documents,
-    originalDir: schemaOriginalDir,
-    processedDir: schemaProcessedDir,
-    aggregateChunksPath: path.join(schemaProcessedDir, schemaAggregateChunksName),
-    aggregateChunkCount: manifest.aggregate_chunk_count || 0,
-    processedAt: manifest.processed_at || null
+    aggregateChunkCount: documents.reduce((sum, item) => sum + item.chunkCount, 0),
+    processedAt: processedTimes.at(-1) || null
   };
 }
 
 async function uploadSchemaDocument(payload) {
-  await mkdir(schemaOriginalDir, { recursive: true });
   const fileName = await uniqueSchemaDocName(payload.filename);
   const data = Buffer.from(String(payload.dataBase64 || ""), "base64");
   if (!data.length) throw new Error("Uploaded schema document is empty.");
-  const sourcePath = path.join(schemaOriginalDir, fileName);
-  await writeFile(sourcePath, data);
-  return { ok: true, fileName, sourcePath, ...(await listSchemaDocuments()) };
+  if (!(await store.insertMetaForm({ fileName, docx: data, sha256: sha256Hex(data) }))) {
+    throw new Error(`A MetaForm named ${fileName} already exists.`);
+  }
+  return { ok: true, fileName, ...(await listSchemaDocuments()) };
 }
 
+// Processes the named document, or every one that needs it (all of them with force).
+// The preprocessor works on files, so it runs on scratch copies of the DOCX files.
 async function processSchemaDocuments(payload = {}) {
-  const command = existsSync(mapperPythonBin) ? mapperPythonBin : pythonBin;
-  const args = [schemaPreprocessorPath];
-  if (payload.force) args.push("--force");
-  const result = await runCommand(command, args, { cwd: mapperRoot });
+  const requested = String(payload.fileName || "").trim();
+  const fileNames = requested ? [cleanSchemaDocName(requested)] : payload.force ? null : await store.listUnprocessedMetaFormNames();
+  const docs = fileNames?.length === 0 ? [] : await store.listMetaFormDocx(fileNames);
+  if (requested && !docs.length) throw new Error(`MetaForm not found: ${requested}`);
+  const result = !docs.length
+    ? { code: 0, stdout: "No MetaForms need processing.\n", stderr: "" }
+    : await withScratchDir(async (dir) => {
+      const inputDir = path.join(dir, "originalDocx");
+      const outputDir = path.join(dir, "processedMD");
+      await mkdir(inputDir);
+      for (const doc of docs) await writeFile(path.join(inputDir, path.basename(doc.fileName)), doc.data);
+      const command = existsSync(mapperPythonBin) ? mapperPythonBin : pythonBin;
+      const run = await runCommand(command, [schemaPreprocessorPath, "--input-dir", inputDir, "--output-dir", outputDir], { cwd: mapperRoot });
+      if (run.code !== 0) return run;
+      const manifest = JSON.parse(await readFile(path.join(outputDir, schemaManifestName), "utf8"));
+      for (const doc of docs) {
+        const info = manifest.documents?.[path.basename(doc.fileName)];
+        if (info) await store.setMetaFormProcessed(doc.fileName, await readPreprocessedMetaForm(info));
+      }
+      return run;
+    });
   return {
     ...(await listSchemaDocuments()),
     ok: result.code === 0,
@@ -619,27 +587,56 @@ async function processSchemaDocuments(payload = {}) {
 
 async function deleteSchemaDocument(fileName) {
   const cleanName = cleanSchemaDocName(fileName);
-  const stem = safeSchemaStem(cleanName);
-  const sourcePath = path.join(schemaOriginalDir, cleanName);
-  const markdownPath = path.join(schemaProcessedDir, `${stem}.md`);
-  const chunksPath = path.join(schemaProcessedDir, `${stem}.chunks.jsonl`);
   const linkedWorkspaceIds = (await listForms()).forms
     .filter((item) => item.metaFormLink?.fileName === cleanName)
     .map((item) => item.workspaceId);
 
-  await rm(sourcePath, { force: true });
-  await rm(markdownPath, { force: true });
-  await rm(chunksPath, { force: true });
-
-  const manifest = await readSchemaManifest();
-  manifest.documents = manifest.documents || {};
-  delete manifest.documents[cleanName];
-  await rebuildSchemaAggregate(manifest);
-  await writeSchemaManifest(manifest);
+  await store.deleteMetaForm(cleanName);
 
   for (const workspaceId of linkedWorkspaceIds) await deleteForm(workspaceId);
 
-  return { ok: true, deleted: { fileName: cleanName, sourcePath, markdownPath, chunksPath }, deletedWorkspaceIds: linkedWorkspaceIds, ...(await listSchemaDocuments()) };
+  return { ok: true, deleted: { fileName: cleanName }, deletedWorkspaceIds: linkedWorkspaceIds, ...(await listSchemaDocuments()) };
+}
+
+// MetaForms used to be stored as files under SchemaTerminologies. Copies any found
+// there into the database on the first start after the move; the folder is ignored after that.
+async function importLegacyMetaForms() {
+  const taskName = "import-legacy-meta-forms";
+  if (await store.taskCompleted(taskName)) return;
+  const originalDir = path.join(legacyMetaFormsRoot, "originalDocx");
+  const processedDir = path.join(legacyMetaFormsRoot, "processedMD");
+  let names = [];
+  try {
+    names = (await readdir(originalDir)).filter((name) => name.toLowerCase().endsWith(".docx") && !name.startsWith("~$"));
+  } catch {}
+  let manifest = {};
+  try {
+    manifest = JSON.parse(await readFile(path.join(processedDir, schemaManifestName), "utf8")).documents || {};
+  } catch {}
+
+  let imported = 0;
+  let failed = 0;
+  for (const name of names) {
+    try {
+      const docx = await readFile(path.join(originalDir, name));
+      const sha256 = sha256Hex(docx);
+      const info = manifest[name];
+      let processed = null;
+      // Processed output for an older version of the file is left behind; it can be reprocessed.
+      if (info?.sha256 === sha256 && info.markdown_path && info.chunks_path) {
+        try {
+          processed = { ...(await readPreprocessedMetaForm(info)), processedAt: info.processed_at || null };
+        } catch {}
+      }
+      if (await store.insertMetaForm({ fileName: name, docx, sha256, processed })) imported += 1;
+    } catch (error) {
+      failed += 1;
+      console.warn(`Could not import MetaForm ${name}: ${error.message || error}`);
+    }
+  }
+  if (imported) console.log(`Imported ${imported} MetaForm document(s) from ${originalDir} into the database.`);
+  // Tried again on the next start if any file could not be read.
+  if (!failed) await store.markTaskCompleted(taskName);
 }
 
 function runCommand(command, args, options = {}) {
@@ -1353,15 +1350,13 @@ async function fileSummary(filePath) {
 }
 
 async function terminologyAssetsStatus() {
-  const schemaOriginalExists = existsSync(schemaOriginalDir);
-  const schemaProcessedExists = existsSync(schemaProcessedDir);
-  const aggregateChunksPath = path.join(schemaProcessedDir, schemaAggregateChunksName);
+  const metaForms = await store.metaFormTotals();
   const assets = {
     snomed: await fileSummary(latestSnomedLookupPath()),
     icd10: await fileSummary(latestSharedLookupPath("icd10", "icd10_lookup.csv")),
     loinc: await fileSummary(latestLoincPath()),
     rxnorm: await fileSummary(latestRxNormMetadataPath()),
-    schemaAggregateChunks: await fileSummary(aggregateChunksPath)
+    metaFormChunks: { ok: metaForms.chunkCount > 0, ...metaForms }
   };
   const missing = Object.entries(assets)
     .filter(([, value]) => !value.ok)
@@ -1370,10 +1365,6 @@ async function terminologyAssetsStatus() {
     ok: missing.length === 0,
     mapperRoot,
     schemaTerminologiesRoot: path.join(mapperRoot, "SchemaTerminologies"),
-    schemaOriginalDir,
-    schemaOriginalExists,
-    schemaProcessedDir,
-    schemaProcessedExists,
     assets,
     missing
   };
@@ -2085,23 +2076,17 @@ async function metaFormVariableDetails(fileName, formIndex, variable) {
   const targetFormIndex = Number(formIndex || 0);
   const targetVariable = String(variable || "").trim();
   if (!cleanName || !targetFormIndex || !targetVariable) return null;
-  const chunksPath = path.join(schemaProcessedDir, `${safeSchemaStem(cleanName)}.chunks.jsonl`);
-  if (!existsSync(chunksPath)) return null;
-  const lines = (await readFile(chunksPath, "utf8")).split(/\r?\n/).filter(Boolean);
-  for (const line of lines) {
-    try {
-      const chunk = JSON.parse(line);
-      if (chunk.chunk_type !== "variable") continue;
-      if (Number(chunk.form_index || 0) !== targetFormIndex) continue;
-      if (String(chunk.variable || "").trim() !== targetVariable) continue;
-      return {
-        name: targetVariable,
-        label: chunk.question || targetVariable,
-        formatOptions: chunk.format_options || "",
-        instructions: chunk.instructions || "",
-        formTitle: chunk.form_title || ""
-      };
-    } catch {}
+  for (const chunk of (await store.getMetaFormChunks(cleanName)) || []) {
+    if (chunk.chunk_type !== "variable") continue;
+    if (Number(chunk.form_index || 0) !== targetFormIndex) continue;
+    if (String(chunk.variable || "").trim() !== targetVariable) continue;
+    return {
+      name: targetVariable,
+      label: chunk.question || targetVariable,
+      formatOptions: chunk.format_options || "",
+      instructions: chunk.instructions || "",
+      formTitle: chunk.form_title || ""
+    };
   }
   return null;
 }
@@ -3003,6 +2988,11 @@ async function deleteForm(workspaceId) {
 }
 
 const server = createServer(async (req, res) => {
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    const who = req.user ? ` user=${req.user.username}` : "";
+    console.log(`[http] ${req.method} ${req.url} -> ${res.statusCode} (${Date.now() - startedAt} ms)${who}`);
+  });
   if (req.method === "OPTIONS") return jsonResponse(res, 200, { ok: true });
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
@@ -3248,11 +3238,15 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const message = error.message || String(error);
     const status = error.statusCode || (/not found/i.test(message) ? 404 : 500);
+    if (status >= 500) console.error(`[http] ${req.method} ${req.url} failed:`, error);
+    else console.warn(`[http] ${req.method} ${req.url} -> ${status}: ${message}`);
     jsonResponse(res, status, { ok: false, error: message });
   }
 });
 
 await migrate();
+await logTablePrivileges();
+await importLegacyMetaForms();
 server.listen(port, "0.0.0.0", () => {
   console.log(`ICPH form-builder API listening on http://localhost:${port}`);
 });

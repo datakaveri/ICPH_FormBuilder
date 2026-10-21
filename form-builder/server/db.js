@@ -11,8 +11,42 @@ const pool = new pg.Pool({
 const transactionClient = new AsyncLocalStorage();
 
 // Runs on the surrounding transaction when there is one.
-export function query(text, params) {
-  return (transactionClient.getStore() || pool).query(text, params);
+export async function query(text, params) {
+  try {
+    return await (transactionClient.getStore() || pool).query(text, params);
+  } catch (error) {
+    // 42501 = insufficient_privilege, i.e. the database role lacks a GRANT.
+    console.error(
+      `[db] query failed (${error.code || "no code"}${error.table ? `, table ${error.table}` : ""}): ${error.message}\n  sql: ${String(text).replace(/\s+/g, " ").trim()}`
+    );
+    throw error;
+  }
+}
+
+// Logs which app tables the connected role cannot read or change, so missing GRANTs show up at startup.
+export async function logTablePrivileges() {
+  const { rows } = await pool.query(
+    `SELECT current_user AS role, c.relname AS table_name,
+            pg_get_userbyid(c.relowner) AS owner,
+            array_remove(ARRAY[
+              CASE WHEN NOT has_table_privilege(c.oid, 'SELECT') THEN 'SELECT' END,
+              CASE WHEN NOT has_table_privilege(c.oid, 'INSERT') THEN 'INSERT' END,
+              CASE WHEN NOT has_table_privilege(c.oid, 'UPDATE') THEN 'UPDATE' END,
+              CASE WHEN NOT has_table_privilege(c.oid, 'DELETE') THEN 'DELETE' END
+            ], NULL) AS missing
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind IN ('r', 'p') AND n.nspname = current_schema()
+      ORDER BY c.relname`
+  );
+  const role = rows[0]?.role || "(unknown)";
+  const lacking = rows.filter((row) => row.missing.length);
+  if (!lacking.length) {
+    console.log(`[db] role "${role}" has SELECT/INSERT/UPDATE/DELETE on all ${rows.length} tables`);
+    return;
+  }
+  for (const row of lacking) {
+    console.warn(`[db] role "${role}" lacks ${row.missing.join(", ")} on ${row.table_name} (owner ${row.owner})`);
+  }
 }
 
 export async function withTransaction(work) {

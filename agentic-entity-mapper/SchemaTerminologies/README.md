@@ -6,10 +6,10 @@ lean ICPH form-builder workflow.
 Tracked in this client repository:
 
 - `schemas/fhir/r4/fhir.schema.json`: FHIR R4 JSON schema used by the mapper.
-- `schemas/ICPH_MetaForms/originalDocx/`: place DOCX MetaForms here before
-  preprocessing.
-- `schemas/ICPH_MetaForms/processedMD/`: generated Markdown/chunks are written
-  here by `preprocess_icph_metaforms.py`.
+- `schemas/ICPH_MetaForms/`: where MetaForms were stored before they moved to
+  the form builder's database. Any DOCX files left in `originalDocx/` (with
+  their output in `processedMD/`) are imported once on the next app start.
+  Upload new MetaForms in the app.
 
 Large terminology lookup/source assets are intentionally not tracked. If a
 deployment needs automatic terminology suggestions, provide these optional
@@ -32,15 +32,10 @@ rename or move this lightweight `SchemaTerminologies/` folder out of the way,
 and unzip the file. The unzipped folder must be named exactly
 `SchemaTerminologies`.
 
-To refresh MetaForm metadata after adding DOCX files:
+To run the MetaForm preprocessor by hand on a folder of DOCX files (the app
+does this for you when you click Process):
 
 ```bash
 cd agentic-entity-mapper
-./.venv/bin/python preprocess_icph_metaforms.py
-```
-
-To rebuild all processed MetaForm outputs:
-
-```bash
-./.venv/bin/python preprocess_icph_metaforms.py --force
+./.venv/bin/python preprocess_icph_metaforms.py --input-dir <docx-dir> --output-dir <out-dir>
 ```

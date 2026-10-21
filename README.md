@@ -52,11 +52,11 @@ If you receive a separate `ICPH_SchemaTerminologies.zip`, place it in
 resulting folder must be named `SchemaTerminologies`.
 
 The complete `agentic-entity-mapper/SchemaTerminologies/` directory is mounted
-from the host into the container. Terminology data and uploaded MetaForms stay
-on the host, are not baked into the image, and are available without rebuilding.
+read-only from the host into the container. Terminology data stays on the host,
+is not baked into the image, and is available without rebuilding.
 
-Before starting, match the container user to your account so the app can write
-MetaForm data without running as root:
+Before starting, match the container user to your account so the app can read
+the mounted folder without running as root:
 
 ```bash
 export ICPH_UID="$(id -u)"
@@ -93,8 +93,8 @@ shared hosting, put an HTTPS reverse proxy in front of ports `5173` and `8787`;
 HTTPS is required for browser camera and geolocation permissions. Do not expose
 the API directly to the public internet.
 
-Forms, checkpoints, attachments, submissions, terminology reviews and FHIR
-bundles are stored in the `postgres` service (database `icph`, Docker volume
+Forms, checkpoints, attachments, submissions, MetaForm documents, terminology
+reviews and FHIR bundles are stored in the `postgres` service (database `icph`, Docker volume
 `postgres-data`). The app creates and migrates its schema on start from
 `form-builder/server/migrations/`. Back it up with:
 
@@ -102,8 +102,10 @@ bundles are stored in the `postgres` service (database `icph`, Docker volume
 docker compose exec postgres pg_dump -U icph icph > icph-backup.sql
 ```
 
-Terminology data, uploaded MetaForm documents, and generated metadata persist in
-`agentic-entity-mapper/SchemaTerminologies/`.
+Terminology lookup data stays in `agentic-entity-mapper/SchemaTerminologies/`.
+MetaForms uploaded before they moved to the database are imported from
+`SchemaTerminologies/schemas/ICPH_MetaForms/` once, on the first start after the
+upgrade; the folder is ignored after that.
 
 Stop the containers with:
 
@@ -111,8 +113,7 @@ Stop the containers with:
 docker compose down
 ```
 
-This stops and removes the containers but keeps the database volume and the
-MetaForm data directory. `docker compose down -v` also deletes the database
+This stops and removes the containers but keeps the database volume. `docker compose down -v` also deletes the database
 volume, and with it every form and submission.
 
 The browser picks the API address from the page's own address. When the app is
@@ -275,17 +276,8 @@ npm install
 
 ## Key Paths
 
-Schema source documents:
-
-```text
-agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx/
-```
-
-Processed schema Markdown/chunks:
-
-```text
-agentic-entity-mapper/SchemaTerminologies/schemas/ICPH_MetaForms/processedMD/
-```
+MetaForm documents and their processed Markdown/chunks are stored in Postgres
+(table `meta_forms`). The preprocessor runs on a scratch copy of the DOCX files.
 
 Optional terminology lookup assets:
 

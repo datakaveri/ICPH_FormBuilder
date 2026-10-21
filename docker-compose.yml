@@ -24,9 +24,11 @@ services:
       keycloak-setup:
         condition: service_completed_successfully
     volumes:
+      # Terminology lookup data; the app only reads it.
       - type: bind
         source: ./agentic-entity-mapper/SchemaTerminologies
         target: /app/agentic-entity-mapper/SchemaTerminologies
+        read_only: true
     tmpfs:
       # Scratch space for the XLSForm, terminology and FHIR tools, which work on files.
       - /tmp:rw,noexec,nosuid,size=512m

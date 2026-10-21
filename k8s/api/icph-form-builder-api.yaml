@@ -79,16 +79,16 @@ spec:
             limits:
               cpu: "2"
               memory: 4Gi
-      # CHANGE (optional): uploaded MetaForm documents and the terminology lookup
-      # data live in this folder, not in Postgres. Without a volume the app still
-      # runs, but uploaded MetaForms are lost when the pod restarts and automatic
-      # terminology suggestions are unavailable. To keep them, create a PVC and
-      # uncomment both blocks (volumeMounts goes under the container above).
+      # CHANGE (optional): terminology lookup data (SNOMED CT, ICD-10, LOINC,
+      # RxNorm) is not in the image. Uploaded MetaForms are in Postgres and need
+      # no volume. Without this volume the app still runs, but automatic
+      # terminology suggestions are unavailable. To enable them, put the
+      # SchemaTerminologies folder on a PVC and uncomment both blocks
+      # (volumeMounts goes under the container above). The app only reads it.
       #     volumeMounts:
       #       - name: schema-terminologies
       #         mountPath: /app/agentic-entity-mapper/SchemaTerminologies
-      # securityContext:
-      #   fsGroup: 1000                             # the image runs as uid 1000
+      #         readOnly: true
       # volumes:
       #   - name: schema-terminologies
       #     persistentVolumeClaim:

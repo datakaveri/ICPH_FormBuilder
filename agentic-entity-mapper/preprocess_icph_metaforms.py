@@ -1,10 +1,12 @@
 """Preprocess ICPH meta-form DOCX files into Markdown and RAG chunks.
 
 The script is intentionally rerun-safe:
-- DOCX files under SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx
+- DOCX files under --input-dir (default SchemaTerminologies/schemas/ICPH_MetaForms/originalDocx)
   are converted only when new or changed, unless --force is passed.
 - Markdown, per-document chunks, an aggregate chunk file, and a manifest are
-  written under SchemaTerminologies/schemas/ICPH_MetaForms/processedMD.
+  written under --output-dir (default SchemaTerminologies/schemas/ICPH_MetaForms/processedMD).
+
+The form builder runs this on a scratch directory and stores the results in Postgres.
 """
 
 from __future__ import annotations
@@ -66,6 +68,14 @@ def sha256_file(path: Path) -> str:
 
 def safe_stem(path: Path) -> str:
     return re.sub(r"[^0-9A-Za-z._-]+", "_", path.stem).strip("_") or "document"
+
+
+def display_path(path: Path) -> str:
+    """Relative to this project when inside it; absolute otherwise (e.g. a scratch directory)."""
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def clean_markdown_cell(value: str) -> str:
@@ -467,8 +477,8 @@ def process_docx(docx_path: Path, output_dir: Path, *, force: bool, manifest: di
         chunks = read_jsonl(chunks_path)
         return "skipped", {
             **previous,
-            "markdown_path": str(markdown_path.relative_to(PROJECT_ROOT)),
-            "chunks_path": str(chunks_path.relative_to(PROJECT_ROOT)),
+            "markdown_path": display_path(markdown_path),
+            "chunks_path": display_path(chunks_path),
             "chunk_count": len(chunks),
         }
 
@@ -482,9 +492,9 @@ def process_docx(docx_path: Path, output_dir: Path, *, force: bool, manifest: di
 
     return "processed", {
         "sha256": digest,
-        "source_path": str(docx_path.relative_to(PROJECT_ROOT)),
-        "markdown_path": str(markdown_path.relative_to(PROJECT_ROOT)),
-        "chunks_path": str(chunks_path.relative_to(PROJECT_ROOT)),
+        "source_path": display_path(docx_path),
+        "markdown_path": display_path(markdown_path),
+        "chunks_path": display_path(chunks_path),
         "source_size_bytes": docx_path.stat().st_size,
         "processed_at": now_utc(),
         "form_count": len({(row.form_index, row.form_title) for row in schema_rows}),
@@ -544,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     aggregate_count = rebuild_aggregate_chunks(output_dir, manifest)
-    manifest["aggregate_chunks_path"] = str((output_dir / AGGREGATE_CHUNKS_NAME).relative_to(PROJECT_ROOT))
+    manifest["aggregate_chunks_path"] = display_path(output_dir / AGGREGATE_CHUNKS_NAME)
     manifest["aggregate_chunk_count"] = aggregate_count
     save_manifest(manifest_path, manifest)
 

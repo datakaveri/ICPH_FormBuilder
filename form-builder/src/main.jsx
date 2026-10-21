@@ -5941,7 +5941,6 @@ function SchemaDocumentsPanel({ documents, summary, status, uploadSchemaDocument
           ))}
         </div>
       )}
-      <p className="mono schema-path">{summary?.processedDir || "processedMD path will appear here"}</p>
       </div> : null}
     </section>
   );

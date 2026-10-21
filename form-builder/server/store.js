@@ -280,6 +280,99 @@ export async function deleteMetaFormPrimary(fileName) {
   await query("DELETE FROM meta_form_primaries WHERE file_name = $1", [fileName]);
 }
 
+// ---- MetaForm documents ----------------------------------------------------
+
+function metaFormFromRow(row) {
+  return {
+    fileName: row.file_name,
+    sha256: row.sha256,
+    sizeBytes: row.size_bytes,
+    chunks: row.chunks,
+    formCount: row.form_count,
+    variableCount: row.variable_count,
+    chunkCount: row.chunk_count,
+    uploadedAt: iso(row.uploaded_at),
+    processedAt: iso(row.processed_at)
+  };
+}
+
+// Everything but the DOCX and Markdown, which only processing needs.
+export async function listMetaForms() {
+  const result = await query(
+    `SELECT file_name, sha256, octet_length(docx) AS size_bytes, chunks, form_count, variable_count,
+       chunk_count, uploaded_at, processed_at
+     FROM meta_forms ORDER BY file_name`
+  );
+  return result.rows.map(metaFormFromRow);
+}
+
+export async function metaFormExists(fileName) {
+  return (await query("SELECT 1 FROM meta_forms WHERE file_name = $1", [fileName])).rowCount > 0;
+}
+
+export async function getMetaFormChunks(fileName) {
+  return (await query("SELECT chunks FROM meta_forms WHERE file_name = $1", [fileName])).rows[0]?.chunks || null;
+}
+
+// The DOCX of each named document, or of every document when fileNames is null.
+export async function listMetaFormDocx(fileNames = null) {
+  const result = await query(
+    "SELECT file_name, docx FROM meta_forms WHERE $1::text[] IS NULL OR file_name = ANY($1) ORDER BY file_name",
+    [fileNames]
+  );
+  return result.rows.map((row) => ({ fileName: row.file_name, data: row.docx }));
+}
+
+// Unprocessed, or processed without finding any forms.
+export async function listUnprocessedMetaFormNames() {
+  const result = await query("SELECT file_name FROM meta_forms WHERE processed_at IS NULL OR chunk_count = 0 ORDER BY file_name");
+  return result.rows.map((row) => row.file_name);
+}
+
+export async function metaFormTotals() {
+  const row = (await query("SELECT count(*)::int AS documents, coalesce(sum(chunk_count), 0)::int AS chunks FROM meta_forms")).rows[0];
+  return { documentCount: row.documents, chunkCount: row.chunks };
+}
+
+// Returns false when a document with that name already exists.
+export async function insertMetaForm({ fileName, docx, sha256, processed = null }) {
+  const result = await query(
+    `INSERT INTO meta_forms (file_name, docx, sha256, markdown, chunks, form_count, variable_count, chunk_count, processed_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (file_name) DO NOTHING`,
+    [
+      fileName, docx, sha256,
+      processed?.markdown ?? null, processed ? json(processed.chunks) : null,
+      processed?.formCount || 0, processed?.variableCount || 0, processed?.chunks.length || 0,
+      processed?.processedAt || null
+    ]
+  );
+  return result.rowCount > 0;
+}
+
+export async function setMetaFormProcessed(fileName, { markdown, chunks, formCount, variableCount }) {
+  await query(
+    `UPDATE meta_forms SET markdown = $2, chunks = $3, form_count = $4, variable_count = $5, chunk_count = $6,
+       processed_at = now()
+     WHERE file_name = $1`,
+    [fileName, markdown, json(chunks), formCount, variableCount, chunks.length]
+  );
+}
+
+export async function deleteMetaForm(fileName) {
+  await query("DELETE FROM meta_forms WHERE file_name = $1", [fileName]);
+}
+
+// ---- one-time tasks --------------------------------------------------------
+
+export async function taskCompleted(name) {
+  return (await query("SELECT 1 FROM completed_tasks WHERE name = $1", [name])).rowCount > 0;
+}
+
+export async function markTaskCompleted(name) {
+  await query("INSERT INTO completed_tasks (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
+}
+
 // ---- FHIR bundles ----------------------------------------------------------
 
 export async function listFhirBundles(workspaceId) {
