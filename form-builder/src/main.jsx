@@ -1881,7 +1881,10 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
       requiredExpression,
       relevant: bind.relevant || "",
       appearance: control.getAttribute("appearance") || "",
-      defaultValue: defaults.get(name) || "",
+      // XLSForm defaults such as now() are emitted by xls2xform as a
+      // first-load setvalue rather than as text in the instance node. Keep
+      // the authored draft default when that instance node is empty.
+      defaultValue: defaults.get(name) || fallbackQuestion.defaultValue || "",
       constraint: bind.constraint || "",
       constraintMessage: bind.constraintMessage || "",
       calculation: bind.calculation || "",
@@ -8839,7 +8842,7 @@ function PreviewPanel({ form, collapsible = false }) {
   const content = (
     <>
       {previewQuestions.slice(0, 5).map((question) => (
-        <PreviewField key={question.id} question={question} />
+        <PreviewField key={question.id} question={question} value={browserDefaultValue(question)} />
       ))}
       {form.questions.length > previewQuestions.length ? (
         <p className="muted">{form.questions.length - previewQuestions.length} conditional questions hidden in this preview.</p>
@@ -8863,6 +8866,17 @@ function PreviewPanel({ form, collapsible = false }) {
       {content}
     </div>
   );
+}
+
+function browserDefaultValue(question = {}) {
+  const defaultValue = String(question.defaultValue || "").trim();
+  if (defaultValue === "now()") {
+    return question.type === "dateTime" ? localTimestamp().slice(0, 16) : "";
+  }
+  if (defaultValue === "today()") {
+    return question.type === "date" ? todayString() : "";
+  }
+  return defaultValue;
 }
 
 function parseLocationPoints(value) {
@@ -12986,10 +13000,8 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         setOfflineReady(Boolean(accessCode && packageCached));
         const defaults = {};
         for (const question of publishedForm.questions || []) {
-          if (question.defaultValue && question.defaultValue !== "now()") defaults[question.name] = question.defaultValue;
-          if (question.defaultValue === "now()" && question.type === "dateTime") {
-            defaults[question.name] = new Date().toISOString().slice(0, 16);
-          }
+          const browserDefault = browserDefaultValue(question);
+          if (browserDefault) defaults[question.name] = browserDefault;
           if (question.type === "today" && !defaults[question.name]) defaults[question.name] = todayString();
           if (question.type === "start" && !defaults[question.name]) defaults[question.name] = localTimestamp();
           if (question.type === "deviceid" && !defaults[question.name]) {
