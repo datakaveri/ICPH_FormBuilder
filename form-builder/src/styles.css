@@ -3105,18 +3105,51 @@ button:disabled {
   background: #f7faff;
 }
 
-.location-sketch {
-  width: 100%;
-  min-height: 230px;
+.location-map {
+  position: relative;
+  height: 300px;
+  overflow: hidden;
   border: 1px solid #cbd8e8;
   border-radius: 8px;
-  color: #6f8eae;
-  background: #eef5fb;
+  background: #dbe8f4;
   cursor: crosshair;
+  touch-action: none;
+  user-select: none;
 }
 
-.location-capture:has(.location-sketch[aria-disabled="true"]) .location-sketch {
-  cursor: default;
+.location-map.is-disabled {
+  cursor: grab;
+}
+
+.location-map:active {
+  cursor: grabbing;
+}
+
+.location-map .location-reference-tile {
+  pointer-events: none;
+}
+
+.location-map-overlay {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.location-map-hint {
+  position: absolute;
+  left: 50%;
+  top: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  color: #34516c;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.16);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateX(-50%);
 }
 
 .location-line {
@@ -3124,27 +3157,20 @@ button:disabled {
   stroke: #1769aa;
   stroke-linecap: round;
   stroke-linejoin: round;
-  stroke-width: 1.1;
+  stroke-width: 3;
 }
 
 .location-shape {
   fill: rgba(23, 105, 170, 0.2);
   stroke: #1769aa;
   stroke-linejoin: round;
-  stroke-width: 1.1;
+  stroke-width: 3;
 }
 
 .location-point {
   fill: #1769aa;
   stroke: #fff;
-  stroke-width: 0.7;
-}
-
-.location-empty-label {
-  fill: #60758f;
-  font-size: 4px;
-  font-weight: 700;
-  pointer-events: none;
+  stroke-width: 2.5;
 }
 
 .location-capture-actions {

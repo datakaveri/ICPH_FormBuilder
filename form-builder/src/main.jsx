@@ -8323,25 +8323,133 @@ function formatLocationPoint(point) {
   return [point.lat, point.lon, point.alt ?? 0, point.accuracy ?? 0].join(" ");
 }
 
+const MAP_TILE_SIZE = 256;
+const MAP_MIN_ZOOM = 2;
+const MAP_MAX_ZOOM = 19;
+
+// Web Mercator position in tile units at the given zoom.
+function mapWorldPoint(latitude, longitude, zoom) {
+  const scale = 2 ** zoom;
+  const latitudeRadians = (Math.max(-85.0511, Math.min(85.0511, latitude)) * Math.PI) / 180;
+  return {
+    x: ((longitude + 180) / 360) * scale,
+    y: ((1 - Math.asinh(Math.tan(latitudeRadians)) / Math.PI) / 2) * scale
+  };
+}
+
+function mapLocationFromWorld(x, y, zoom) {
+  const scale = 2 ** zoom;
+  const clampedY = Math.max(0, Math.min(scale, y));
+  const longitude = ((((x / scale) * 360 - 180) + 540) % 360) - 180;
+  const latitude = (Math.atan(Math.sinh(Math.PI * (1 - (2 * clampedY) / scale))) * 180) / Math.PI;
+  return { latitude, longitude };
+}
+
 function LocationCaptureField({ question, value, onChange, disabled, label, hintNode }) {
   const points = parseLocationPoints(value);
   const isPoint = question.type === "geopoint";
   const isShape = question.type === "geoshape";
   const canDraw = !disabled;
-  const toSvgPoint = (point) => `${((point.lon + 180) / 360) * 100},${((90 - point.lat) / 180) * 100}`;
+  const mapRef = useRef(null);
+  const dragRef = useRef(null);
+  const suppressClickRef = useRef(false);
+  const movedByUserRef = useRef(false);
+  const [mapSize, setMapSize] = useState({ width: 0, height: 0 });
+  const [mapView, setMapView] = useState(() => (points.length
+    ? { center: { latitude: points[0].lat, longitude: points[0].lon }, zoom: 15 }
+    : { center: { latitude: 20, longitude: 78 }, zoom: 5 }));
+  const [locationStatus, setLocationStatus] = useState("");
+
+  useEffect(() => {
+    const node = mapRef.current;
+    if (!node) return undefined;
+    const update = () => setMapSize({ width: node.clientWidth, height: node.clientHeight });
+    update();
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  // Centre on the device only when location is already allowed, so opening a form never prompts.
+  useEffect(() => {
+    if (points.length || !navigator.geolocation || !navigator.permissions?.query) return undefined;
+    let cancelled = false;
+    navigator.permissions.query({ name: "geolocation" }).then((permission) => {
+      if (cancelled || permission.state !== "granted") return;
+      navigator.geolocation.getCurrentPosition(({ coords }) => {
+        if (cancelled || movedByUserRef.current) return;
+        setMapView({ center: { latitude: coords.latitude, longitude: coords.longitude }, zoom: 15 });
+      }, () => {});
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const zoom = mapView.zoom;
+  const centerWorld = mapWorldPoint(mapView.center.latitude, mapView.center.longitude, zoom);
+  const toScreen = (point) => {
+    const world = mapWorldPoint(point.lat, point.lon, zoom);
+    return {
+      x: (world.x - centerWorld.x) * MAP_TILE_SIZE + mapSize.width / 2,
+      y: (world.y - centerWorld.y) * MAP_TILE_SIZE + mapSize.height / 2
+    };
+  };
 
   function addPointFromEvent(event) {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
     if (!canDraw) return;
     const bounds = event.currentTarget.getBoundingClientRect();
-    const lon = ((event.clientX - bounds.left) / bounds.width) * 360 - 180;
-    const lat = 90 - ((event.clientY - bounds.top) / bounds.height) * 180;
-    const nextPoint = { lat: Number(lat.toFixed(6)), lon: Number(lon.toFixed(6)), alt: 0, accuracy: 0 };
+    const worldX = centerWorld.x + (event.clientX - bounds.left - bounds.width / 2) / MAP_TILE_SIZE;
+    const worldY = centerWorld.y + (event.clientY - bounds.top - bounds.height / 2) / MAP_TILE_SIZE;
+    const { latitude, longitude } = mapLocationFromWorld(worldX, worldY, zoom);
+    const nextPoint = { lat: Number(latitude.toFixed(6)), lon: Number(longitude.toFixed(6)), alt: 0, accuracy: 0 };
     const next = isPoint ? [nextPoint] : [...points, nextPoint];
     onChange(next.map(formatLocationPoint).join("; "));
   }
 
+  function startPan(event) {
+    if (event.button !== undefined && event.button !== 0) return;
+    if (event.target.closest?.("button")) return;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = { x: event.clientX, y: event.clientY, moved: false };
+  }
+
+  function movePan(event) {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const dx = event.clientX - drag.x;
+    const dy = event.clientY - drag.y;
+    if (!drag.moved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+    drag.moved = true;
+    movedByUserRef.current = true;
+    setMapView((current) => {
+      const world = mapWorldPoint(current.center.latitude, current.center.longitude, current.zoom);
+      const center = mapLocationFromWorld(world.x - dx / MAP_TILE_SIZE, world.y - dy / MAP_TILE_SIZE, current.zoom);
+      return { ...current, center };
+    });
+    drag.x = event.clientX;
+    drag.y = event.clientY;
+  }
+
+  function endPan() {
+    if (dragRef.current?.moved) suppressClickRef.current = true;
+    dragRef.current = null;
+  }
+
+  function changeZoom(event, delta) {
+    event.stopPropagation();
+    movedByUserRef.current = true;
+    setMapView((current) => ({ ...current, zoom: Math.max(MAP_MIN_ZOOM, Math.min(MAP_MAX_ZOOM, current.zoom + delta)) }));
+  }
+
   function captureCurrentLocation() {
     if (!canDraw || !navigator.geolocation) return;
+    setLocationStatus("Getting current location...");
     navigator.geolocation.getCurrentPosition((position) => {
       const coords = position.coords;
       const nextPoint = {
@@ -8352,34 +8460,73 @@ function LocationCaptureField({ question, value, onChange, disabled, label, hint
       };
       const next = isPoint ? [nextPoint] : [...points, nextPoint];
       onChange(next.map(formatLocationPoint).join("; "));
-    }, () => {});
+      setMapView((current) => ({ center: { latitude: nextPoint.lat, longitude: nextPoint.lon }, zoom: Math.max(current.zoom, 16) }));
+      setLocationStatus("");
+    }, () => setLocationStatus("Allow location access in the browser to use the current location."), { enableHighAccuracy: true, timeout: 15000 });
   }
 
-  const path = points.map(toSvgPoint).join(" ");
+  const tiles = [];
+  if (mapSize.width && mapSize.height) {
+    const scale = 2 ** zoom;
+    const halfWidth = mapSize.width / 2 / MAP_TILE_SIZE;
+    const halfHeight = mapSize.height / 2 / MAP_TILE_SIZE;
+    for (let tileY = Math.floor(centerWorld.y - halfHeight); tileY <= Math.floor(centerWorld.y + halfHeight); tileY += 1) {
+      if (tileY < 0 || tileY >= scale) continue;
+      for (let tileX = Math.floor(centerWorld.x - halfWidth); tileX <= Math.floor(centerWorld.x + halfWidth); tileX += 1) {
+        const wrappedX = ((tileX % scale) + scale) % scale;
+        tiles.push(
+          <img
+            key={`${zoom}-${tileX}-${tileY}`}
+            className="location-reference-tile"
+            style={{
+              left: `${(tileX - centerWorld.x) * MAP_TILE_SIZE + mapSize.width / 2}px`,
+              top: `${(tileY - centerWorld.y) * MAP_TILE_SIZE + mapSize.height / 2}px`
+            }}
+            src={`https://tile.openstreetmap.org/${zoom}/${wrappedX}/${tileY}.png`}
+            alt=""
+            draggable={false}
+          />
+        );
+      }
+    }
+  }
+  const screenPoints = points.map(toScreen);
+  const path = screenPoints.map(({ x, y }) => `${x},${y}`).join(" ");
+  const emptyHint = isPoint ? "Tap the map to place a point" : isShape ? "Tap the map to outline the area" : "Tap the map to draw the route";
   return (
     <div className="preview-field location-preview-field">
       <span>{label}</span>
       {hintNode}
       <div className={`location-capture location-capture-${question.type}`}>
-        <svg className="location-sketch" viewBox="0 0 100 100" role="img" aria-label="Interactive location drawing area" onClick={addPointFromEvent}>
-          <defs>
-            <pattern id={`location-grid-${question.id}`} width="10" height="10" patternUnits="userSpaceOnUse">
-              <path d="M 10 0 L 0 0 0 10" fill="none" stroke="currentColor" strokeOpacity="0.12" strokeWidth="0.35" />
-            </pattern>
-          </defs>
-          <rect width="100" height="100" fill="url(#location-grid-${question.id})" />
-          {isShape && points.length > 2 ? <polygon points={path} className="location-shape" /> : null}
-          {!isPoint && points.length > 1 ? <polyline points={path} className="location-line" /> : null}
-          {points.map((point, index) => {
-            const [x, y] = toSvgPoint(point).split(",");
-            return <circle key={`${x}-${y}-${index}`} cx={x} cy={y} r="1.8" className="location-point" />;
-          })}
-          {!points.length ? <text x="50" y="48" textAnchor="middle" className="location-empty-label">Click to place a point</text> : null}
-        </svg>
+        <div
+          ref={mapRef}
+          className={`location-map ${canDraw ? "" : "is-disabled"}`}
+          role="application"
+          aria-label="Map for choosing a location. Drag to move, tap to place a point."
+          onPointerDown={startPan}
+          onPointerMove={movePan}
+          onPointerUp={endPan}
+          onPointerCancel={endPan}
+          onClick={addPointFromEvent}
+        >
+          {tiles}
+          <svg className="location-map-overlay" width={mapSize.width} height={mapSize.height} aria-hidden="true">
+            {isShape && points.length > 2 ? <polygon points={path} className="location-shape" /> : null}
+            {!isPoint && points.length > 1 ? <polyline points={path} className="location-line" /> : null}
+            {screenPoints.map(({ x, y }, index) => <circle key={`${points[index].lat}-${points[index].lon}-${index}`} cx={x} cy={y} r="7" className="location-point" />)}
+          </svg>
+          {!points.length && canDraw ? <span className="location-map-hint">{emptyHint}</span> : null}
+          <div className="geopoint-map-controls">
+            <button type="button" onClick={(event) => changeZoom(event, 1)} aria-label="Zoom in">+</button>
+            <button type="button" onClick={(event) => changeZoom(event, -1)} aria-label="Zoom out">−</button>
+          </div>
+          <small className="location-reference-attribution">© OpenStreetMap contributors</small>
+        </div>
         <div className="location-capture-actions">
           <button type="button" className="secondary small" disabled={!canDraw || !navigator.geolocation} onClick={captureCurrentLocation}><MapPin size={14} /> Use current location</button>
-          {!isPoint && points.length ? <button type="button" className="secondary small" disabled={!canDraw} onClick={() => onChange(points.slice(0, -1).map(formatLocationPoint).join(";"))}>Undo point</button> : null}
+          {!isPoint && points.length ? <button type="button" className="secondary small" disabled={!canDraw} onClick={() => onChange(points.slice(0, -1).map(formatLocationPoint).join("; "))}>Undo point</button> : null}
           {points.length ? <button type="button" className="secondary small" disabled={!canDraw} onClick={() => onChange("")}>Clear</button> : null}
+          {locationStatus ? <small className="muted">{locationStatus}</small> : null}
         </div>
       </div>
       <div className="location-coordinates">

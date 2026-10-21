@@ -147,6 +147,7 @@ async function authenticateRequest(req) {
     // A key-fetch failure is an outage, not a bad token: report it as such.
     const code = String(error?.code || "");
     if (!code.startsWith("ERR_J") || code === "ERR_JWKS_TIMEOUT" || code === "ERR_JOSE_GENERIC") {
+      console.error(`[auth] could not fetch signing keys from ${keycloakUrl} (realm ${keycloakRealm}):`, error);
       const unavailable = new Error("The login service is unavailable. Try again shortly.");
       unavailable.statusCode = 503;
       throw unavailable;
