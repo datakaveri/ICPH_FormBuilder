@@ -12063,18 +12063,6 @@ function LocationTypeHelp({ question }) {
   );
 }
 
-const GEOMETRY_POINT_PICKER_XML = `<?xml version="1.0" encoding="UTF-8"?>
-<h:html xmlns:h="http://www.w3.org/1999/xhtml" xmlns="http://www.w3.org/2002/xforms" xmlns:jr="http://openrosa.org/javarosa">
-  <h:head>
-    <h:title>Choose map point</h:title>
-    <model>
-      <instance><data id="icph_geometry_picker"><location /></data></instance>
-      <bind nodeset="/data/location" type="geopoint" required="true()" />
-    </model>
-  </h:head>
-  <h:body><input ref="/data/location" appearance="placement-map"><label>Choose a point</label></input></h:body>
-</h:html>`;
-
 function GeopointOptionPicker({ onAdd, onClose }) {
   const [mapView, setMapView] = useState({ center: { latitude: 20, longitude: 78 }, zoom: 5 });
   const [selectedPoint, setSelectedPoint] = useState(null);
@@ -12082,7 +12070,6 @@ function GeopointOptionPicker({ onAdd, onClose }) {
   const tileSize = 256;
   const dragRef = useRef(null);
   const suppressClickRef = useRef(false);
-  const mapSelectRef = useRef(null);
 
   useEffect(() => {
     if (!navigator.geolocation) return undefined;
@@ -12187,15 +12174,6 @@ function GeopointOptionPicker({ onAdd, onClose }) {
     setLabel("");
   }
 
-  function handleMapSelected(point) {
-    onAdd({
-      name: `place_${Date.now().toString().slice(-6)}`,
-      label: label.trim() || `Place ${point.latitude.toFixed(4)}, ${point.longitude.toFixed(4)}`,
-      geometry: `POINT (${point.longitude} ${point.latitude})`
-    });
-    onClose();
-  }
-
   return (
     <div className="geopoint-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="geopoint-picker" role="dialog" aria-modal="true" aria-label="Add a map point">
@@ -12203,22 +12181,38 @@ function GeopointOptionPicker({ onAdd, onClose }) {
           <div><strong>Add map point</strong><span>Click the map to place a point, then give it a choice label.</span></div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close map point picker"><X size={16} /></button>
         </div>
-        <div className="geopoint-picker-odk-map">
-          <OdkWebFormIsland
-            form={{ questions: [] }}
-            formXml={GEOMETRY_POINT_PICKER_XML}
-            workspaceId=""
-            formApiBase=""
-            mapPicker
-            mapPickerSelectRef={mapSelectRef}
-            onMapSelected={handleMapSelected}
-            onSubmitted={() => {}}
-            onError={() => {}}
-          />
+        <div
+          className="geopoint-picker-map"
+          onPointerDown={startPan}
+          onPointerMove={movePan}
+          onPointerUp={endPan}
+          onPointerCancel={endPan}
+          onLostPointerCapture={endPan}
+          onClick={pointFromClick}
+        >
+          <div className="location-reference-tiles">{tiles}</div>
+          {selectedPoint ? (
+            <span
+              className="geopoint-picker-marker"
+              aria-label={`Selected point ${selectedPoint.latitude}, ${selectedPoint.longitude}`}
+              style={{ left: markerLeft, top: markerTop }}
+            />
+          ) : null}
+          <div className="geopoint-map-controls" aria-label="Map controls" onPointerDown={(event) => event.stopPropagation()}>
+            <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(1); }} aria-label="Zoom in">+</button>
+            <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(-1); }} aria-label="Zoom out">−</button>
+          </div>
+          <small className="location-reference-attribution">© OpenStreetMap contributors</small>
         </div>
         <div className="geopoint-picker-actions">
-          <small className="muted">Move the point on the map, then select it.</small>
-          <button className="primary" type="button" onClick={() => mapSelectRef.current?.()}><MapPin size={16} /> Select</button>
+          <label className="geopoint-picker-label">
+            <span>Choice label</span>
+            <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="e.g. Primary health centre" />
+          </label>
+          <div className="geopoint-picker-action-buttons">
+            <small className="muted">{selectedPoint ? `${selectedPoint.latitude.toFixed(6)}, ${selectedPoint.longitude.toFixed(6)}` : "Click the map to place a point."}</small>
+            <button className="primary" type="button" disabled={!selectedPoint} onClick={addPoint}><MapPin size={16} /> Add point</button>
+          </div>
         </div>
       </div>
     </div>

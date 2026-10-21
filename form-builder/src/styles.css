@@ -4044,10 +4044,32 @@ button:disabled {
 }
 
 .geopoint-picker-map {
+  position: relative;
   height: min(62vh, 560px);
+  overflow: hidden;
+  border: 1px solid #b9cbe0;
+  border-radius: 8px;
+  background: #dbe8f4;
   cursor: crosshair;
   touch-action: none;
   user-select: none;
+}
+
+.geopoint-picker-map .location-reference-tile {
+  pointer-events: none;
+}
+
+.geopoint-picker-marker {
+  position: absolute;
+  z-index: 1;
+  width: 20px;
+  height: 20px;
+  border: 3px solid #fff;
+  border-radius: 50% 50% 50% 0;
+  background: #1769aa;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.38);
+  transform: translate(-50%, -100%) rotate(-45deg);
+  pointer-events: none;
 }
 
 .geopoint-picker-odk-map {
@@ -4071,11 +4093,34 @@ button:disabled {
 }
 
 .geopoint-picker-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
+  display: grid;
   gap: 12px;
   padding-top: 2px;
+}
+
+.geopoint-picker-label {
+  display: grid;
+  gap: 5px;
+  max-width: 520px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.geopoint-picker-label input {
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid #b8c8da;
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+}
+
+.geopoint-picker-action-buttons {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .geopoint-picker-map:active {
