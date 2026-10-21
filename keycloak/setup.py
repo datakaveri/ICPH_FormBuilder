@@ -6,7 +6,8 @@ Creates:
   realm   icph (login theme: icph)
     - realm roles  icph-admin, icph-field-agent
                    (carried in the standard realm_access.roles claim)
-    - client       icph-form-builder (public SPA, Authorization Code + PKCE)
+    - client       icph-form-builder (public SPA, Authorization Code + PKCE,
+                   offline_access scope for offline sign-in)
     - users        admin      -> icph-admin
                    fieldagent -> icph-field-agent
 Safe to re-run (409 Conflict is treated as 'already exists').
@@ -94,8 +95,14 @@ api("POST", "/realms", {
     # A working day, so a field agent who goes offline can resume without a new login.
     "ssoSessionIdleTimeout": 43200, "ssoSessionMaxLifespan": 43200,
 })
-# Applied separately so an existing realm picks up the theme too.
-api("PUT", f"/realms/{REALM}", {"realm": REALM, "loginTheme": LOGIN_THEME})
+# Applied separately so an existing realm picks these up too.
+api("PUT", f"/realms/{REALM}", {
+    "realm": REALM, "loginTheme": LOGIN_THEME,
+    # The app asks for offline_access: its refresh token survives the browser
+    # session, for 30 days without use and 60 days at most before a new login.
+    "offlineSessionIdleTimeout": 30 * 86400,
+    "offlineSessionMaxLifespanEnabled": True, "offlineSessionMaxLifespan": 60 * 86400,
+})
 
 # 2. roles (standard realm_access.roles claim, no custom mappers) ------------
 step(f"realm roles {', '.join(r[0] for r in ROLES)}")
@@ -117,6 +124,10 @@ api("POST", f"/realms/{REALM}/clients", client)
 existing = jget(f"/realms/{REALM}/clients?clientId={CLIENT_ID}")[0]
 # Re-apply so a changed APP_URLS takes effect on an existing realm.
 api("PUT", f"/realms/{REALM}/clients/{existing['id']}", {**existing, **client})
+# The app requests the offline_access scope; Keycloak refuses it unless the
+# client offers it (users get the offline_access role through default roles).
+offline_scope = next(s for s in jget(f"/realms/{REALM}/client-scopes") if s["name"] == "offline_access")
+api("PUT", f"/realms/{REALM}/clients/{existing['id']}/optional-client-scopes/{offline_scope['id']}")
 
 # 4. users -------------------------------------------------------------------
 for username, password, first, last, role_name in USERS:

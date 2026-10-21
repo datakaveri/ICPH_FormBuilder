@@ -1,0 +1,38 @@
+# WAF for the ICPH Form Builder route (Envoy Gateway + Coraza).
+#
+# The Gateway-wide policy envoy/coraza-waf runs the OWASP Core Rule Set, which by
+# default only allows GET HEAD POST OPTIONS (rule 911100) and answers anything else
+# with an empty 403 before the request reaches the API. The app needs PUT and DELETE
+# (saving settings, deleting folders, forms, entries and attachments).
+#
+# A policy targeting the HTTPRoute replaces the Gateway's policy for that route (the
+# same way keycloak/keycloak-waf-exclude does), so this repeats the Gateway's WAF
+# config and adds one line: tx.allowed_methods, set after crs-setup and before the
+# CRS rules load. Keep the rest in step with envoy/coraza-waf if that changes.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyExtensionPolicy
+metadata:
+    name: icph-form-builder-waf
+    namespace: icph
+spec:
+    targetRefs:
+        - group: gateway.networking.k8s.io
+          kind: HTTPRoute
+          name: icph-form-builder
+    wasm:
+        - name: coraza-waf
+          rootID: coraza-filter
+          code:
+              type: Image
+              image:
+                  url: ghcr.io/corazawaf/coraza-proxy-wasm:0.6.0
+          config:
+              default_directives: default
+              directives_map:
+                  default:
+                      - SecDebugLogLevel 1
+                      - SecRuleEngine On
+                      - Include @crs-setup-conf
+                      - SecAction "id:900200,phase:1,nolog,pass,t:none,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'"
+                      - Include @owasp_crs/*.conf
+          failOpen: false

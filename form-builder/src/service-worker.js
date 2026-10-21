@@ -30,6 +30,11 @@ self.addEventListener("fetch", (event) => {
   event.respondWith(caches.match(request).then((cached) => cached || fetch(request)));
 });
 
+// Sent by a page loaded with a hard reload, which bypasses the worker.
+self.addEventListener("message", (event) => {
+  if (event.data?.type === "icph:claim") event.waitUntil(self.clients.claim());
+});
+
 self.addEventListener("sync", (event) => {
   if (event.tag === "icph-submit-queue") event.waitUntil(requestPageSync());
 });

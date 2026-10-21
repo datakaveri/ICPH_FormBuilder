@@ -47,7 +47,7 @@ import {
   X
 } from "lucide-react";
 import "./styles.css";
-import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, configureAuth, forgetSession, initAuth, login, logout } from "./auth.js";
+import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, configureAuth, confirmSessionEnded, initAuth, login, logout, reconfirmSession } from "./auth.js";
 import cdpgLogo from "./assets/cdpg-logo.png";
 import icphLogo from "./assets/icph-logo.png";
 
@@ -2645,6 +2645,11 @@ function App() {
     if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return;
     navigator.serviceWorker.register("/service-worker.js")
       .catch((error) => console.warn("ICPH offline app setup failed:", error));
+    // A hard reload (Ctrl+Shift+R) skips the worker, leaving this page uncontrolled
+    // and unable to load cached files if the connection drops. Ask it to take over.
+    navigator.serviceWorker.ready.then((registration) => {
+      if (!navigator.serviceWorker.controller) registration.active?.postMessage({ type: "icph:claim" });
+    });
     const syncOnRequest = (event) => {
       if (event.data?.type === "icph:sync-queue") void syncPendingSubmissions().catch(() => {});
     };
@@ -3030,10 +3035,29 @@ function useAuthSession() {
     return () => { cancelled = true; };
   }, []);
 
-  function expireSession() {
-    forgetSession();
+  // Offline too long: the login is kept, but locked until Keycloak confirms it again.
+  useEffect(() => {
+    if (!session?.needsReconnect) return;
+    const days = Math.floor((Date.now() - session.verifiedAt) / (24 * 60 * 60 * 1000));
+    setAuthMessage(`Your sign-in was last confirmed ${days} days ago. Connect to the internet to keep using the app.`);
+    const recheck = () => {
+      if (!navigator.onLine) return;
+      reconfirmSession().then((nextSession) => {
+        setSession(nextSession);
+        if (!nextSession.needsReconnect) setAuthMessage(nextSession.authenticated ? "" : "Your session has ended. Sign in again.");
+      }, () => {});
+    };
+    recheck();
+    window.addEventListener("online", recheck);
+    return () => window.removeEventListener("online", recheck);
+  }, [session?.needsReconnect]);
+
+  // Returns whether the login really ended; see confirmSessionEnded.
+  async function expireSession() {
+    if (!(await confirmSessionEnded())) return false;
     setSession({ authenticated: false, username: "", roles: [] });
     setAuthMessage("Your session has ended. Sign in again.");
+    return true;
   }
 
   return { session, authMessage, expireSession };
@@ -3354,10 +3378,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
         : nextForms[0]?.respondentAccessCode || "");
       setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
     } catch (error) {
-      if (error?.status === 401) {
-        onSessionExpired?.();
-        return;
-      }
+      if (error?.status === 401 && await onSessionExpired?.()) return;
       const savedForms = await listOfflineFormPackages().catch(() => []);
       const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
       if (savedForms.length) {
@@ -3880,7 +3901,7 @@ function DashboardApp({ onLogout }) {
     [form.questions]
   );
   const folderPrimaryIdentifier = currentFolder?.primaryIdentifierVariable
-    || forms.find((item) => item.folderId === form.folderId && item.primaryIdentifierVariable)?.primaryIdentifierVariable
+    || forms.find((item) => item.folderId === form.folderId && item.hasXml && item.primaryIdentifierVariable)?.primaryIdentifierVariable
     || "";
   const needsFolderPrimaryAcknowledgement = Boolean(form.folderId && !folderPrimaryIdentifier);
   const attachmentNames = useMemo(() => attachments.map((attachment) => attachment.fileName), [attachments]);
@@ -4448,6 +4469,11 @@ function DashboardApp({ onLogout }) {
         setStatus({ kind: "error", message: "Add at least one named answer question outside repeats before moving to Publish." });
         return;
       }
+      setPublishConfirmationAccepted(true);
+      setPublishIdentifierPrompt(true);
+      return;
+    }
+    if (!alreadyPublished && selectedPrimaryIdentifier && needsFolderPrimaryAcknowledgement && !options.primaryIdentifierAcknowledged) {
       setPublishConfirmationAccepted(true);
       setPublishIdentifierPrompt(true);
       return;

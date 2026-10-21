@@ -37,6 +37,9 @@ const keycloakPublicUrl = String(process.env.KEYCLOAK_PUBLIC_URL || keycloakUrl)
 const keycloakRealm = process.env.KEYCLOAK_REALM || "icph";
 const keycloakClientId = process.env.KEYCLOAK_CLIENT_ID || "icph-form-builder";
 const keycloakIssuer = `${keycloakPublicUrl}/realms/${keycloakRealm}`;
+// Days a signed-in user may keep working offline before the app needs Keycloak
+// to confirm the login again. Keep it below the realm's Offline Session Idle.
+const offlineSignInDays = Math.max(1, Number(process.env.OFFLINE_SIGN_IN_DAYS) || 7);
 const keycloakKeys = createRemoteJWKSet(new URL(`${keycloakUrl}/realms/${keycloakRealm}/protocol/openid-connect/certs`));
 const ADMIN_ROLE = "icph-admin";
 const FIELD_AGENT_ROLE = "icph-field-agent";
@@ -3002,7 +3005,7 @@ const server = createServer(async (req, res) => {
       return jsonResponse(res, 200, { ok: true });
     }
     if (req.method === "GET" && pathname === "/api/auth/config") {
-      return jsonResponse(res, 200, { ok: true, url: keycloakPublicUrl, realm: keycloakRealm, clientId: keycloakClientId });
+      return jsonResponse(res, 200, { ok: true, url: keycloakPublicUrl, realm: keycloakRealm, clientId: keycloakClientId, offlineSignInDays });
     }
     // Collection routes: filling in and reviewing published forms by form code.
     const collector = pathname.startsWith("/api/public/") ? await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE) : null;

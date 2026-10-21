@@ -63,6 +63,10 @@ spec:
               value: "icph"                         # CHANGE: realm
             - name: KEYCLOAK_CLIENT_ID
               value: "icph-form-builder"            # CHANGE: client id, if different
+            - name: OFFLINE_SIGN_IN_DAYS
+              # Days a user may work offline before the app needs Keycloak to
+              # confirm the login again. Keep below the realm's Offline Session Idle.
+              value: "7"
           ports:
             - name: http
               containerPort: 8787

@@ -358,6 +358,35 @@ The API reads `KEYCLOAK_URL` (how the server reaches Keycloak),
 the app is opened from so Keycloak accepts the login redirect. Sign-in needs a
 secure browser context: `localhost` or HTTPS.
 
+#### Offline sign-in
+
+The app asks Keycloak for the `offline_access` scope, so its refresh token
+outlives the browser session and a signed-in user stays signed in across
+reloads, hard reloads and days without a connection. Offline, the app accepts
+the stored login for `OFFLINE_SIGN_IN_DAYS` (default 7) after Keycloak last
+confirmed it, then locks until the device reconnects. A failed API call signs
+the user out only when Keycloak itself rejects the refresh token. Signing out
+revokes the offline token (on the next online start, if signed out offline).
+
+`keycloak/setup.py` configures this for the local realm. For another Keycloak,
+in the realm:
+
+- Clients → `icph-form-builder` → Client scopes: `offline_access` is assigned
+  (Optional). Without it, sign-in fails.
+- Users have the `offline_access` realm role. Keycloak's default roles include
+  it; to limit offline sign-in to field agents, move it from the default roles
+  to the `icph-field-agent` role.
+- Realm settings → Sessions: Offline Session Idle (30 days here) above
+  `OFFLINE_SIGN_IN_DAYS`, and optionally Offline Session Max Limited (60 days
+  here) to force a fresh password sign-in eventually.
+- Realm settings → Tokens: Revoke Refresh Token off (the default), or Refresh
+  Token Max Reuse of 1 or more. Single-use refresh tokens sign users out when
+  two tabs refresh at once or a refresh reply is lost on a poor connection.
+
+The full list, with console paths, is in `keycloak_changes.md`.
+
+Admins can end a user's offline sign-in under Users → the user → Sessions.
+
 When an admin moves a form to Publish, the API generates a 5-character
 alphanumeric respondent form code. A signed-in field agent fills a published
 form from the Field Agent screen, or by entering the code at:
