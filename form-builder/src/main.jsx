@@ -8,6 +8,7 @@ import {
 import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 import {
   AlertCircle,
+  BarChart3,
   Calendar,
   Check,
   ChevronDown,
@@ -2317,6 +2318,302 @@ function entriesToCsv(form, entries) {
     rows.push(questions.map((question) => csvEscape(entryExportValue(answers, question))).join(","));
   }
   return rows.join("\n") + "\n";
+}
+
+const STATISTICS_CHOICE_TYPES = new Set([
+  "select_one",
+  "select_multiple",
+  "select_one_from_file",
+  "select_multiple_from_file",
+  "rank"
+]);
+
+const STATISTICS_EXCLUDED_TYPES = new Set([
+  ...STRUCTURAL_TYPES,
+  "note",
+  "calculate",
+  "hidden",
+  "csv-external",
+  "timer",
+  "audit",
+  "background-audio",
+  "start",
+  "end",
+  "today",
+  "deviceid",
+  "username"
+]);
+
+function statisticAnswerValues(question, answers = {}) {
+  const raw = entryExportValue(answers, question);
+  const values = Array.isArray(raw) ? raw.flat(Infinity) : [raw];
+  return values.flatMap((value) => {
+    const text = String(value ?? "").trim();
+    if (!text) return [];
+    if (["select_multiple", "select_multiple_from_file", "rank"].includes(question.type)) {
+      return text.split(/\s+/).filter(Boolean);
+    }
+    return [text];
+  });
+}
+
+function statisticQuestionLabel(question = {}) {
+  return displayFormText(question.label || question.name || "Question") || question.name || "Question";
+}
+
+function statisticOptionLabel(question = {}, value = "") {
+  const option = (question.options || []).find((item) => String(item.name) === String(value));
+  return displayFormText(option?.label || option?.name || value) || String(value);
+}
+
+function statisticFrequencyItems(values = [], labelForValue = (value) => value, limit = 8) {
+  const counts = new Map();
+  values.forEach((value) => {
+    const key = String(value);
+    const current = counts.get(key) || { key, label: labelForValue(value), count: 0 };
+    current.count += 1;
+    counts.set(key, current);
+  });
+  return [...counts.values()]
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+    .slice(0, limit);
+}
+
+function formatStatisticNumber(value) {
+  if (!Number.isFinite(value)) return "—";
+  return Number.isInteger(value) ? String(value) : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function statisticDateLabel(value, type) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (type === "time") return text;
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return text;
+  return parsed.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+function numericStatisticBins(numbers) {
+  if (!numbers.length) return [];
+  const min = Math.min(...numbers);
+  const max = Math.max(...numbers);
+  if (min === max) return [{ label: formatStatisticNumber(min), count: numbers.length }];
+  const binCount = Math.min(5, Math.max(2, Math.ceil(Math.sqrt(numbers.length))));
+  const width = (max - min) / binCount;
+  return Array.from({ length: binCount }, (_, index) => {
+    const lower = min + width * index;
+    const upper = index === binCount - 1 ? max : min + width * (index + 1);
+    const count = numbers.filter((value) => index === binCount - 1
+      ? value >= lower && value <= upper
+      : value >= lower && value < upper).length;
+    return {
+      label: `${formatStatisticNumber(lower)}–${formatStatisticNumber(upper)}`,
+      count
+    };
+  });
+}
+
+function buildQuestionStatistics(question, entries = [], form = {}) {
+  const answerRows = entries.map((entry) => statisticAnswerValues(question, computeCalculatedAnswers(form, entry.answers || {})));
+  const values = answerRows.flat();
+  const responseCount = answerRows.filter((answers) => answers.length > 0).length;
+  const base = {
+    question,
+    label: statisticQuestionLabel(question),
+    responseCount,
+    responseRate: entries.length ? (responseCount / entries.length) * 100 : 0,
+    uniqueCount: new Set(values).size,
+    totalEntries: entries.length
+  };
+
+  if (STATISTICS_CHOICE_TYPES.has(question.type)) {
+    const counts = new Map(values.map((value) => [String(value), 0]));
+    (question.options || []).forEach((option) => counts.set(String(option.name), 0));
+    values.forEach((value) => counts.set(String(value), (counts.get(String(value)) || 0) + 1));
+    const orderedKeys = [
+      ...(question.options || []).map((option) => String(option.name)),
+      ...[...counts.keys()].filter((key) => !(question.options || []).some((option) => String(option.name) === key))
+    ];
+    const denominator = question.type === "select_multiple" || question.type === "select_multiple_from_file" ? values.length : responseCount;
+    return {
+      ...base,
+      kind: "choice",
+      denominator,
+      items: orderedKeys.map((key) => ({
+        key,
+        label: statisticOptionLabel(question, key),
+        count: counts.get(key) || 0
+      })).filter((item) => item.count > 0 || question.options?.some((option) => String(option.name) === item.key))
+    };
+  }
+
+  if (["integer", "decimal", "range"].includes(question.type)) {
+    const numbers = values.map(Number).filter(Number.isFinite);
+    const sorted = [...numbers].sort((left, right) => left - right);
+    const middle = Math.floor(sorted.length / 2);
+    const median = sorted.length
+      ? sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+      : NaN;
+    return {
+      ...base,
+      kind: "numeric",
+      numericCount: numbers.length,
+      average: numbers.length ? numbers.reduce((sum, value) => sum + value, 0) / numbers.length : NaN,
+      median,
+      minimum: numbers.length ? sorted[0] : NaN,
+      maximum: numbers.length ? sorted.at(-1) : NaN,
+      items: numericStatisticBins(numbers)
+    };
+  }
+
+  if (["date", "dateTime", "time"].includes(question.type)) {
+    const items = statisticFrequencyItems(values, (value) => statisticDateLabel(value, question.type));
+    return {
+      ...base,
+      kind: "date",
+      items,
+      earliest: values.length ? statisticDateLabel([...values].sort()[0], question.type) : "",
+      latest: values.length ? statisticDateLabel([...values].sort().at(-1), question.type) : ""
+    };
+  }
+
+  if (["image", "audio", "video", "file"].includes(question.type)) {
+    return { ...base, kind: "media" };
+  }
+
+  return {
+    ...base,
+    kind: "text",
+    items: statisticFrequencyItems(values, (value) => value)
+  };
+}
+
+function StatisticsMetric({ label, value }) {
+  return (
+    <div className="statistics-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function StatisticsBarChart({ items = [], denominator = 0 }) {
+  const max = Math.max(...items.map((item) => item.count), 0);
+  if (!items.length) return <p className="statistics-empty">No responses yet.</p>;
+  return (
+    <div className="statistics-bars">
+      {items.map((item) => {
+        const percentage = denominator ? (item.count / denominator) * 100 : 0;
+        return (
+          <div className="statistics-bar-row" key={item.key || item.label}>
+            <div className="statistics-bar-label" title={item.label}>
+              <span>{item.label || "Blank"}</span>
+              <strong>{item.count} <small>{percentage.toFixed(0)}%</small></strong>
+            </div>
+            <div className="statistics-bar-track" aria-hidden="true">
+              <span style={{ width: `${max ? Math.max((item.count / max) * 100, item.count ? 4 : 0) : 0}%` }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function StatisticsQuestionCard({ statistic }) {
+  const { question, label, responseCount, responseRate, totalEntries } = statistic;
+  return (
+    <article className="statistics-question-card">
+      <div className="statistics-question-head">
+        <div>
+          <span className="eyebrow">{question.type.replace(/_/g, " ")}</span>
+          <h3>{label}</h3>
+        </div>
+        <span className="statistics-response-count">{responseCount}/{totalEntries} answered</span>
+      </div>
+      {statistic.kind === "choice" ? (
+        <StatisticsBarChart items={statistic.items} denominator={statistic.denominator} />
+      ) : statistic.kind === "numeric" ? (
+        statistic.numericCount ? (
+          <>
+            <div className="statistics-metrics">
+              <StatisticsMetric label="Average" value={formatStatisticNumber(statistic.average)} />
+              <StatisticsMetric label="Median" value={formatStatisticNumber(statistic.median)} />
+              <StatisticsMetric label="Minimum" value={formatStatisticNumber(statistic.minimum)} />
+              <StatisticsMetric label="Maximum" value={formatStatisticNumber(statistic.maximum)} />
+            </div>
+            <StatisticsBarChart items={statistic.items} denominator={statistic.numericCount} />
+          </>
+        ) : <p className="statistics-empty">No numeric responses yet.</p>
+      ) : statistic.kind === "date" ? (
+        responseCount ? (
+          <>
+            <div className="statistics-metrics">
+              <StatisticsMetric label="First response" value={statistic.earliest} />
+              <StatisticsMetric label="Latest response" value={statistic.latest} />
+            </div>
+            <StatisticsBarChart items={statistic.items} denominator={responseCount} />
+          </>
+        ) : <p className="statistics-empty">No responses yet.</p>
+      ) : statistic.kind === "media" ? (
+        <div className="statistics-metrics">
+          <StatisticsMetric label="Files submitted" value={responseCount} />
+          <StatisticsMetric label="Completion" value={`${responseRate.toFixed(0)}%`} />
+        </div>
+      ) : (
+        responseCount ? (
+          <>
+            <div className="statistics-metrics">
+              <StatisticsMetric label="Unique answers" value={statistic.uniqueCount} />
+              <StatisticsMetric label="Completion" value={`${responseRate.toFixed(0)}%`} />
+            </div>
+            <StatisticsBarChart items={statistic.items} denominator={responseCount} />
+          </>
+        ) : <p className="statistics-empty">No responses yet.</p>
+      )}
+    </article>
+  );
+}
+
+function StatisticsModal({ form, entries, onClose }) {
+  const statistics = useMemo(() => entryCsvQuestions(form)
+    .filter((question) => !STATISTICS_EXCLUDED_TYPES.has(question.type))
+    .map((question) => buildQuestionStatistics(question, entries, form)), [entries, form]);
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="link-modal statistics-modal" role="dialog" aria-modal="true" aria-label="Response statistics" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head statistics-modal-head">
+          <div>
+            <span className="eyebrow">Published questionnaire</span>
+            <h2>Response statistics</h2>
+            <p>{form.title || "Form"} · {entries.length} total response{entries.length === 1 ? "" : "s"}</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close response statistics">
+            <X size={16} />
+          </button>
+        </div>
+        <div className="statistics-modal-body">
+          {statistics.length ? statistics.map((statistic) => (
+            <StatisticsQuestionCard key={statistic.question.id || statistic.question.name} statistic={statistic} />
+          )) : (
+            <div className="statistics-empty-state">
+              <BarChart3 size={28} />
+              <p>No answerable questions are available for statistics.</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 const CRC32_TABLE = Array.from({ length: 256 }, (_, index) => {
@@ -6663,6 +6960,7 @@ function BuilderPage(props) {
     [form]
   );
   const [questionTypeToAdd, setQuestionTypeToAdd] = useState(QUESTION_TYPES[0]?.type || "text");
+  const [statisticsOpen, setStatisticsOpen] = useState(false);
 
   return (
     <>
@@ -6676,6 +6974,11 @@ function BuilderPage(props) {
         <div className="topbar-title">
           <h1>{form.title || "ICPH Form Builder"}</h1>
           <p>Build, checkpoint, export, and collect locally in one form workspace.</p>
+          {published ? (
+            <button className="secondary small statistics-trigger" type="button" onClick={() => setStatisticsOpen(true)}>
+              <BarChart3 size={15} /> Statistics
+            </button>
+          ) : null}
         </div>
         <div className="topbar-brand">
           <BrandLogos />
@@ -7009,6 +7312,7 @@ function BuilderPage(props) {
 	        createNewVersion={createNewVersion}
 	        leaveAllTerminologyUnmappedAndPublish={leaveAllTerminologyUnmappedAndPublish}
 	      />
+      {statisticsOpen ? <StatisticsModal form={form} entries={entries} onClose={() => setStatisticsOpen(false)} /> : null}
     </>
   );
 }
