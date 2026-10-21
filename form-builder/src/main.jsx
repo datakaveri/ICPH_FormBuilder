@@ -5426,57 +5426,29 @@ function DashboardApp({ onLogout }) {
     return { terminology: nextTerminology, question: savedQuestion, entityIndex: savedEntityIndex >= 0 ? savedEntityIndex : addedEntityIndex };
   }
 
-  async function importXlsx(event, folderId = "") {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    setStatus({ kind: "busy", message: `Inspecting ${file.name}...` });
-    try {
-      const dataBase64 = await fileToBase64(file);
-      const data = await postJson("/api/forms/inspect-xlsx", { filename: file.name, dataBase64 });
-      setPendingXlsxImport({
-        filename: file.name,
-        dataBase64,
-        title: data.title,
-        formId: data.formId,
-        variables: data.variables || [],
-        variableCount: data.variableCount || 0,
-        folderId: String(folderId || "").trim() || "",
-        folderName: folders.find((folder) => folder.id === folderId)?.name || "",
-        folderPrimaryIdentifier: folders.find((folder) => folder.id === folderId)?.primaryIdentifierVariable
-          || forms.find((item) => item.folderId === folderId && item.hasXml && item.primaryIdentifierVariable)?.primaryIdentifierVariable
-          || ""
-      });
-      setStatus({
-        kind: "ok",
-        message: `Inspected ${file.name}. Choose its primary identifier and optional MetaForm link.`
-      });
-    } catch (error) {
-      handleRequestError(error);
-    }
-  }
-
-  async function confirmXlsxImport(linkage) {
-    if (!pendingXlsxImport) return;
-    setStatus({ kind: "busy", message: `Importing ${pendingXlsxImport.filename}...` });
+  async function completeXlsxImport(pending, linkage = {}) {
+    if (!pending) return;
+    setStatus({ kind: "busy", message: `Importing ${pending.filename}...` });
     try {
       const data = await postJson("/api/forms/import-xlsx", {
-        filename: pendingXlsxImport.filename,
-        dataBase64: pendingXlsxImport.dataBase64,
+        filename: pending.filename,
+        dataBase64: pending.dataBase64,
         linkedMetaFormFileName: linkage.linkedMetaFormFileName,
         primaryIdentifierVariable: linkage.primaryIdentifierVariable,
         metaFormFormIndex: linkage.metaFormFormIndex,
         metaFormFormTitle: linkage.metaFormFormTitle,
         primaryIdentifierAcknowledged: linkage.primaryIdentifierAcknowledged,
         addMissingPrimaryIdentifier: linkage.addMissingPrimaryIdentifier,
-        folderId: pendingXlsxImport.folderId
+        folderId: pending.folderId
       });
       setPendingXlsxImport(null);
-	      const importedForm = normalizeFormDraft({
-	        ...data.draft,
-	        primaryIdentifierVariable: data.draft?.primaryIdentifierVariable || linkage.primaryIdentifierVariable,
-	        instanceName: data.draft?.instanceName || instanceNameForPrimaryIdentifier(linkage.primaryIdentifierVariable)
-	      });
+      const importedForm = normalizeFormDraft({
+        ...data.draft,
+        primaryIdentifierVariable: data.draft?.primaryIdentifierVariable || linkage.primaryIdentifierVariable || "",
+        instanceName: data.draft?.instanceName || (linkage.primaryIdentifierVariable
+          ? instanceNameForPrimaryIdentifier(linkage.primaryIdentifierVariable)
+          : "")
+      });
       const importedAttachments = data.attachments || [];
       const importedResourceRequirements = formResourceRequirements(
         importedForm,
@@ -5503,6 +5475,51 @@ function DashboardApp({ onLogout }) {
     } catch (error) {
       handleRequestError(error);
     }
+  }
+
+  async function importXlsx(event, folderId = "") {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setStatus({ kind: "busy", message: `Inspecting ${file.name}...` });
+    try {
+      const dataBase64 = await fileToBase64(file);
+      const data = await postJson("/api/forms/inspect-xlsx", { filename: file.name, dataBase64 });
+      const pending = {
+        filename: file.name,
+        dataBase64,
+        title: data.title,
+        formId: data.formId,
+        variables: data.variables || [],
+        variableCount: data.variableCount || 0,
+        folderId: String(folderId || "").trim() || "",
+        folderName: folders.find((folder) => folder.id === folderId)?.name || "",
+        folderPrimaryIdentifier: folders.find((folder) => folder.id === folderId)?.primaryIdentifierVariable
+          || forms.find((item) => item.folderId === folderId && item.hasXml && item.primaryIdentifierVariable)?.primaryIdentifierVariable
+          || ""
+      };
+      if (pending.folderId) {
+        await completeXlsxImport(pending, {
+          linkedMetaFormFileName: "",
+          primaryIdentifierVariable: pending.folderPrimaryIdentifier,
+          primaryIdentifierAcknowledged: false,
+          addMissingPrimaryIdentifier: Boolean(pending.folderPrimaryIdentifier)
+        });
+        return;
+      }
+      setPendingXlsxImport(pending);
+      setStatus({
+        kind: "ok",
+        message: `Inspected ${file.name}. Choose its primary identifier and optional MetaForm link.`
+      });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
+  async function confirmXlsxImport(linkage) {
+    if (!pendingXlsxImport) return;
+    await completeXlsxImport(pendingXlsxImport, linkage);
   }
 
   async function uploadSchemaDocument(event) {
