@@ -2587,6 +2587,68 @@ function statisticsMapWorldPoint(latitude, longitude, zoom) {
   };
 }
 
+function useStreetMapGrid(mapRef) {
+  const [mapSize, setMapSize] = useState({ width: 1024, height: 600 });
+
+  useEffect(() => {
+    const element = mapRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return undefined;
+    const updateSize = () => setMapSize({ width: element.clientWidth, height: element.clientHeight });
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [mapRef]);
+
+  const columns = Math.max(3, Math.ceil(mapSize.width / 256) + 2) | 1;
+  const rows = Math.max(3, Math.ceil(mapSize.height / 256) + 2) | 1;
+  return { columns, rows };
+}
+
+function StreetMapTiles({ mapRef, mapView, className = "location-reference-tile" }) {
+  const { columns, rows } = useStreetMapGrid(mapRef);
+  const tileSize = 256;
+  const scale = 2 ** mapView.zoom;
+  const centerWorld = statisticsMapWorldPoint(mapView.center.latitude, mapView.center.longitude, mapView.zoom);
+  const centerTileX = Math.floor(centerWorld.x);
+  const centerTileY = Math.floor(centerWorld.y);
+  const fractionalX = centerWorld.x - centerTileX;
+  const fractionalY = centerWorld.y - centerTileY;
+  const halfColumns = Math.floor(columns / 2);
+  const halfRows = Math.floor(rows / 2);
+  const tiles = [];
+  for (let row = -halfRows; row <= halfRows; row += 1) {
+    for (let column = -halfColumns; column <= halfColumns; column += 1) {
+      const tileX = centerTileX + column;
+      const tileY = centerTileY + row;
+      if (tileY < 0 || tileY >= scale) continue;
+      tiles.push(
+        <img
+          key={`${tileX}-${tileY}`}
+          className={className}
+          style={{ left: `${(column + halfColumns - fractionalX) * tileSize}px`, top: `${(row + halfRows - fractionalY) * tileSize}px` }}
+          src={`https://tile.openstreetmap.org/${mapView.zoom}/${((tileX % scale) + scale) % scale}/${tileY}.png`}
+          alt=""
+          draggable="false"
+        />
+      );
+    }
+  }
+  return (
+    <div
+      className="street-map-tiles"
+      style={{
+        left: `calc(50% - ${halfColumns * tileSize}px)`,
+        top: `calc(50% - ${halfRows * tileSize}px)`,
+        width: `${columns * tileSize}px`,
+        height: `${rows * tileSize}px`
+      }}
+    >
+      {tiles}
+    </div>
+  );
+}
+
 function StatisticsLocationMap({ points = [] }) {
   const hasPoints = points.length > 0;
   const minLatitude = hasPoints ? Math.min(...points.map((point) => point.latitude)) : 20;
@@ -2602,6 +2664,7 @@ function StatisticsLocationMap({ points = [] }) {
     longitude: (minLongitude + maxLongitude) / 2
   };
   const [mapView, setMapView] = useState({ center: fittedCenter, zoom: fittedZoom });
+  const mapRef = useRef(null);
   const dragRef = useRef(null);
   const tileSize = 256;
 
@@ -2648,37 +2711,19 @@ function StatisticsLocationMap({ points = [] }) {
   if (!hasPoints) return <p className="statistics-empty">No valid location responses yet.</p>;
 
   const zoom = mapView.zoom;
-  const scale = 2 ** zoom;
   const centerWorld = statisticsMapWorldPoint(mapView.center.latitude, mapView.center.longitude, zoom);
-  const centerTileX = Math.floor(centerWorld.x);
-  const centerTileY = Math.floor(centerWorld.y);
-  const fractionalX = centerWorld.x - centerTileX;
-  const fractionalY = centerWorld.y - centerTileY;
-  const tiles = [];
-  for (let row = -1; row <= 1; row += 1) {
-    for (let column = -1; column <= 1; column += 1) {
-      const tileX = centerTileX + column;
-      const tileY = centerTileY + row;
-      if (tileY < 0 || tileY >= scale) continue;
-      tiles.push({
-        key: `${tileX}_${tileY}`,
-        left: `${(column + 1 - fractionalX) * tileSize}px`,
-        top: `${(row + 1 - fractionalY) * tileSize}px`,
-        src: `https://tile.openstreetmap.org/${zoom}/${((tileX % scale) + scale) % scale}/${tileY}.png`
-      });
-    }
-  }
   return (
     <div className="statistics-location-map">
       <div
         className="statistics-map-viewport"
+        ref={mapRef}
         onPointerDown={startPan}
         onPointerMove={movePan}
         onPointerUp={endPan}
         onPointerCancel={endPan}
         onLostPointerCapture={endPan}
       >
-        {tiles.map((tile) => <img key={tile.key} className="statistics-map-tile" src={tile.src} alt="" style={{ left: tile.left, top: tile.top }} />)}
+        <StreetMapTiles mapRef={mapRef} mapView={mapView} className="statistics-map-tile" />
         {points.map((point, index) => {
           const world = statisticsMapWorldPoint(point.latitude, point.longitude, zoom);
           return (
@@ -12070,6 +12115,7 @@ function GeopointOptionPicker({ onAdd, onClose }) {
   const tileSize = 256;
   const dragRef = useRef(null);
   const suppressClickRef = useRef(false);
+  const mapRef = useRef(null);
 
   useEffect(() => {
     if (!navigator.geolocation) return undefined;
@@ -12134,31 +12180,7 @@ function GeopointOptionPicker({ onAdd, onClose }) {
     setMapView((current) => ({ ...current, zoom: Math.max(2, Math.min(18, current.zoom + delta)) }));
   }
 
-  const zoom = mapView.zoom;
-  const scale = 2 ** zoom;
   const centerWorld = worldPoint(mapView.center.latitude, mapView.center.longitude);
-  const centerTileX = Math.floor(centerWorld.x);
-  const centerTileY = Math.floor(centerWorld.y);
-  const fractionalX = centerWorld.x - centerTileX;
-  const fractionalY = centerWorld.y - centerTileY;
-  const tiles = [];
-  for (let row = -1; row <= 1; row += 1) {
-    for (let column = -1; column <= 1; column += 1) {
-      const tileX = centerTileX + column;
-      const tileY = centerTileY + row;
-      const wrappedX = ((tileX % scale) + scale) % scale;
-      if (tileY < 0 || tileY >= scale) continue;
-      tiles.push(
-        <img
-          key={`${tileX}-${tileY}`}
-          className="location-reference-tile"
-          style={{ left: `${(column + 1 - fractionalX) * tileSize}px`, top: `${(row + 1 - fractionalY) * tileSize}px` }}
-          src={`https://tile.openstreetmap.org/${zoom}/${wrappedX}/${tileY}.png`}
-          alt=""
-        />
-      );
-    }
-  }
   const selectedWorld = selectedPoint ? worldPoint(selectedPoint.latitude, selectedPoint.longitude) : null;
   const markerLeft = selectedWorld ? `calc(50% + ${(selectedWorld.x - centerWorld.x) * tileSize}px)` : "50%";
   const markerTop = selectedWorld ? `calc(50% + ${(selectedWorld.y - centerWorld.y) * tileSize}px)` : "50%";
@@ -12183,6 +12205,7 @@ function GeopointOptionPicker({ onAdd, onClose }) {
         </div>
         <div
           className="geopoint-picker-map"
+          ref={mapRef}
           onPointerDown={startPan}
           onPointerMove={movePan}
           onPointerUp={endPan}
@@ -12190,7 +12213,7 @@ function GeopointOptionPicker({ onAdd, onClose }) {
           onLostPointerCapture={endPan}
           onClick={pointFromClick}
         >
-          <div className="location-reference-tiles">{tiles}</div>
+          <StreetMapTiles mapRef={mapRef} mapView={mapView} />
           {selectedPoint ? (
             <span
               className="geopoint-picker-marker"

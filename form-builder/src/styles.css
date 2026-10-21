@@ -4430,6 +4430,11 @@ button:disabled {
   cursor: grabbing;
 }
 
+.street-map-tiles {
+  position: absolute;
+  pointer-events: none;
+}
+
 .statistics-map-tile {
   position: absolute;
   width: 256px;
