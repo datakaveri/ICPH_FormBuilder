@@ -2328,6 +2328,8 @@ const STATISTICS_CHOICE_TYPES = new Set([
   "rank"
 ]);
 
+const STATISTICS_LOCATION_TYPES = new Set(["geopoint", "geotrace", "geoshape", "start-geopoint"]);
+
 const STATISTICS_EXCLUDED_TYPES = new Set([
   ...STRUCTURAL_TYPES,
   "note",
@@ -2413,6 +2415,27 @@ function numericStatisticBins(numbers) {
   });
 }
 
+function parseStatisticsLocationPoints(value, type = "") {
+  const segments = String(value || "")
+    .trim()
+    .split(/[;|\n]+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const points = [];
+  for (const segment of segments) {
+    const numbers = segment.split(/[\s,]+/).map(Number).filter(Number.isFinite);
+    const coordinateLimit = ["geopoint", "start-geopoint"].includes(type) ? 2 : numbers.length;
+    for (let index = 0; index + 1 < Math.min(numbers.length, coordinateLimit); index += 2) {
+      const latitude = numbers[index];
+      const longitude = numbers[index + 1];
+      if (latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180) {
+        points.push({ latitude, longitude });
+      }
+    }
+  }
+  return points;
+}
+
 function buildQuestionStatistics(question, entries = [], form = {}) {
   const answerRows = entries.map((entry) => statisticAnswerValues(question, computeCalculatedAnswers(form, entry.answers || {})));
   const values = answerRows.flat();
@@ -2445,6 +2468,13 @@ function buildQuestionStatistics(question, entries = [], form = {}) {
         count: counts.get(key) || 0
       })).filter((item) => item.count > 0 || question.options?.some((option) => String(option.name) === item.key))
     };
+  }
+
+  if (STATISTICS_LOCATION_TYPES.has(question.type)) {
+    const points = answerRows.flatMap((answers, entryIndex) => answers.flatMap((value) => (
+      parseStatisticsLocationPoints(value, question.type).map((point) => ({ ...point, entryIndex }))
+    )));
+    return { ...base, kind: "location", points };
   }
 
   if (["integer", "decimal", "range"].includes(question.type)) {
@@ -2484,7 +2514,9 @@ function buildQuestionStatistics(question, entries = [], form = {}) {
   return {
     ...base,
     kind: "text",
-    items: statisticFrequencyItems(values, (value) => value)
+    items: statisticFrequencyItems(values, (value) => value),
+    responses: values.slice(0, 50),
+    responseTotal: values.length
   };
 }
 
@@ -2497,25 +2529,119 @@ function StatisticsMetric({ label, value }) {
   );
 }
 
-function StatisticsBarChart({ items = [], denominator = 0 }) {
+function StatisticsVerticalBarChart({ items = [], denominator = 0 }) {
   const max = Math.max(...items.map((item) => item.count), 0);
   if (!items.length) return <p className="statistics-empty">No responses yet.</p>;
+  const chartWidth = Math.max(items.length * 74, 520);
+  const yAxis = [max, Math.round(max / 2), 0];
   return (
-    <div className="statistics-bars">
-      {items.map((item) => {
-        const percentage = denominator ? (item.count / denominator) * 100 : 0;
-        return (
-          <div className="statistics-bar-row" key={item.key || item.label}>
-            <div className="statistics-bar-label" title={item.label}>
-              <span>{item.label || "Blank"}</span>
-              <strong>{item.count} <small>{percentage.toFixed(0)}%</small></strong>
-            </div>
-            <div className="statistics-bar-track" aria-hidden="true">
-              <span style={{ width: `${max ? Math.max((item.count / max) * 100, item.count ? 4 : 0) : 0}%` }} />
-            </div>
+    <div className="statistics-column-scroll">
+      <div className="statistics-column-chart" style={{ minWidth: `${chartWidth + 42}px` }}>
+        <div className="statistics-column-y-axis" aria-hidden="true">
+          {yAxis.map((value, index) => <span key={`${value}_${index}`}>{value}</span>)}
+        </div>
+        <div className="statistics-column-plot">
+          <div className="statistics-column-grid-lines" aria-hidden="true">
+            <span /><span /><span />
           </div>
-        );
-      })}
+          <div className="statistics-column-bars" style={{ gridTemplateColumns: `repeat(${items.length}, minmax(46px, 1fr))` }}>
+            {items.map((item) => {
+              const percentage = denominator ? (item.count / denominator) * 100 : 0;
+              return (
+                <div className="statistics-column-item" key={item.key || item.label} title={`${item.label}: ${item.count} (${percentage.toFixed(0)}%)`}>
+                  <div className="statistics-column-value" style={{ height: `${max ? Math.max((item.count / max) * 100, item.count ? 3 : 0) : 0}%` }}>
+                    <span>{item.count}</span>
+                  </div>
+                  <span className="statistics-column-label">{item.label || "Blank"}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatisticsResponseList({ responses = [], responseTotal = 0 }) {
+  if (!responses.length) return <p className="statistics-empty">No responses yet.</p>;
+  return (
+    <div className="statistics-response-list">
+      {responses.map((response, index) => (
+        <div className="statistics-response-item" key={`${response}_${index}`}>
+          <span>{index + 1}</span>
+          <p>{response}</p>
+        </div>
+      ))}
+      {responseTotal > responses.length ? <small className="statistics-list-note">Showing the first {responses.length} of {responseTotal} responses.</small> : null}
+    </div>
+  );
+}
+
+function statisticsMapWorldPoint(latitude, longitude, zoom) {
+  const scale = 2 ** zoom;
+  const latitudeRadians = (latitude * Math.PI) / 180;
+  return {
+    x: ((longitude + 180) / 360) * scale,
+    y: ((1 - Math.asinh(Math.tan(latitudeRadians)) / Math.PI) / 2) * scale
+  };
+}
+
+function StatisticsLocationMap({ points = [] }) {
+  if (!points.length) return <p className="statistics-empty">No valid location responses yet.</p>;
+  const minLatitude = Math.min(...points.map((point) => point.latitude));
+  const maxLatitude = Math.max(...points.map((point) => point.latitude));
+  const minLongitude = Math.min(...points.map((point) => point.longitude));
+  const maxLongitude = Math.max(...points.map((point) => point.longitude));
+  const latitudeSpan = maxLatitude - minLatitude;
+  const longitudeSpan = maxLongitude - minLongitude;
+  const span = Math.max(latitudeSpan, longitudeSpan, 0.25);
+  const zoom = Math.max(3, Math.min(12, Math.round(Math.log2(180 / (span * 2.2)))));
+  const center = {
+    latitude: (minLatitude + maxLatitude) / 2,
+    longitude: (minLongitude + maxLongitude) / 2
+  };
+  const centerWorld = statisticsMapWorldPoint(center.latitude, center.longitude, zoom);
+  const originX = Math.floor(centerWorld.x) - 1;
+  const originY = Math.floor(centerWorld.y) - 1;
+  const tileCount = 2 ** zoom;
+  const tiles = [];
+  for (let row = 0; row < 3; row += 1) {
+    for (let column = 0; column < 3; column += 1) {
+      const tileX = originX + column;
+      const tileY = originY + row;
+      if (tileY < 0 || tileY >= tileCount) continue;
+      tiles.push({
+        x: column * 256,
+        y: row * 256,
+        src: `https://tile.openstreetmap.org/${zoom}/${((tileX % tileCount) + tileCount) % tileCount}/${tileY}.png`
+      });
+    }
+  }
+  const centerOffsetX = (centerWorld.x - originX) * 256;
+  const centerOffsetY = (centerWorld.y - originY) * 256;
+  return (
+    <div className="statistics-location-map">
+      <div className="statistics-map-viewport">
+        <div className="statistics-map-canvas" style={{ left: `calc(50% - ${centerOffsetX}px)`, top: `calc(50% - ${centerOffsetY}px)` }}>
+          {tiles.map((tile) => <img key={`${tile.x}_${tile.y}`} className="statistics-map-tile" src={tile.src} alt="" style={{ left: tile.x, top: tile.y }} />)}
+          {points.map((point, index) => {
+            const world = statisticsMapWorldPoint(point.latitude, point.longitude, zoom);
+            return (
+              <span
+                className="statistics-map-marker"
+                key={`${point.entryIndex}_${point.latitude}_${point.longitude}_${index}`}
+                title={`Response ${point.entryIndex + 1}: ${point.latitude.toFixed(5)}, ${point.longitude.toFixed(5)}`}
+                style={{ left: (world.x - originX) * 256, top: (world.y - originY) * 256 }}
+              >
+                <span>{index + 1}</span>
+              </span>
+            );
+          })}
+        </div>
+        <span className="statistics-map-attribution">© OpenStreetMap contributors</span>
+      </div>
+      <p className="statistics-map-note">{points.length} location point{points.length === 1 ? "" : "s"} plotted from the submitted responses.</p>
     </div>
   );
 }
@@ -2532,7 +2658,9 @@ function StatisticsQuestionCard({ statistic }) {
         <span className="statistics-response-count">{responseCount}/{totalEntries} answered</span>
       </div>
       {statistic.kind === "choice" ? (
-        <StatisticsBarChart items={statistic.items} denominator={statistic.denominator} />
+        <StatisticsVerticalBarChart items={statistic.items} denominator={statistic.denominator} />
+      ) : statistic.kind === "location" ? (
+        <StatisticsLocationMap points={statistic.points} />
       ) : statistic.kind === "numeric" ? (
         statistic.numericCount ? (
           <>
@@ -2542,7 +2670,7 @@ function StatisticsQuestionCard({ statistic }) {
               <StatisticsMetric label="Minimum" value={formatStatisticNumber(statistic.minimum)} />
               <StatisticsMetric label="Maximum" value={formatStatisticNumber(statistic.maximum)} />
             </div>
-            <StatisticsBarChart items={statistic.items} denominator={statistic.numericCount} />
+            <StatisticsVerticalBarChart items={statistic.items} denominator={statistic.numericCount} />
           </>
         ) : <p className="statistics-empty">No numeric responses yet.</p>
       ) : statistic.kind === "date" ? (
@@ -2552,7 +2680,7 @@ function StatisticsQuestionCard({ statistic }) {
               <StatisticsMetric label="First response" value={statistic.earliest} />
               <StatisticsMetric label="Latest response" value={statistic.latest} />
             </div>
-            <StatisticsBarChart items={statistic.items} denominator={responseCount} />
+            <StatisticsVerticalBarChart items={statistic.items} denominator={responseCount} />
           </>
         ) : <p className="statistics-empty">No responses yet.</p>
       ) : statistic.kind === "media" ? (
@@ -2567,7 +2695,7 @@ function StatisticsQuestionCard({ statistic }) {
               <StatisticsMetric label="Unique answers" value={statistic.uniqueCount} />
               <StatisticsMetric label="Completion" value={`${responseRate.toFixed(0)}%`} />
             </div>
-            <StatisticsBarChart items={statistic.items} denominator={responseCount} />
+            <StatisticsResponseList responses={statistic.responses} responseTotal={statistic.responseTotal} />
           </>
         ) : <p className="statistics-empty">No responses yet.</p>
       )}
@@ -2581,11 +2709,16 @@ function StatisticsModal({ form, entries, onClose }) {
     .map((question) => buildQuestionStatistics(question, entries, form)), [entries, form]);
 
   useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     function handleKeyDown(event) {
       if (event.key === "Escape") onClose();
     }
     window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
   }, [onClose]);
 
   return (

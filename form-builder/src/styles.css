@@ -4177,9 +4177,11 @@ button:disabled {
 .statistics-modal {
   width: min(1080px, 100%);
   max-height: min(860px, calc(100vh - 32px));
+  min-height: 0;
   overflow: hidden;
   padding: 0;
   gap: 0;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .statistics-modal-head {
@@ -4195,6 +4197,7 @@ button:disabled {
 .statistics-modal-body {
   display: grid;
   gap: 14px;
+  min-height: 0;
   overflow: auto;
   padding: 18px 22px 22px;
   background: #f7f9fc;
@@ -4230,56 +4233,193 @@ button:disabled {
   white-space: nowrap;
 }
 
-.statistics-bars {
-  display: grid;
-  gap: 11px;
+.statistics-column-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  padding-bottom: 6px;
 }
 
-.statistics-bar-row {
+.statistics-column-chart {
   display: grid;
-  gap: 5px;
+  grid-template-columns: 34px minmax(0, 1fr);
+  height: 250px;
 }
 
-.statistics-bar-label {
+.statistics-column-y-axis {
   display: flex;
+  flex-direction: column;
   justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
-  color: var(--text);
-  font-size: 13px;
+  padding: 2px 6px 30px 0;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
 }
 
-.statistics-bar-label > span {
+.statistics-column-plot {
+  position: relative;
   min-width: 0;
+  height: 100%;
+  border-bottom: 1px solid #bac7d9;
+}
+
+.statistics-column-grid-lines {
+  position: absolute;
+  inset: 2px 0 30px;
+  display: grid;
+  grid-template-rows: repeat(3, 1fr);
+  pointer-events: none;
+}
+
+.statistics-column-grid-lines span {
+  border-top: 1px dashed #dce3ee;
+}
+
+.statistics-column-bars {
+  position: absolute;
+  inset: 2px 0 0;
+  display: grid;
+  align-items: end;
+  gap: 10px;
+  padding: 0 8px;
+}
+
+.statistics-column-item {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) 30px;
+  align-items: end;
+  min-width: 0;
+  height: 100%;
+}
+
+.statistics-column-value {
+  position: relative;
+  justify-self: center;
+  width: min(42px, 72%);
+  min-height: 0;
+  border-radius: 7px 7px 0 0;
+  background: linear-gradient(180deg, #6ca6ff, #2f7bf0);
+}
+
+.statistics-column-value span {
+  position: absolute;
+  top: -18px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.statistics-column-label {
+  align-self: start;
+  width: 100%;
   overflow: hidden;
+  padding-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.statistics-bar-label strong {
-  flex: 0 0 auto;
+.statistics-response-list {
+  display: grid;
+  gap: 7px;
+  max-height: 300px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.statistics-response-item {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  border-bottom: 1px solid #e6ebf3;
+  padding: 7px 0;
+}
+
+.statistics-response-item > span {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #edf3ff;
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.statistics-response-item p {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.statistics-list-note,
+.statistics-map-note {
+  margin: 0;
+  color: var(--muted);
   font-size: 12px;
 }
 
-.statistics-bar-label small {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
+.statistics-location-map {
+  display: grid;
+  gap: 7px;
 }
 
-.statistics-bar-track {
-  height: 9px;
+.statistics-map-viewport {
+  position: relative;
+  height: 310px;
   overflow: hidden;
-  border-radius: 999px;
-  background: #e8edf5;
+  border: 1px solid #b9cbe0;
+  border-radius: 10px;
+  background: #e7f0f7;
 }
 
-.statistics-bar-track span {
-  display: block;
-  height: 100%;
-  min-width: 0;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #2f7bf0, #6ca6ff);
+.statistics-map-canvas {
+  position: absolute;
+  width: 768px;
+  height: 768px;
+}
+
+.statistics-map-tile {
+  position: absolute;
+  width: 256px;
+  height: 256px;
+  max-width: none;
+}
+
+.statistics-map-marker {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  transform: translate(-50%, -100%);
+  border: 2px solid #fff;
+  border-radius: 50% 50% 50% 0;
+  background: #e05252;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.32);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  rotate: -45deg;
+}
+
+.statistics-map-marker > span {
+  rotate: 45deg;
+}
+
+.statistics-map-attribution {
+  position: absolute;
+  right: 5px;
+  bottom: 4px;
+  padding: 2px 4px;
+  background: rgba(255, 255, 255, 0.82);
+  color: #526173;
+  font-size: 9px;
 }
 
 .statistics-metrics {
