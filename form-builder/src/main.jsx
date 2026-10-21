@@ -49,6 +49,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, configureAuth, confirmSessionEnded, initAuth, login, logout, reconfirmSession } from "./auth.js";
+import { configureConnectivity, isOnline, onConnectivityChange, reportNetworkFailure, reportNetworkSuccess } from "./connectivity.js";
 import cdpgLogo from "./assets/cdpg-logo.png";
 import icphLogo from "./assets/icph-logo.png";
 
@@ -62,6 +63,7 @@ const DEFAULT_API_BASE = typeof window === "undefined"
     : window.location.origin;
 const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
 configureAuth(API_BASE);
+configureConnectivity(API_BASE);
 const OFFLINE_DATABASE_NAME = "icph-offline-v1";
 const OFFLINE_DATABASE_VERSION = 1;
 let odkWebFormsLoader = null;
@@ -1223,15 +1225,44 @@ function validateAnswers(form, answers, questionSubset = null) {
   return { answers: calculated, errors };
 }
 
+const OFFLINE_MESSAGE = "You are offline. Connect to the internet and try again.";
+// The field agent and respondent screens read from /api/public and fall back to
+// what this device has saved. A read there that gets no answer this soon means
+// the server is out of reach (mobile data on, no signal), so the app is marked
+// offline instead of waiting for the browser to give up.
+const PUBLIC_READ_DEADLINE_MS = 4000;
+
 async function requestJson(path, options = {}) {
   // Offline, fail at once instead of trying the network. Callers already fall
   // back to what this device has saved when a request fails.
-  if (!navigator.onLine) throw new Error("You are offline. Connect to the internet and try again.");
-  const headers = {
-    ...(await authHeaders()),
-    ...(options.headers || {})
-  };
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  if (!isOnline()) throw new Error(OFFLINE_MESSAGE);
+  const controller = new AbortController();
+  const send = (async () => {
+    const headers = {
+      ...(await authHeaders()),
+      ...(options.headers || {})
+    };
+    return fetch(`${API_BASE}${path}`, { signal: controller.signal, ...options, headers });
+  })();
+  let timer = null;
+  const deadline = (options.method || "GET") === "GET" && path.startsWith("/api/public/")
+    ? new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(OFFLINE_MESSAGE));
+        controller.abort();
+      }, PUBLIC_READ_DEADLINE_MS);
+    })
+    : null;
+  let response;
+  try {
+    response = await (deadline ? Promise.race([send, deadline]) : send);
+  } catch (error) {
+    if (error.name !== "AbortError") reportNetworkFailure();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+  reportNetworkSuccess();
   const text = await response.text();
   let data = {};
   try {
@@ -1408,7 +1439,7 @@ async function saveOfflineFirst(path, payload) {
       createdAt: Date.now()
     });
   } catch (error) {
-    if (!navigator.onLine) throw error;
+    if (!isOnline()) throw error;
     await postJson(path, { ...payload, clientSubmissionId: id });
     return { id, queued: false, error: "", pendingCount: await getPendingSubmissionCount() };
   }
@@ -1424,10 +1455,10 @@ async function saveOfflineFirst(path, payload) {
 }
 
 async function syncPendingSubmissions(onlyId = "") {
-  if (!navigator.onLine) return { syncedIds: [], errors: {}, pendingCount: await getPendingSubmissionCount() };
+  if (!isOnline()) return { syncedIds: [], errors: {}, pendingCount: await getPendingSubmissionCount() };
   if (submissionSyncPromise) {
     const ongoingResult = await submissionSyncPromise;
-    if (!onlyId || ongoingResult.syncedIds.includes(onlyId) || !navigator.onLine) return ongoingResult;
+    if (!onlyId || ongoingResult.syncedIds.includes(onlyId) || !isOnline()) return ongoingResult;
     return syncPendingSubmissions(onlyId);
   }
   submissionSyncPromise = (async () => {
@@ -3558,6 +3589,16 @@ function FolderVisualizationPage({ folderId }) {
   );
 }
 
+// Whether the server can be reached, not just whether a network is attached.
+function useOnline() {
+  const [online, setOnline] = useState(isOnline);
+  useEffect(() => {
+    setOnline(isOnline());
+    return onConnectivityChange(setOnline);
+  }, []);
+  return online;
+}
+
 function useAuthSession() {
   const [session, setSession] = useState(null);
   const [authMessage, setAuthMessage] = useState("");
@@ -3580,15 +3621,14 @@ function useAuthSession() {
     const days = Math.floor((Date.now() - session.verifiedAt) / (24 * 60 * 60 * 1000));
     setAuthMessage(`Your sign-in was last confirmed ${days} days ago. Connect to the internet to keep using the app.`);
     const recheck = () => {
-      if (!navigator.onLine) return;
+      if (!isOnline()) return;
       reconfirmSession().then((nextSession) => {
         setSession(nextSession);
         if (!nextSession.needsReconnect) setAuthMessage(nextSession.authenticated ? "" : "Your session has ended. Sign in again.");
       }, () => {});
     };
     recheck();
-    window.addEventListener("online", recheck);
-    return () => window.removeEventListener("online", recheck);
+    return onConnectivityChange(recheck);
   }, [session?.needsReconnect]);
 
   // Returns whether the login really ended; see confirmSessionEnded.
@@ -3870,7 +3910,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
   const [selectedCode, setSelectedCode] = useState("");
   const [displayFieldByCode, setDisplayFieldByCode] = useState({});
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const online = useOnline();
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const [statisticsForm, setStatisticsForm] = useState(null);
   const [statisticsLoading, setStatisticsLoading] = useState(false);
@@ -3891,11 +3931,32 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
 
   async function refreshFieldAgentSyncStatus(sync = false) {
     try {
-      const result = sync && navigator.onLine ? await syncPendingSubmissions() : null;
+      const result = sync && isOnline() ? await syncPendingSubmissions() : null;
       setPendingSyncCount(result?.pendingCount ?? await getPendingSubmissionCount());
     } catch {
       setPendingSyncCount(await getPendingSubmissionCount());
     }
+  }
+
+  // Forms saved on this device, shown while the server's list loads or in its place.
+  async function showSavedForms(message = "") {
+    const savedForms = await listOfflineFormPackages().catch(() => []);
+    const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
+    if (!savedForms.length) return false;
+    setForms(savedForms.map((item) => {
+      const checkpoints = localCheckpoints.get(normalizeAccessCodeInput(item.accessCode)) || [];
+      return {
+        ...item,
+        respondentAccessCode: item.accessCode,
+        checkpoints,
+        checkpointCount: checkpoints.length
+      };
+    }));
+    setSelectedCode((current) => savedForms.some((item) => item.accessCode === current)
+      ? current
+      : savedForms[0]?.accessCode || "");
+    if (message) setStatus({ kind: "ok", message });
+    return true;
   }
 
   async function loadPublishedForms() {
@@ -3920,46 +3981,27 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
       setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
     } catch (error) {
       if (error?.status === 401 && await onSessionExpired?.()) return;
-      const savedForms = await listOfflineFormPackages().catch(() => []);
-      const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
-      if (savedForms.length) {
-        setForms(savedForms.map((item) => {
-          const checkpoints = localCheckpoints.get(normalizeAccessCodeInput(item.accessCode)) || [];
-          return {
-            ...item,
-            respondentAccessCode: item.accessCode,
-            checkpoints,
-            checkpointCount: checkpoints.length
-          };
-        }));
-        setSelectedCode((current) => savedForms.some((item) => item.accessCode === current)
-          ? current
-          : savedForms[0]?.accessCode || "");
-        setStatus({ kind: "ok", message: "Offline. Saved forms are available; entries will load when you reconnect." });
-      } else {
+      if (!(await showSavedForms("Offline. Saved forms are available; entries will load when you reconnect."))) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
   }
 
   useEffect(() => {
-    loadPublishedForms();
+    showSavedForms().then(loadPublishedForms);
   }, []);
 
   useEffect(() => {
-    const updateOnlineState = () => {
-      const online = navigator.onLine;
-      setIsOnline(online);
-      refreshFieldAgentSyncStatus(online);
-    };
-    refreshFieldAgentSyncStatus(navigator.onLine);
-    window.addEventListener("online", updateOnlineState);
-    window.addEventListener("offline", updateOnlineState);
-    window.addEventListener("focus", updateOnlineState);
+    const syncOnFocus = () => refreshFieldAgentSyncStatus(isOnline());
+    refreshFieldAgentSyncStatus(isOnline());
+    window.addEventListener("focus", syncOnFocus);
+    const stopWatching = onConnectivityChange((nowOnline) => {
+      refreshFieldAgentSyncStatus(nowOnline);
+      if (nowOnline) loadPublishedForms();
+    });
     return () => {
-      window.removeEventListener("online", updateOnlineState);
-      window.removeEventListener("offline", updateOnlineState);
-      window.removeEventListener("focus", updateOnlineState);
+      window.removeEventListener("focus", syncOnFocus);
+      stopWatching();
     };
   }, []);
 
@@ -4058,9 +4100,9 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
           <p>Published form collection</p>
         </div>
         <div className="field-agent-sync-status" aria-live="polite">
-          <span className={isOnline ? "sync-online" : "sync-offline"}>{isOnline ? "Online" : "Offline"}</span>
+          <span className={online ? "sync-online" : "sync-offline"}>{online ? "Online" : "Offline"}</span>
           <span>{pendingSyncCount} unsynced {pendingSyncCount === 1 ? "entry" : "entries"}</span>
-          {pendingSyncCount && isOnline ? (
+          {pendingSyncCount && online ? (
             <button className="secondary small" type="button" onClick={() => refreshFieldAgentSyncStatus(true)}>
               <RefreshCw size={14} /> Sync now
             </button>
@@ -12995,7 +13037,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   const [cachedAttachmentUrls, setCachedAttachmentUrls] = useState({});
   const [offlineReady, setOfflineReady] = useState(false);
   const [localDraftSaved, setLocalDraftSaved] = useState(false);
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const online = useOnline();
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const cachedPackageRef = useRef(null);
   const [activeGroupPage, setActiveGroupPage] = useState(0);
@@ -13035,20 +13077,10 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   }, [form?.formId, entryId, checkpointAnswers, resumeCheckpointIdentifier]);
 
   useEffect(() => {
-    const updateOnlineState = () => setIsOnline(navigator.onLine);
-    window.addEventListener("online", updateOnlineState);
-    window.addEventListener("offline", updateOnlineState);
-    return () => {
-      window.removeEventListener("online", updateOnlineState);
-      window.removeEventListener("offline", updateOnlineState);
-    };
-  }, []);
-
-  useEffect(() => {
     let cancelled = false;
     const refreshQueue = async () => {
       try {
-        const result = isOnline ? await syncPendingSubmissions() : null;
+        const result = online ? await syncPendingSubmissions() : null;
         const count = result?.pendingCount ?? await getPendingSubmissionCount();
         if (!cancelled) setPendingSyncCount(count);
       } catch {}
@@ -13059,7 +13091,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
       cancelled = true;
       window.removeEventListener("focus", refreshQueue);
     };
-  }, [isOnline]);
+  }, [online]);
 
   useEffect(() => {
     if (!form || !answersReady || !accessCode) return undefined;
@@ -13138,7 +13170,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           if (networkError.status && networkError.status < 500) throw networkError;
           const savedPackage = accessCode ? await loadOfflineFormPackage(accessCode) : null;
           if (!savedPackage) {
-            if (!navigator.onLine) throw new Error("This form is not saved on this device yet. Open it once while online to make it available offline.");
+            if (!isOnline()) throw new Error("This form is not saved on this device yet. Open it once while online to make it available offline.");
             throw networkError;
           }
           try {

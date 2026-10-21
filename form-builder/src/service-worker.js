@@ -1,7 +1,5 @@
 const CACHE_NAME = "icph-app-shell-v1";
 const PRECACHE_URLS = __ICPH_PRECACHE_URLS__;
-// On a weak connection that never quite fails, open the saved app after this long.
-const NAVIGATION_TIMEOUT_MS = 4000;
 
 // The server answers with "Vary: Origin" and the page loads its scripts and
 // styles with crossorigin, so the page's requests carry an Origin header the
@@ -10,16 +8,12 @@ function fromCache(request) {
   return caches.match(request, { ignoreVary: true });
 }
 
-// Every page of the app is the same index.html, saved as "/".
+// Every page of the app is the same index.html, saved as "/". It is opened
+// from the cache without waiting on the network; a new release reaches it when
+// the browser installs the updated worker, which saves the new page and files
+// together, and shows from the next launch.
 async function openApp(request) {
-  const savedApp = await fromCache("/");
-  if (!savedApp) return fetch(request);
-  if (!self.navigator.onLine) return savedApp;
-  const network = fetch(request)
-    .then((response) => (response.status >= 500 ? savedApp : response))
-    .catch(() => savedApp);
-  const slow = new Promise((resolve) => setTimeout(() => resolve(savedApp), NAVIGATION_TIMEOUT_MS));
-  return Promise.race([network, slow]);
+  return (await fromCache("/")) || fetch(request);
 }
 
 // Submissions carry the signed-in field agent's token, which only a page holds,

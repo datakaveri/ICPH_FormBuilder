@@ -1,5 +1,6 @@
 import { decodeJwt } from "jose";
 import Keycloak from "keycloak-js";
+import { isOnline, onConnectivityChange } from "./connectivity.js";
 
 export const ADMIN_ROLE = "icph-admin";
 export const FIELD_AGENT_ROLE = "icph-field-agent";
@@ -9,9 +10,9 @@ const CONFIG_KEY = "icph_auth_config";
 // A refresh token from a sign-out made offline, revoked on the next online start.
 const REVOKE_KEY = "icph_auth_pending_revoke";
 const DAY_MS = 24 * 60 * 60 * 1000;
-// On a connection that never quite fails, stop waiting for Keycloak or the
-// login settings after this long and carry on with what this device has saved.
-const NETWORK_WAIT_MS = 5000;
+// Keycloak's requests have no timeout of their own. On a connection that hangs,
+// stop waiting on them after this long and carry on with the login there is.
+const KEYCLOAK_WAIT_MS = 3000;
 let apiBase = "";
 let keycloak = null;
 let authConfig = null;
@@ -35,6 +36,10 @@ function writeStored(key, value) {
   } catch {}
 }
 
+function withinKeycloakWait(promise, fallback) {
+  return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(fallback), KEYCLOAK_WAIT_MS))]);
+}
+
 function decodeToken(token) {
   try {
     return decodeJwt(token);
@@ -51,23 +56,31 @@ function persistTokens() {
     : null);
 }
 
+// The saved login stands in until Keycloak has finished starting; after that
+// only Keycloak's answer counts, including a login it rejected.
 function currentToken() {
-  return keycloakStarted ? keycloak.token : savedLogin?.token;
+  return keycloak?.token || savedLogin?.token;
 }
 
+async function fetchAuthConfig() {
+  const response = await fetch(`${apiBase}/api/auth/config`);
+  if (!response.ok) throw new Error("Login configuration is unavailable.");
+  const { url, realm, clientId, offlineSignInDays } = await response.json();
+  writeStored(CONFIG_KEY, { url, realm, clientId, offlineSignInDays });
+  return { url, realm, clientId, offlineSignInDays };
+}
+
+// The saved settings are used at once and refreshed for the next start.
 async function loadAuthConfig() {
   const cached = readStored(CONFIG_KEY);
-  if (!navigator.onLine && cached) return cached;
-  try {
-    const response = await fetch(`${apiBase}/api/auth/config`, cached ? { signal: AbortSignal.timeout(NETWORK_WAIT_MS) } : {});
-    if (!response.ok) throw new Error("Login configuration is unavailable.");
-    const { url, realm, clientId, offlineSignInDays } = await response.json();
-    writeStored(CONFIG_KEY, { url, realm, clientId, offlineSignInDays });
-    return { url, realm, clientId, offlineSignInDays };
-  } catch (error) {
-    if (cached) return cached;
-    throw error;
-  }
+  if (!cached) return fetchAuthConfig();
+  if (isOnline()) fetchAuthConfig().catch(() => {});
+  return cached;
+}
+
+// Keycloak returns to the app with the login result in the URL fragment.
+function isLoginCallback() {
+  return /[#&]state=/.test(window.location.hash);
 }
 
 // Logging out of Keycloak ends the browser session but not an offline session,
@@ -88,7 +101,6 @@ async function revokeRefreshToken(refreshToken) {
 function startKeycloak() {
   if (!keycloakStarted) {
     const stored = readStored(TOKENS_KEY);
-    savedLogin = null;
     keycloakStarted = (async () => {
       try {
         await keycloak.init({
@@ -103,9 +115,10 @@ function startKeycloak() {
         // Keycloak could not be reached to refresh the stored login. Keep it so
         // offline screens stay usable; the API still rejects an expired token.
       }
+      savedLogin = null;
       persistTokens();
       const pendingRevoke = readStored(REVOKE_KEY);
-      if (pendingRevoke && navigator.onLine) {
+      if (pendingRevoke && isOnline()) {
         revokeRefreshToken(pendingRevoke).then(() => writeStored(REVOKE_KEY, null), () => {});
       }
       // Ask the browser not to evict the stored login and offline data.
@@ -121,7 +134,7 @@ export function configureAuth(nextApiBase) {
 
 export function authSession() {
   const token = currentToken();
-  const claims = (keycloakStarted ? keycloak.tokenParsed : decodeToken(token)) || {};
+  const claims = (keycloak?.token ? keycloak.tokenParsed : decodeToken(token)) || {};
   const hasLogin = Boolean(token);
   // The access token is reissued on every refresh, so its issue time is when
   // Keycloak last confirmed this login. An expired token keeps the user signed
@@ -149,13 +162,24 @@ export function initAuth() {
       keycloak.onAuthSuccess = persistTokens;
       keycloak.onAuthRefreshSuccess = persistTokens;
       keycloak.onAuthLogout = persistTokens;
-      if (navigator.onLine) {
-        // Keycloak sets the saved login before refreshing it, so a slow refresh
-        // is left to finish in the background.
-        await Promise.race([startKeycloak(), new Promise((resolve) => setTimeout(resolve, NETWORK_WAIT_MS))]);
+      const stored = readStored(TOKENS_KEY);
+      if (!stored?.token || isLoginCallback()) {
+        // Nothing saved to show yet; without a saved login Keycloak starts
+        // without the network unless it is finishing a sign-in.
+        await startKeycloak();
+        return authSession();
+      }
+      // Open with the saved login straight away and let Keycloak confirm it
+      // in the background, now if online or else once the server is reachable.
+      savedLogin = stored;
+      if (isOnline()) {
+        void startKeycloak();
       } else {
-        savedLogin = readStored(TOKENS_KEY);
-        window.addEventListener("online", () => { void startKeycloak(); }, { once: true });
+        const stopWatching = onConnectivityChange((online) => {
+          if (!online) return;
+          stopWatching();
+          void startKeycloak();
+        });
       }
       return authSession();
     })();
@@ -185,13 +209,11 @@ export async function authHeaders() {
   } catch {
     return {};
   }
-  if (navigator.onLine) {
-    await startKeycloak();
-    if (keycloak.token) {
-      try {
-        await keycloak.updateToken(30);
-      } catch {}
-    }
+  if (isOnline()) {
+    await withinKeycloakWait((async () => {
+      await startKeycloak();
+      if (keycloak.token) await keycloak.updateToken(30);
+    })().catch(() => {}));
   }
   const token = currentToken();
   return token ? { authorization: `Bearer ${token}` } : {};
@@ -199,7 +221,7 @@ export async function authHeaders() {
 
 export async function login(returnPath = "/") {
   // Keycloak's login page cannot load offline, and leaving the app would strand the user.
-  if (!navigator.onLine) throw new Error("You are offline. Connect to the internet to sign in.");
+  if (!isOnline()) throw new Error("You are offline. Connect to the internet to sign in.");
   await initAuth();
   await startKeycloak();
   await keycloak.login({ redirectUri: `${window.location.origin}${returnPath}` });
@@ -207,8 +229,8 @@ export async function login(returnPath = "/") {
 
 export async function logout(returnPath = "/") {
   await initAuth();
-  if (!navigator.onLine) {
-    const refreshToken = keycloakStarted ? keycloak.refreshToken : savedLogin?.refreshToken;
+  if (!isOnline()) {
+    const refreshToken = keycloak.refreshToken || savedLogin?.refreshToken;
     if (refreshToken) writeStored(REVOKE_KEY, refreshToken);
     savedLogin = null;
     keycloak.clearToken();
@@ -227,10 +249,12 @@ export async function logout(returnPath = "/") {
 // user stays signed in. Returns whether the login has ended.
 export async function confirmSessionEnded() {
   if (!keycloak) return true;
-  await startKeycloak();
-  if (!keycloak.refreshToken) return true;
-  try {
-    await keycloak.updateToken(-1);
-  } catch {}
-  return !keycloak.token;
+  return withinKeycloakWait((async () => {
+    await startKeycloak();
+    if (!keycloak.refreshToken) return true;
+    try {
+      await keycloak.updateToken(-1);
+    } catch {}
+    return !keycloak.token;
+  })(), false);
 }
