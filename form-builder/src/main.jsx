@@ -3832,6 +3832,8 @@ function FieldAgentPortal() {
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const [statisticsForm, setStatisticsForm] = useState(null);
+  const [statisticsLoading, setStatisticsLoading] = useState(false);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading published forms..." });
   const selectedForm = forms.find((item) => item.respondentAccessCode === selectedCode) || forms[0] || null;
   const fieldAgentEntryIds = useMemo(
@@ -3922,6 +3924,7 @@ function FieldAgentPortal() {
 
   useEffect(() => {
     setSelectedEntryIds([]);
+    setStatisticsForm(null);
   }, [selectedForm?.respondentAccessCode]);
 
   useEffect(() => {
@@ -3954,6 +3957,21 @@ function FieldAgentPortal() {
     const code = normalizeAccessCodeInput(form?.respondentAccessCode);
     if (!code || !entryId) return;
     window.open(`/public-entry/${encodeURIComponent(code)}/${encodeURIComponent(entryId)}`, "_blank", "noopener,noreferrer");
+  }
+
+  async function openFieldAgentStatistics(form) {
+    const code = normalizeAccessCodeInput(form?.respondentAccessCode);
+    if (!code) return;
+    setStatisticsLoading(true);
+    try {
+      const data = await requestJson(`/api/public/forms/${encodeURIComponent(code)}`);
+      const draft = normalizeFormDraft(data.draft || {});
+      setStatisticsForm({ ...draft, title: data.title || draft.title || form.title });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    } finally {
+      setStatisticsLoading(false);
+    }
   }
 
   function toggleFieldAgentEntry(entryId, checked) {
@@ -4038,6 +4056,14 @@ function FieldAgentPortal() {
                 </div>
                 <button className="primary" onClick={() => openFillForm(selectedForm)}>
                   <ExternalLink size={16} /> Fill Form
+                </button>
+                <button
+                  className="secondary small statistics-trigger"
+                  type="button"
+                  disabled={statisticsLoading}
+                  onClick={() => openFieldAgentStatistics(selectedForm)}
+                >
+                  <BarChart3 size={15} /> {statisticsLoading ? "Loading..." : "Statistics"}
                 </button>
                 {fieldAgentDisplayOptions.length ? (
                   <label className="display-field-select">
@@ -4145,6 +4171,13 @@ function FieldAgentPortal() {
           )}
         </section>
       </main>
+      {statisticsForm ? (
+        <StatisticsModal
+          form={statisticsForm}
+          entries={selectedForm?.entries || []}
+          onClose={() => setStatisticsForm(null)}
+        />
+      ) : null}
       <footer className="builder-footer home-footer" aria-label="Page status">
         <div className={`footer-status ${status.kind}`}>
           {status.kind === "ok" ? <Check size={16} /> : status.kind === "busy" ? <RefreshCw size={16} /> : <AlertCircle size={16} />}
