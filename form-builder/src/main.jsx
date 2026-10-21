@@ -2588,60 +2588,117 @@ function statisticsMapWorldPoint(latitude, longitude, zoom) {
 }
 
 function StatisticsLocationMap({ points = [] }) {
-  if (!points.length) return <p className="statistics-empty">No valid location responses yet.</p>;
-  const minLatitude = Math.min(...points.map((point) => point.latitude));
-  const maxLatitude = Math.max(...points.map((point) => point.latitude));
-  const minLongitude = Math.min(...points.map((point) => point.longitude));
-  const maxLongitude = Math.max(...points.map((point) => point.longitude));
+  const hasPoints = points.length > 0;
+  const minLatitude = hasPoints ? Math.min(...points.map((point) => point.latitude)) : 20;
+  const maxLatitude = hasPoints ? Math.max(...points.map((point) => point.latitude)) : 20;
+  const minLongitude = hasPoints ? Math.min(...points.map((point) => point.longitude)) : 78;
+  const maxLongitude = hasPoints ? Math.max(...points.map((point) => point.longitude)) : 78;
   const latitudeSpan = maxLatitude - minLatitude;
   const longitudeSpan = maxLongitude - minLongitude;
   const span = Math.max(latitudeSpan, longitudeSpan, 0.25);
-  const zoom = Math.max(3, Math.min(12, Math.round(Math.log2(180 / (span * 2.2)))));
-  const center = {
+  const fittedZoom = Math.max(3, Math.min(12, Math.round(Math.log2(180 / (span * 2.2)))));
+  const fittedCenter = {
     latitude: (minLatitude + maxLatitude) / 2,
     longitude: (minLongitude + maxLongitude) / 2
   };
-  const centerWorld = statisticsMapWorldPoint(center.latitude, center.longitude, zoom);
-  const originX = Math.floor(centerWorld.x) - 1;
-  const originY = Math.floor(centerWorld.y) - 1;
-  const tileCount = 2 ** zoom;
+  const [mapView, setMapView] = useState({ center: fittedCenter, zoom: fittedZoom });
+  const dragRef = useRef(null);
+  const tileSize = 256;
+
+  useEffect(() => {
+    if (!points.length) return;
+    setMapView({ center: fittedCenter, zoom: fittedZoom });
+  }, [points]);
+
+  function locationFromWorld(x, y, zoom) {
+    const scale = 2 ** zoom;
+    const longitude = (x / scale) * 360 - 180;
+    const latitude = (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / scale))) * 180) / Math.PI;
+    return { latitude, longitude };
+  }
+
+  function startPan(event) {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = { x: event.clientX, y: event.clientY };
+  }
+
+  function movePan(event) {
+    if (!dragRef.current) return;
+    const dx = event.clientX - dragRef.current.x;
+    const dy = event.clientY - dragRef.current.y;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+    setMapView((current) => {
+      const centerWorld = statisticsMapWorldPoint(current.center.latitude, current.center.longitude, current.zoom);
+      return {
+        ...current,
+        center: locationFromWorld(centerWorld.x - dx / tileSize, centerWorld.y - dy / tileSize, current.zoom)
+      };
+    });
+    dragRef.current = { x: event.clientX, y: event.clientY };
+  }
+
+  function endPan() {
+    dragRef.current = null;
+  }
+
+  function changeZoom(delta) {
+    setMapView((current) => ({ ...current, zoom: Math.max(2, Math.min(18, current.zoom + delta)) }));
+  }
+
+  if (!hasPoints) return <p className="statistics-empty">No valid location responses yet.</p>;
+
+  const zoom = mapView.zoom;
+  const scale = 2 ** zoom;
+  const centerWorld = statisticsMapWorldPoint(mapView.center.latitude, mapView.center.longitude, zoom);
+  const centerTileX = Math.floor(centerWorld.x);
+  const centerTileY = Math.floor(centerWorld.y);
+  const fractionalX = centerWorld.x - centerTileX;
+  const fractionalY = centerWorld.y - centerTileY;
   const tiles = [];
-  for (let row = 0; row < 3; row += 1) {
-    for (let column = 0; column < 3; column += 1) {
-      const tileX = originX + column;
-      const tileY = originY + row;
-      if (tileY < 0 || tileY >= tileCount) continue;
+  for (let row = -1; row <= 1; row += 1) {
+    for (let column = -1; column <= 1; column += 1) {
+      const tileX = centerTileX + column;
+      const tileY = centerTileY + row;
+      if (tileY < 0 || tileY >= scale) continue;
       tiles.push({
-        x: column * 256,
-        y: row * 256,
-        src: `https://tile.openstreetmap.org/${zoom}/${((tileX % tileCount) + tileCount) % tileCount}/${tileY}.png`
+        key: `${tileX}_${tileY}`,
+        left: `${(column + 1 - fractionalX) * tileSize}px`,
+        top: `${(row + 1 - fractionalY) * tileSize}px`,
+        src: `https://tile.openstreetmap.org/${zoom}/${((tileX % scale) + scale) % scale}/${tileY}.png`
       });
     }
   }
-  const centerOffsetX = (centerWorld.x - originX) * 256;
-  const centerOffsetY = (centerWorld.y - originY) * 256;
   return (
     <div className="statistics-location-map">
-      <div className="statistics-map-viewport">
-        <div className="statistics-map-canvas" style={{ left: `calc(50% - ${centerOffsetX}px)`, top: `calc(50% - ${centerOffsetY}px)` }}>
-          {tiles.map((tile) => <img key={`${tile.x}_${tile.y}`} className="statistics-map-tile" src={tile.src} alt="" style={{ left: tile.x, top: tile.y }} />)}
-          {points.map((point, index) => {
-            const world = statisticsMapWorldPoint(point.latitude, point.longitude, zoom);
-            return (
-              <span
-                className="statistics-map-marker"
-                key={`${point.entryIndex}_${point.latitude}_${point.longitude}_${index}`}
-                title={`Response ${point.entryIndex + 1}: ${point.latitude.toFixed(5)}, ${point.longitude.toFixed(5)}`}
-                style={{ left: (world.x - originX) * 256, top: (world.y - originY) * 256 }}
-              >
-                <span>{index + 1}</span>
-              </span>
-            );
-          })}
+      <div
+        className="statistics-map-viewport"
+        onPointerDown={startPan}
+        onPointerMove={movePan}
+        onPointerUp={endPan}
+        onPointerCancel={endPan}
+        onLostPointerCapture={endPan}
+      >
+        {tiles.map((tile) => <img key={tile.key} className="statistics-map-tile" src={tile.src} alt="" style={{ left: tile.left, top: tile.top }} />)}
+        {points.map((point, index) => {
+          const world = statisticsMapWorldPoint(point.latitude, point.longitude, zoom);
+          return (
+            <span
+              className="statistics-map-marker"
+              key={`${point.entryIndex}_${point.latitude}_${point.longitude}_${index}`}
+              title={`Response ${point.entryIndex + 1}: ${point.latitude.toFixed(5)}, ${point.longitude.toFixed(5)}`}
+              style={{ left: `calc(50% + ${(world.x - centerWorld.x) * tileSize}px)`, top: `calc(50% + ${(world.y - centerWorld.y) * tileSize}px)` }}
+            >
+              <span>{index + 1}</span>
+            </span>
+          );
+        })}
+        <div className="statistics-map-controls" aria-label="Map controls" onPointerDown={(event) => event.stopPropagation()}>
+          <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(1); }} aria-label="Zoom in">+</button>
+          <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(-1); }} aria-label="Zoom out">−</button>
         </div>
         <span className="statistics-map-attribution">© OpenStreetMap contributors</span>
       </div>
-      <p className="statistics-map-note">{points.length} location point{points.length === 1 ? "" : "s"} plotted from the submitted responses.</p>
+      <p className="statistics-map-note">{points.length} location point{points.length === 1 ? "" : "s"} plotted from the submitted responses. Drag to pan or use the controls to zoom.</p>
     </div>
   );
 }

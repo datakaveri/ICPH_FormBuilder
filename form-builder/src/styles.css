@@ -4376,12 +4376,13 @@ button:disabled {
   border: 1px solid #b9cbe0;
   border-radius: 10px;
   background: #e7f0f7;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
 
-.statistics-map-canvas {
-  position: absolute;
-  width: 768px;
-  height: 768px;
+.statistics-map-viewport:active {
+  cursor: grabbing;
 }
 
 .statistics-map-tile {
@@ -4389,6 +4390,7 @@ button:disabled {
   width: 256px;
   height: 256px;
   max-width: none;
+  pointer-events: none;
 }
 
 .statistics-map-marker {
@@ -4406,6 +4408,7 @@ button:disabled {
   font-size: 10px;
   font-weight: 800;
   rotate: -45deg;
+  pointer-events: none;
 }
 
 .statistics-map-marker > span {
@@ -4420,6 +4423,29 @@ button:disabled {
   background: rgba(255, 255, 255, 0.82);
   color: #526173;
   font-size: 9px;
+  pointer-events: none;
+}
+
+.statistics-map-controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  display: grid;
+  gap: 5px;
+}
+
+.statistics-map-controls button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #b8c8da;
+  border-radius: 6px;
+  color: #1f3550;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.16);
+  cursor: pointer;
+  font-size: 22px;
+  line-height: 1;
 }
 
 .statistics-metrics {
