@@ -8,6 +8,7 @@ import {
 import { BarcodeFormat, DecodeHintType } from "@zxing/library";
 import {
   AlertCircle,
+  BarChart3,
   Calendar,
   Check,
   ChevronDown,
@@ -2293,6 +2294,537 @@ function entriesToCsv(form, entries) {
   return rows.join("\n") + "\n";
 }
 
+const STATISTICS_CHOICE_TYPES = new Set([
+  "select_one",
+  "select_multiple",
+  "select_one_from_file",
+  "select_multiple_from_file",
+  "rank"
+]);
+
+const STATISTICS_LOCATION_TYPES = new Set(["geopoint", "geotrace", "geoshape", "start-geopoint"]);
+
+const STATISTICS_EXCLUDED_TYPES = new Set([
+  ...STRUCTURAL_TYPES,
+  "note",
+  "calculate",
+  "hidden",
+  "csv-external",
+  "timer",
+  "audit",
+  "background-audio",
+  "start",
+  "end",
+  "today",
+  "deviceid",
+  "username"
+]);
+
+function statisticAnswerValues(question, answers = {}) {
+  const raw = entryExportValue(answers, question);
+  const values = Array.isArray(raw) ? raw.flat(Infinity) : [raw];
+  return values.flatMap((value) => {
+    const text = String(value ?? "").trim();
+    if (!text) return [];
+    if (["select_multiple", "select_multiple_from_file", "rank"].includes(question.type)) {
+      return text.split(/\s+/).filter(Boolean);
+    }
+    return [text];
+  });
+}
+
+function statisticQuestionLabel(question = {}) {
+  return displayFormText(question.label || question.name || "Question") || question.name || "Question";
+}
+
+function statisticOptionLabel(question = {}, value = "") {
+  const option = (question.options || []).find((item) => String(item.name) === String(value));
+  return displayFormText(option?.label || option?.name || value) || String(value);
+}
+
+function statisticFrequencyItems(values = [], labelForValue = (value) => value, limit = 8) {
+  const counts = new Map();
+  values.forEach((value) => {
+    const key = String(value);
+    const current = counts.get(key) || { key, label: labelForValue(value), count: 0 };
+    current.count += 1;
+    counts.set(key, current);
+  });
+  return [...counts.values()]
+    .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label))
+    .slice(0, limit);
+}
+
+function formatStatisticNumber(value) {
+  if (!Number.isFinite(value)) return "—";
+  return Number.isInteger(value) ? String(value) : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function statisticDateLabel(value, type) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (type === "time") return text;
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return text;
+  return parsed.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+function numericStatisticBins(numbers) {
+  if (!numbers.length) return [];
+  const min = Math.min(...numbers);
+  const max = Math.max(...numbers);
+  if (min === max) return [{ label: formatStatisticNumber(min), count: numbers.length }];
+  const binCount = Math.min(5, Math.max(2, Math.ceil(Math.sqrt(numbers.length))));
+  const width = (max - min) / binCount;
+  return Array.from({ length: binCount }, (_, index) => {
+    const lower = min + width * index;
+    const upper = index === binCount - 1 ? max : min + width * (index + 1);
+    const count = numbers.filter((value) => index === binCount - 1
+      ? value >= lower && value <= upper
+      : value >= lower && value < upper).length;
+    return {
+      label: `${formatStatisticNumber(lower)}–${formatStatisticNumber(upper)}`,
+      count
+    };
+  });
+}
+
+function parseStatisticsLocationPoints(value, type = "") {
+  const segments = String(value || "")
+    .trim()
+    .split(/[;|\n]+/)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  const points = [];
+  for (const segment of segments) {
+    const numbers = segment.split(/[\s,]+/).map(Number).filter(Number.isFinite);
+    const coordinateLimit = ["geopoint", "start-geopoint"].includes(type) ? 2 : numbers.length;
+    for (let index = 0; index + 1 < Math.min(numbers.length, coordinateLimit); index += 2) {
+      const latitude = numbers[index];
+      const longitude = numbers[index + 1];
+      if (latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180) {
+        points.push({ latitude, longitude });
+      }
+    }
+  }
+  return points;
+}
+
+function buildQuestionStatistics(question, entries = [], form = {}) {
+  const answerRows = entries.map((entry) => statisticAnswerValues(question, computeCalculatedAnswers(form, entry.answers || {})));
+  const values = answerRows.flat();
+  const responseCount = answerRows.filter((answers) => answers.length > 0).length;
+  const base = {
+    question,
+    label: statisticQuestionLabel(question),
+    responseCount,
+    responseRate: entries.length ? (responseCount / entries.length) * 100 : 0,
+    uniqueCount: new Set(values).size,
+    totalEntries: entries.length
+  };
+
+  if (STATISTICS_CHOICE_TYPES.has(question.type)) {
+    const counts = new Map(values.map((value) => [String(value), 0]));
+    (question.options || []).forEach((option) => counts.set(String(option.name), 0));
+    values.forEach((value) => counts.set(String(value), (counts.get(String(value)) || 0) + 1));
+    const orderedKeys = [
+      ...(question.options || []).map((option) => String(option.name)),
+      ...[...counts.keys()].filter((key) => !(question.options || []).some((option) => String(option.name) === key))
+    ];
+    const denominator = question.type === "select_multiple" || question.type === "select_multiple_from_file" ? values.length : responseCount;
+    return {
+      ...base,
+      kind: "choice",
+      denominator,
+      items: orderedKeys.map((key) => ({
+        key,
+        label: statisticOptionLabel(question, key),
+        count: counts.get(key) || 0
+      })).filter((item) => item.count > 0 || question.options?.some((option) => String(option.name) === item.key))
+    };
+  }
+
+  if (STATISTICS_LOCATION_TYPES.has(question.type)) {
+    const points = answerRows.flatMap((answers, entryIndex) => answers.flatMap((value) => (
+      parseStatisticsLocationPoints(value, question.type).map((point) => ({ ...point, entryIndex }))
+    )));
+    return { ...base, kind: "location", points };
+  }
+
+  if (["integer", "decimal", "range"].includes(question.type)) {
+    const numbers = values.map(Number).filter(Number.isFinite);
+    const sorted = [...numbers].sort((left, right) => left - right);
+    const middle = Math.floor(sorted.length / 2);
+    const median = sorted.length
+      ? sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+      : NaN;
+    return {
+      ...base,
+      kind: "numeric",
+      numericCount: numbers.length,
+      average: numbers.length ? numbers.reduce((sum, value) => sum + value, 0) / numbers.length : NaN,
+      median,
+      minimum: numbers.length ? sorted[0] : NaN,
+      maximum: numbers.length ? sorted.at(-1) : NaN,
+      items: numericStatisticBins(numbers)
+    };
+  }
+
+  if (["date", "dateTime", "time"].includes(question.type)) {
+    const items = statisticFrequencyItems(values, (value) => statisticDateLabel(value, question.type));
+    return {
+      ...base,
+      kind: "date",
+      items,
+      earliest: values.length ? statisticDateLabel([...values].sort()[0], question.type) : "",
+      latest: values.length ? statisticDateLabel([...values].sort().at(-1), question.type) : ""
+    };
+  }
+
+  if (["image", "audio", "video", "file"].includes(question.type)) {
+    return { ...base, kind: "media" };
+  }
+
+  return {
+    ...base,
+    kind: "text",
+    items: statisticFrequencyItems(values, (value) => value),
+    responses: values.slice(0, 50),
+    responseTotal: values.length
+  };
+}
+
+function StatisticsMetric({ label, value }) {
+  return (
+    <div className="statistics-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function StatisticsVerticalBarChart({ items = [], denominator = 0 }) {
+  const max = Math.max(...items.map((item) => item.count), 0);
+  if (!items.length) return <p className="statistics-empty">No responses yet.</p>;
+  const chartWidth = Math.max(items.length * 74, 520);
+  const yAxis = [max, Math.round(max / 2), 0];
+  return (
+    <div className="statistics-column-scroll">
+      <div className="statistics-column-chart" style={{ minWidth: `${chartWidth + 42}px` }}>
+        <div className="statistics-column-y-axis" aria-hidden="true">
+          {yAxis.map((value, index) => <span key={`${value}_${index}`}>{value}</span>)}
+        </div>
+        <div className="statistics-column-plot">
+          <div className="statistics-column-grid-lines" aria-hidden="true">
+            <span /><span /><span />
+          </div>
+          <div className="statistics-column-bars" style={{ gridTemplateColumns: `repeat(${items.length}, minmax(46px, 1fr))` }}>
+            {items.map((item) => {
+              const percentage = denominator ? (item.count / denominator) * 100 : 0;
+              return (
+                <div className="statistics-column-item" key={item.key || item.label} title={`${item.label}: ${item.count} (${percentage.toFixed(0)}%)`}>
+                  <div className="statistics-column-value" style={{ height: `${max ? Math.max((item.count / max) * 100, item.count ? 3 : 0) : 0}%` }}>
+                    <span>{item.count}</span>
+                  </div>
+                  <span className="statistics-column-label">{item.label || "Blank"}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatisticsResponseList({ responses = [], responseTotal = 0 }) {
+  if (!responses.length) return <p className="statistics-empty">No responses yet.</p>;
+  return (
+    <div className="statistics-response-list">
+      {responses.map((response, index) => (
+        <div className="statistics-response-item" key={`${response}_${index}`}>
+          <span>{index + 1}</span>
+          <p>{response}</p>
+        </div>
+      ))}
+      {responseTotal > responses.length ? <small className="statistics-list-note">Showing the first {responses.length} of {responseTotal} responses.</small> : null}
+    </div>
+  );
+}
+
+function statisticsMapWorldPoint(latitude, longitude, zoom) {
+  const scale = 2 ** zoom;
+  const latitudeRadians = (latitude * Math.PI) / 180;
+  return {
+    x: ((longitude + 180) / 360) * scale,
+    y: ((1 - Math.asinh(Math.tan(latitudeRadians)) / Math.PI) / 2) * scale
+  };
+}
+
+function useStreetMapGrid(mapRef) {
+  const [mapSize, setMapSize] = useState({ width: 1024, height: 600 });
+
+  useEffect(() => {
+    const element = mapRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return undefined;
+    const updateSize = () => setMapSize({ width: element.clientWidth, height: element.clientHeight });
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [mapRef]);
+
+  const columns = Math.max(3, Math.ceil(mapSize.width / 256) + 2) | 1;
+  const rows = Math.max(3, Math.ceil(mapSize.height / 256) + 2) | 1;
+  return { columns, rows };
+}
+
+function StreetMapTiles({ mapRef, mapView, className = "location-reference-tile" }) {
+  const { columns, rows } = useStreetMapGrid(mapRef);
+  const tileSize = 256;
+  const scale = 2 ** mapView.zoom;
+  const centerWorld = statisticsMapWorldPoint(mapView.center.latitude, mapView.center.longitude, mapView.zoom);
+  const centerTileX = Math.floor(centerWorld.x);
+  const centerTileY = Math.floor(centerWorld.y);
+  const fractionalX = centerWorld.x - centerTileX;
+  const fractionalY = centerWorld.y - centerTileY;
+  const halfColumns = Math.floor(columns / 2);
+  const halfRows = Math.floor(rows / 2);
+  const tiles = [];
+  for (let row = -halfRows; row <= halfRows; row += 1) {
+    for (let column = -halfColumns; column <= halfColumns; column += 1) {
+      const tileX = centerTileX + column;
+      const tileY = centerTileY + row;
+      if (tileY < 0 || tileY >= scale) continue;
+      tiles.push(
+        <img
+          key={`${tileX}-${tileY}`}
+          className={className}
+          style={{ left: `${(column + halfColumns - fractionalX) * tileSize}px`, top: `${(row + halfRows - fractionalY) * tileSize}px` }}
+          src={`https://tile.openstreetmap.org/${mapView.zoom}/${((tileX % scale) + scale) % scale}/${tileY}.png`}
+          alt=""
+          draggable="false"
+        />
+      );
+    }
+  }
+  return (
+    <div
+      className="street-map-tiles"
+      style={{
+        left: `calc(50% - ${halfColumns * tileSize}px)`,
+        top: `calc(50% - ${halfRows * tileSize}px)`,
+        width: `${columns * tileSize}px`,
+        height: `${rows * tileSize}px`
+      }}
+    >
+      {tiles}
+    </div>
+  );
+}
+
+function StatisticsLocationMap({ points = [] }) {
+  const hasPoints = points.length > 0;
+  const minLatitude = hasPoints ? Math.min(...points.map((point) => point.latitude)) : 20;
+  const maxLatitude = hasPoints ? Math.max(...points.map((point) => point.latitude)) : 20;
+  const minLongitude = hasPoints ? Math.min(...points.map((point) => point.longitude)) : 78;
+  const maxLongitude = hasPoints ? Math.max(...points.map((point) => point.longitude)) : 78;
+  const latitudeSpan = maxLatitude - minLatitude;
+  const longitudeSpan = maxLongitude - minLongitude;
+  const span = Math.max(latitudeSpan, longitudeSpan, 0.25);
+  const fittedZoom = Math.max(3, Math.min(12, Math.round(Math.log2(180 / (span * 2.2)))));
+  const fittedCenter = {
+    latitude: (minLatitude + maxLatitude) / 2,
+    longitude: (minLongitude + maxLongitude) / 2
+  };
+  const [mapView, setMapView] = useState({ center: fittedCenter, zoom: fittedZoom });
+  const mapRef = useRef(null);
+  const dragRef = useRef(null);
+  const tileSize = 256;
+
+  useEffect(() => {
+    if (!points.length) return;
+    setMapView({ center: fittedCenter, zoom: fittedZoom });
+  }, [points]);
+
+  function locationFromWorld(x, y, zoom) {
+    const scale = 2 ** zoom;
+    const longitude = (x / scale) * 360 - 180;
+    const latitude = (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / scale))) * 180) / Math.PI;
+    return { latitude, longitude };
+  }
+
+  function startPan(event) {
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = { x: event.clientX, y: event.clientY };
+  }
+
+  function movePan(event) {
+    if (!dragRef.current) return;
+    const dx = event.clientX - dragRef.current.x;
+    const dy = event.clientY - dragRef.current.y;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+    setMapView((current) => {
+      const centerWorld = statisticsMapWorldPoint(current.center.latitude, current.center.longitude, current.zoom);
+      return {
+        ...current,
+        center: locationFromWorld(centerWorld.x - dx / tileSize, centerWorld.y - dy / tileSize, current.zoom)
+      };
+    });
+    dragRef.current = { x: event.clientX, y: event.clientY };
+  }
+
+  function endPan() {
+    dragRef.current = null;
+  }
+
+  function changeZoom(delta) {
+    setMapView((current) => ({ ...current, zoom: Math.max(2, Math.min(18, current.zoom + delta)) }));
+  }
+
+  if (!hasPoints) return <p className="statistics-empty">No valid location responses yet.</p>;
+
+  const zoom = mapView.zoom;
+  const centerWorld = statisticsMapWorldPoint(mapView.center.latitude, mapView.center.longitude, zoom);
+  return (
+    <div className="statistics-location-map">
+      <div
+        className="statistics-map-viewport"
+        ref={mapRef}
+        onPointerDown={startPan}
+        onPointerMove={movePan}
+        onPointerUp={endPan}
+        onPointerCancel={endPan}
+        onLostPointerCapture={endPan}
+      >
+        <StreetMapTiles mapRef={mapRef} mapView={mapView} className="statistics-map-tile" />
+        {points.map((point, index) => {
+          const world = statisticsMapWorldPoint(point.latitude, point.longitude, zoom);
+          return (
+            <span
+              className="statistics-map-marker"
+              key={`${point.entryIndex}_${point.latitude}_${point.longitude}_${index}`}
+              title={`Response ${point.entryIndex + 1}: ${point.latitude.toFixed(5)}, ${point.longitude.toFixed(5)}`}
+              style={{ left: `calc(50% + ${(world.x - centerWorld.x) * tileSize}px)`, top: `calc(50% + ${(world.y - centerWorld.y) * tileSize}px)` }}
+            >
+              <span>{index + 1}</span>
+            </span>
+          );
+        })}
+        <div className="statistics-map-controls" aria-label="Map controls" onPointerDown={(event) => event.stopPropagation()}>
+          <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(1); }} aria-label="Zoom in">+</button>
+          <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(-1); }} aria-label="Zoom out">−</button>
+        </div>
+        <span className="statistics-map-attribution">© OpenStreetMap contributors</span>
+      </div>
+      <p className="statistics-map-note">{points.length} location point{points.length === 1 ? "" : "s"} plotted from the submitted responses. Drag to pan or use the controls to zoom.</p>
+    </div>
+  );
+}
+
+function StatisticsQuestionCard({ statistic }) {
+  const { question, label, responseCount, responseRate, totalEntries } = statistic;
+  return (
+    <article className="statistics-question-card">
+      <div className="statistics-question-head">
+        <div>
+          <span className="eyebrow">{question.type.replace(/_/g, " ")}</span>
+          <h3>{label}</h3>
+        </div>
+        <span className="statistics-response-count">{responseCount}/{totalEntries} answered</span>
+      </div>
+      {statistic.kind === "choice" ? (
+        <StatisticsVerticalBarChart items={statistic.items} denominator={statistic.denominator} />
+      ) : statistic.kind === "location" ? (
+        <StatisticsLocationMap points={statistic.points} />
+      ) : statistic.kind === "numeric" ? (
+        statistic.numericCount ? (
+          <>
+            <div className="statistics-metrics">
+              <StatisticsMetric label="Average" value={formatStatisticNumber(statistic.average)} />
+              <StatisticsMetric label="Median" value={formatStatisticNumber(statistic.median)} />
+              <StatisticsMetric label="Minimum" value={formatStatisticNumber(statistic.minimum)} />
+              <StatisticsMetric label="Maximum" value={formatStatisticNumber(statistic.maximum)} />
+            </div>
+            <StatisticsVerticalBarChart items={statistic.items} denominator={statistic.numericCount} />
+          </>
+        ) : <p className="statistics-empty">No numeric responses yet.</p>
+      ) : statistic.kind === "date" ? (
+        responseCount ? (
+          <>
+            <div className="statistics-metrics">
+              <StatisticsMetric label="First response" value={statistic.earliest} />
+              <StatisticsMetric label="Latest response" value={statistic.latest} />
+            </div>
+            <StatisticsVerticalBarChart items={statistic.items} denominator={responseCount} />
+          </>
+        ) : <p className="statistics-empty">No responses yet.</p>
+      ) : statistic.kind === "media" ? (
+        <div className="statistics-metrics">
+          <StatisticsMetric label="Files submitted" value={responseCount} />
+          <StatisticsMetric label="Completion" value={`${responseRate.toFixed(0)}%`} />
+        </div>
+      ) : (
+        responseCount ? (
+          <>
+            <div className="statistics-metrics">
+              <StatisticsMetric label="Unique answers" value={statistic.uniqueCount} />
+              <StatisticsMetric label="Completion" value={`${responseRate.toFixed(0)}%`} />
+            </div>
+            <StatisticsResponseList responses={statistic.responses} responseTotal={statistic.responseTotal} />
+          </>
+        ) : <p className="statistics-empty">No responses yet.</p>
+      )}
+    </article>
+  );
+}
+
+function StatisticsModal({ form, entries, onClose }) {
+  const statistics = useMemo(() => entryCsvQuestions(form)
+    .filter((question) => !STATISTICS_EXCLUDED_TYPES.has(question.type))
+    .map((question) => buildQuestionStatistics(question, entries, form)), [entries, form]);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    function handleKeyDown(event) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="link-modal statistics-modal" role="dialog" aria-modal="true" aria-label="Response statistics" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-head statistics-modal-head">
+          <div>
+            <span className="eyebrow">Published questionnaire</span>
+            <h2>Response statistics</h2>
+            <p>{form.title || "Form"} · {entries.length} total response{entries.length === 1 ? "" : "s"}</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close response statistics">
+            <X size={16} />
+          </button>
+        </div>
+        <div className="statistics-modal-body">
+          {statistics.length ? statistics.map((statistic) => (
+            <StatisticsQuestionCard key={statistic.question.id || statistic.question.name} statistic={statistic} />
+          )) : (
+            <div className="statistics-empty-state">
+              <BarChart3 size={28} />
+              <p>No answerable questions are available for statistics.</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const CRC32_TABLE = Array.from({ length: 256 }, (_, index) => {
   let value = index;
   for (let bit = 0; bit < 8; bit += 1) {
@@ -2677,6 +3209,10 @@ function App() {
         />}
       </FieldAgentGate>
     );
+  }
+  if (path.startsWith("/public-entry/")) {
+    const parts = path.replace("/public-entry/", "").split("/");
+    return <EntryViewer accessCode={decodeURIComponent(parts[0] || "")} entryId={decodeURIComponent(parts[1] || "")} />;
   }
   if (path.startsWith("/fill/")) {
     const params = new URLSearchParams(window.location.search);
@@ -3333,6 +3869,8 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const [statisticsForm, setStatisticsForm] = useState(null);
+  const [statisticsLoading, setStatisticsLoading] = useState(false);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading published forms..." });
   const selectedForm = forms.find((item) => item.respondentAccessCode === selectedCode) || forms[0] || null;
   const fieldAgentEntryIds = useMemo(
@@ -3424,6 +3962,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
 
   useEffect(() => {
     setSelectedEntryIds([]);
+    setStatisticsForm(null);
   }, [selectedForm?.respondentAccessCode]);
 
   useEffect(() => {
@@ -3450,6 +3989,27 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     if (checkpointIdentifierValue) params.set("checkpoint", checkpointIdentifierValue);
     const query = params.toString() ? `?${params.toString()}` : "";
     window.open(`/public-fill/${encodeURIComponent(code)}${query}`, "_blank");
+  }
+
+  function viewEntry(form, entryId = "") {
+    const code = normalizeAccessCodeInput(form?.respondentAccessCode);
+    if (!code || !entryId) return;
+    window.open(`/public-entry/${encodeURIComponent(code)}/${encodeURIComponent(entryId)}`, "_blank", "noopener,noreferrer");
+  }
+
+  async function openFieldAgentStatistics(form) {
+    const code = normalizeAccessCodeInput(form?.respondentAccessCode);
+    if (!code) return;
+    setStatisticsLoading(true);
+    try {
+      const data = await requestJson(`/api/public/forms/${encodeURIComponent(code)}`);
+      const draft = normalizeFormDraft(data.draft || {});
+      setStatisticsForm({ ...draft, title: data.title || draft.title || form.title });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    } finally {
+      setStatisticsLoading(false);
+    }
   }
 
   function toggleFieldAgentEntry(entryId, checked) {
@@ -3541,6 +4101,14 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                 <button className="primary" onClick={() => openFillForm(selectedForm)}>
                   <ExternalLink size={16} /> Fill Form
                 </button>
+                <button
+                  className="secondary small statistics-trigger"
+                  type="button"
+                  disabled={statisticsLoading}
+                  onClick={() => openFieldAgentStatistics(selectedForm)}
+                >
+                  <BarChart3 size={15} /> {statisticsLoading ? "Loading..." : "Statistics"}
+                </button>
                 {fieldAgentDisplayOptions.length ? (
                   <label className="display-field-select">
                     <span>Display</span>
@@ -3624,6 +4192,9 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                               <TextCursorInput size={14} /> Edit
                             </button>
                           ) : null}
+                          <button className="secondary small icon-text-button" onClick={() => viewEntry(selectedForm, entry.id)} title="View entry">
+                            <ExternalLink size={14} /> View
+                          </button>
                           <button className="secondary small danger-action" disabled={status.kind === "busy"} onClick={() => deleteFieldAgentEntries([entry.id])}>
                             <Trash2 size={14} /> Delete
                           </button>
@@ -3644,6 +4215,13 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
           )}
         </section>
       </main>
+      {statisticsForm ? (
+        <StatisticsModal
+          form={statisticsForm}
+          entries={selectedForm?.entries || []}
+          onClose={() => setStatisticsForm(null)}
+        />
+      ) : null}
       <footer className="builder-footer home-footer" aria-label="Page status">
         <div className={`footer-status ${status.kind}`}>
           {status.kind === "ok" ? <Check size={16} /> : status.kind === "busy" ? <RefreshCw size={16} /> : <AlertCircle size={16} />}
@@ -6698,6 +7276,7 @@ function BuilderPage(props) {
     [form]
   );
   const [questionTypeToAdd, setQuestionTypeToAdd] = useState(QUESTION_TYPES[0]?.type || "text");
+  const [statisticsOpen, setStatisticsOpen] = useState(false);
 
   return (
     <>
@@ -6711,6 +7290,11 @@ function BuilderPage(props) {
         <div className="topbar-title">
           <h1>{form.title || "ICPH Form Builder"}</h1>
           <p>Build, checkpoint, export, and collect locally in one form workspace.</p>
+          {published ? (
+            <button className="secondary small statistics-trigger" type="button" onClick={() => setStatisticsOpen(true)}>
+              <BarChart3 size={15} /> Statistics
+            </button>
+          ) : null}
         </div>
         <div className="topbar-brand">
           <BrandLogos />
@@ -7044,6 +7628,7 @@ function BuilderPage(props) {
 	        createNewVersion={createNewVersion}
 	        leaveAllTerminologyUnmappedAndPublish={leaveAllTerminologyUnmappedAndPublish}
 	      />
+      {statisticsOpen ? <StatisticsModal form={form} entries={entries} onClose={() => setStatisticsOpen(false)} /> : null}
     </>
   );
 }
@@ -11751,18 +12336,6 @@ function LocationTypeHelp({ question }) {
   );
 }
 
-const GEOMETRY_POINT_PICKER_XML = `<?xml version="1.0" encoding="UTF-8"?>
-<h:html xmlns:h="http://www.w3.org/1999/xhtml" xmlns="http://www.w3.org/2002/xforms" xmlns:jr="http://openrosa.org/javarosa">
-  <h:head>
-    <h:title>Choose map point</h:title>
-    <model>
-      <instance><data id="icph_geometry_picker"><location /></data></instance>
-      <bind nodeset="/data/location" type="geopoint" required="true()" />
-    </model>
-  </h:head>
-  <h:body><input ref="/data/location" appearance="placement-map"><label>Choose a point</label></input></h:body>
-</h:html>`;
-
 function GeopointOptionPicker({ onAdd, onClose }) {
   const [mapView, setMapView] = useState({ center: { latitude: 20, longitude: 78 }, zoom: 5 });
   const [selectedPoint, setSelectedPoint] = useState(null);
@@ -11770,7 +12343,7 @@ function GeopointOptionPicker({ onAdd, onClose }) {
   const tileSize = 256;
   const dragRef = useRef(null);
   const suppressClickRef = useRef(false);
-  const mapSelectRef = useRef(null);
+  const mapRef = useRef(null);
 
   useEffect(() => {
     if (!navigator.geolocation) return undefined;
@@ -11835,31 +12408,7 @@ function GeopointOptionPicker({ onAdd, onClose }) {
     setMapView((current) => ({ ...current, zoom: Math.max(2, Math.min(18, current.zoom + delta)) }));
   }
 
-  const zoom = mapView.zoom;
-  const scale = 2 ** zoom;
   const centerWorld = worldPoint(mapView.center.latitude, mapView.center.longitude);
-  const centerTileX = Math.floor(centerWorld.x);
-  const centerTileY = Math.floor(centerWorld.y);
-  const fractionalX = centerWorld.x - centerTileX;
-  const fractionalY = centerWorld.y - centerTileY;
-  const tiles = [];
-  for (let row = -1; row <= 1; row += 1) {
-    for (let column = -1; column <= 1; column += 1) {
-      const tileX = centerTileX + column;
-      const tileY = centerTileY + row;
-      const wrappedX = ((tileX % scale) + scale) % scale;
-      if (tileY < 0 || tileY >= scale) continue;
-      tiles.push(
-        <img
-          key={`${tileX}-${tileY}`}
-          className="location-reference-tile"
-          style={{ left: `${(column + 1 - fractionalX) * tileSize}px`, top: `${(row + 1 - fractionalY) * tileSize}px` }}
-          src={`https://tile.openstreetmap.org/${zoom}/${wrappedX}/${tileY}.png`}
-          alt=""
-        />
-      );
-    }
-  }
   const selectedWorld = selectedPoint ? worldPoint(selectedPoint.latitude, selectedPoint.longitude) : null;
   const markerLeft = selectedWorld ? `calc(50% + ${(selectedWorld.x - centerWorld.x) * tileSize}px)` : "50%";
   const markerTop = selectedWorld ? `calc(50% + ${(selectedWorld.y - centerWorld.y) * tileSize}px)` : "50%";
@@ -11875,15 +12424,6 @@ function GeopointOptionPicker({ onAdd, onClose }) {
     setLabel("");
   }
 
-  function handleMapSelected(point) {
-    onAdd({
-      name: `place_${Date.now().toString().slice(-6)}`,
-      label: label.trim() || `Place ${point.latitude.toFixed(4)}, ${point.longitude.toFixed(4)}`,
-      geometry: `POINT (${point.longitude} ${point.latitude})`
-    });
-    onClose();
-  }
-
   return (
     <div className="geopoint-picker-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="geopoint-picker" role="dialog" aria-modal="true" aria-label="Add a map point">
@@ -11891,22 +12431,39 @@ function GeopointOptionPicker({ onAdd, onClose }) {
           <div><strong>Add map point</strong><span>Click the map to place a point, then give it a choice label.</span></div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close map point picker"><X size={16} /></button>
         </div>
-        <div className="geopoint-picker-odk-map">
-          <OdkWebFormIsland
-            form={{ questions: [] }}
-            formXml={GEOMETRY_POINT_PICKER_XML}
-            workspaceId=""
-            formApiBase=""
-            mapPicker
-            mapPickerSelectRef={mapSelectRef}
-            onMapSelected={handleMapSelected}
-            onSubmitted={() => {}}
-            onError={() => {}}
-          />
+        <div
+          className="geopoint-picker-map"
+          ref={mapRef}
+          onPointerDown={startPan}
+          onPointerMove={movePan}
+          onPointerUp={endPan}
+          onPointerCancel={endPan}
+          onLostPointerCapture={endPan}
+          onClick={pointFromClick}
+        >
+          <StreetMapTiles mapRef={mapRef} mapView={mapView} />
+          {selectedPoint ? (
+            <span
+              className="geopoint-picker-marker"
+              aria-label={`Selected point ${selectedPoint.latitude}, ${selectedPoint.longitude}`}
+              style={{ left: markerLeft, top: markerTop }}
+            />
+          ) : null}
+          <div className="geopoint-map-controls" aria-label="Map controls" onPointerDown={(event) => event.stopPropagation()}>
+            <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(1); }} aria-label="Zoom in">+</button>
+            <button type="button" onClick={(event) => { event.stopPropagation(); changeZoom(-1); }} aria-label="Zoom out">−</button>
+          </div>
+          <small className="location-reference-attribution">© OpenStreetMap contributors</small>
         </div>
         <div className="geopoint-picker-actions">
-          <small className="muted">Move the point on the map, then select it.</small>
-          <button className="primary" type="button" onClick={() => mapSelectRef.current?.()}><MapPin size={16} /> Select</button>
+          <label className="geopoint-picker-label">
+            <span>Choice label</span>
+            <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="e.g. Primary health centre" />
+          </label>
+          <div className="geopoint-picker-action-buttons">
+            <small className="muted">{selectedPoint ? `${selectedPoint.latitude.toFixed(6)}, ${selectedPoint.longitude.toFixed(6)}` : "Click the map to place a point."}</small>
+            <button className="primary" type="button" disabled={!selectedPoint} onClick={addPoint}><MapPin size={16} /> Add point</button>
+          </div>
         </div>
       </div>
     </div>
@@ -12956,7 +13513,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   );
 }
 
-function EntryViewer({ workspaceId, entryId }) {
+function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
   const [form, setForm] = useState(null);
   const [entry, setEntry] = useState(null);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading entry..." });
@@ -12966,27 +13523,31 @@ function EntryViewer({ workspaceId, entryId }) {
   useEffect(() => {
     async function loadEntry() {
       try {
+        const formRouteId = accessCode
+          ? encodeURIComponent(normalizeAccessCodeInput(accessCode))
+          : encodeURIComponent(workspaceRouteId(workspaceId));
+        const formApiBase = accessCode ? `/api/public/forms/${formRouteId}` : `/api/forms/${formRouteId}`;
         const [formData, entryData] = await Promise.all([
-          requestJson(`/api/forms/${encodeURIComponent(workspaceId)}`),
-          requestJson(`/api/forms/${encodeURIComponent(workspaceId)}/entries`)
+          requestJson(formApiBase),
+          requestJson(`${formApiBase}/entries`)
         ]);
-        const found = (entryData.entries || []).find((item) => item.id === entryId);
+        const found = (entryData.entries || []).find((item) => String(item.id || "") === String(entryId));
         if (!found) throw new Error("Entry not found.");
         const draft = normalizeFormDraft(formData.draft);
         if (formData.hasXml) {
-          const xmlData = await requestJson(`/api/forms/${encodeURIComponent(workspaceId)}/xml`);
+          const xmlData = await requestJson(`${formApiBase}/xml`);
           setForm(parseXFormXml(xmlData.xml, draft));
         } else {
           setForm(draft);
         }
         setEntry(found);
-        setStatus({ kind: "ok", message: formData.hasXml ? "Read-only XML entry view" : "Read-only entry view" });
+        setStatus({ kind: "ok", message: accessCode ? "Read-only public entry view" : formData.hasXml ? "Read-only XML entry view" : "Read-only entry view" });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
     loadEntry();
-  }, [workspaceId, entryId]);
+  }, [accessCode, workspaceId, entryId]);
 
   if (!form || !entry) {
     return (
@@ -13016,6 +13577,7 @@ function EntryViewer({ workspaceId, entryId }) {
             value={answers[questionAnswerKey(question)] || ""}
             forceDisabled
             workspaceId={workspaceId}
+            accessCode={accessCode}
           />
         ))}
       </main>
