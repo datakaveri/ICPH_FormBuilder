@@ -35,9 +35,16 @@ self.addEventListener("activate", (event) => {
   ]));
 });
 
+// Keycloak (/auth), the API (/api) and the file server (/files) share this
+// domain but are not part of the app. Leave them to the network, or a click on
+// "Log in" would get the cached app page instead of the Keycloak login.
+const PASS_THROUGH_PREFIXES = ["/auth/", "/api/", "/files/"];
+
 self.addEventListener("fetch", (event) => {
   const request = event.request;
-  if (request.method !== "GET" || new URL(request.url).origin !== self.location.origin) return;
+  const url = new URL(request.url);
+  if (request.method !== "GET" || url.origin !== self.location.origin) return;
+  if (PASS_THROUGH_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))) return;
   if (request.mode === "navigate") {
     event.respondWith(openApp(request));
     return;
