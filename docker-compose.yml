@@ -50,6 +50,49 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
 
+  # File server: stores uploaded files in Azure Blob Storage. Locally it uses the
+  # Azurite emulator below; in Azure it authenticates with a managed identity
+  # (see file-server/README.md).
+  file-server:
+    build: ./file-server
+    image: "${ICPH_FILE_SERVER_IMAGE:-ghcr.io/datakaveri/icph-file-server:latest}"
+    init: true
+    ports:
+      - "127.0.0.1:8790:8790"
+    environment:
+      NODE_ENV: production
+      FILE_SERVER_PORT: "8790"
+      FILE_SERVER_MAX_UPLOAD_MB: "100"
+      # Azurite's fixed, publicly documented development account key; not a secret.
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+      AZURE_STORAGE_CONTAINER: icph-files
+      KEYCLOAK_URL: http://keycloak:8080                                   # token keys, inside compose network
+      KEYCLOAK_PUBLIC_URL: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}" # browser-visible URL (token issuer)
+      KEYCLOAK_REALM: icph
+      KEYCLOAK_CLIENT_ID: icph-form-builder
+    depends_on:
+      azurite:
+        condition: service_started
+      keycloak-setup:
+        condition: service_completed_successfully
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # Local Azure Blob Storage emulator for the file server.
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.33.0
+    command: azurite-blob --blobHost 0.0.0.0 --location /data --skipApiVersionCheck --loose
+    ports:
+      - "127.0.0.1:10000:10000"
+    volumes:
+      - azurite-data:/data
+    restart: unless-stopped
+
   # Form builder database. The app creates and migrates its schema on start.
   postgres:
     image: postgres:17
@@ -98,5 +141,6 @@ services:
     command: python /setup/setup.py
 
 volumes:
+  azurite-data:
   keycloak-data:
   postgres-data:

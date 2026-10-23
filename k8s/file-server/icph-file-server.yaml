@@ -1,0 +1,109 @@
+# ICPH file server (ServiceAccount + Deployment + Service).
+# Stores uploaded files in Azure Blob Storage, authenticating with a
+# user-assigned managed identity through AKS Workload Identity: no storage keys
+# or secrets are kept in the cluster.
+#
+# Every line marked "CHANGE:" needs a value for your cluster.
+#
+# Before deploying (commands in file-server/README.md):
+#   1. The AKS cluster has the OIDC issuer and Workload Identity enabled.
+#   2. A storage account and the blob container named below exist.
+#   3. A user-assigned managed identity has "Storage Blob Data Contributor" on
+#      that container (not the whole account).
+#   4. That identity has a federated credential for
+#      system:serviceaccount:icph:icph-file-server (namespace:name below).
+#
+# Routing: the file server is not yet in ingress.yaml / httproute.yaml. Add a
+# /files path to Service icph-file-server, port 8790, when the app starts using it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: icph-file-server
+  namespace: icph                                   # CHANGE: namespace
+  annotations:
+    # CHANGE: client ID of the user-assigned managed identity.
+    azure.workload.identity/client-id: "00000000-0000-0000-0000-000000000000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: icph-file-server
+  namespace: icph                                   # CHANGE: namespace
+  labels:
+    app: icph-file-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: icph-file-server
+  template:
+    metadata:
+      labels:
+        app: icph-file-server
+        # Makes AKS inject the federated token and AZURE_* variables that
+        # DefaultAzureCredential uses.
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: icph-file-server
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000                             # the image's "node" user
+      containers:
+        - name: icph-file-server
+          image: ghcr.io/datakaveri/icph-file-server:latest   # CHANGE: image tag
+          imagePullPolicy: Always
+          env:
+            - name: FILE_SERVER_PORT
+              value: "8790"
+            - name: FILE_SERVER_MAX_UPLOAD_MB
+              value: "100"
+            - name: AZURE_STORAGE_ACCOUNT_URL
+              value: "https://<account>.blob.core.windows.net"   # CHANGE: storage account
+            - name: AZURE_STORAGE_CONTAINER
+              value: "icph-files"                   # CHANGE: container, if different
+            - name: KEYCLOAK_URL
+              # CHANGE: same values as the form builder API (k8s/api).
+              value: "https://keycloak.example.org/auth"
+            - name: KEYCLOAK_PUBLIC_URL
+              value: "https://keycloak.example.org/auth"
+            - name: KEYCLOAK_REALM
+              value: "icph"
+            - name: KEYCLOAK_CLIENT_ID
+              value: "icph-form-builder"
+          ports:
+            - name: http
+              containerPort: 8790
+          readinessProbe:
+            httpGet:
+              path: /health                         # also checks the blob container is reachable
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:                                # CHANGE: size for your workload
+            requests:
+              cpu: "100m"
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: icph-file-server
+  namespace: icph                                   # CHANGE: namespace
+  labels:
+    app: icph-file-server
+spec:
+  type: ClusterIP
+  selector:
+    app: icph-file-server
+  ports:
+    - name: http
+      port: 8790
+      targetPort: http
