@@ -11,11 +11,13 @@ import {
   BarChart3,
   Calendar,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clock,
   ClipboardList,
+  CloudDownload,
   Copy,
   Download,
   ExternalLink,
@@ -1386,6 +1388,8 @@ async function listOfflineFormPackages() {
       title: item.title || form.title,
       formId: item.formId || form.formId,
       cachedAt: item.cachedAt,
+      version: item.version || "",
+      sizeBytes: (item.attachments || []).reduce((total, attachment) => total + (attachment?.blob?.size || 0), String(item.xml || "").length),
       primaryIdentifierVariable: identifier,
       participantIdentifierVariable: identifier,
       displayFields: entryCsvQuestions(form).map((question) => {
@@ -1419,9 +1423,84 @@ async function listOfflineCheckpointMetadata() {
   return new Map(Array.from(checkpointsByCode.entries()).map(([code, checkpoints]) => [code, Array.from(checkpoints.values())]));
 }
 
+function formatStorageSize(bytes = 0) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 async function saveOfflineFormPackage(formPackage) {
   await offlineStoreRequest("formPackages", "readwrite", (store) => store.put(formPackage));
   try { await navigator.storage?.persist?.(); } catch {}
+}
+
+// Everything needed to fill a form with no connection: its definition, XML,
+// attachments (images, choice CSVs) and the choice lists read from them.
+async function fetchFormPackage(formApiBase, accessCode = "") {
+  const data = await requestJson(formApiBase);
+  const draft = normalizeFormDraft(data.draft);
+  let xml = "";
+  let publishedForm = draft;
+  if (data.hasXml) {
+    const xmlData = await requestJson(`${formApiBase}/xml`);
+    xml = xmlData.xml || "";
+    publishedForm = parseXFormXml(xml, draft);
+  }
+  const attachmentList = await requestJson(`${formApiBase}/attachments`).catch(() => ({ attachments: [] }));
+  const attachments = (await Promise.all((attachmentList.attachments || []).map(async (attachment) => {
+    try {
+      const response = await fetch(`${API_BASE}${formApiBase}/attachments/${encodeURIComponent(attachment.fileName)}`, { headers: await authHeaders() });
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      return { fileName: attachment.fileName, contentType: blob.type || attachment.contentType || "application/octet-stream", blob };
+    } catch { return null; }
+  }))).filter(Boolean);
+  const cachedByName = new Map(attachments.map((item) => [resourceFileKey(item.fileName), item.blob]));
+  const externalChoices = {};
+  for (const question of publishedForm.questions || []) {
+    if (question.type !== "select_one_from_file" && question.type !== "select_multiple_from_file") continue;
+    const blob = cachedByName.get(resourceFileKey(String(question.listName || "").trim()));
+    if (blob) externalChoices[question.name] = parseCsvRows(await blob.text());
+  }
+  return {
+    data,
+    formPackage: {
+      accessCode: normalizeAccessCodeInput(accessCode),
+      title: publishedForm.title || data.title || "ICPH Form",
+      formId: publishedForm.formId || data.formId || "",
+      version: data.offlineVersion || "",
+      draft,
+      form: publishedForm,
+      xml,
+      externalChoices,
+      attachments,
+      cachedAt: Date.now()
+    }
+  };
+}
+
+// The "download for offline" action: saves a form on this device without opening it.
+async function downloadOfflineFormPackage(accessCode) {
+  const code = normalizeAccessCodeInput(accessCode);
+  const { formPackage } = await fetchFormPackage(`/api/public/forms/${encodeURIComponent(code)}`, code);
+  await saveOfflineFormPackage(formPackage);
+  await offlineCryptoKey();
+  return formPackage;
+}
+
+async function removeOfflineFormPackage(accessCode) {
+  await offlineStoreRequest("formPackages", "readwrite", (store) => store.delete(normalizeAccessCodeInput(accessCode)));
+}
+
+// Drops saved forms the server no longer offers for filling (deleted,
+// unpublished, locked or given a new code while this device was offline).
+// Unsynced entries and checkpoints stay in the queue; only the form goes.
+async function removeWithdrawnOfflineForms(liveAccessCodes) {
+  const live = new Set(Array.from(liveAccessCodes, (code) => normalizeAccessCodeInput(code)));
+  const saved = await listOfflineFormPackages();
+  const withdrawn = saved.filter((item) => !live.has(normalizeAccessCodeInput(item.accessCode)));
+  for (const item of withdrawn) await removeOfflineFormPackage(item.accessCode);
+  return withdrawn;
 }
 
 function offlineDraftId(accessCode, workspaceId = "", entryId = "") {
@@ -3918,6 +3997,10 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
   const [statisticsForm, setStatisticsForm] = useState(null);
   const [statisticsLoading, setStatisticsLoading] = useState(false);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading published forms..." });
+  // Forms saved on this device, by form code, and the codes downloading now.
+  const [savedForms, setSavedForms] = useState({});
+  const [downloadingCodes, setDownloadingCodes] = useState([]);
+  const updatingSavedFormsRef = useRef(false);
   const selectedForm = forms.find((item) => item.respondentAccessCode === selectedCode) || forms[0] || null;
   const fieldAgentEntryIds = useMemo(
     () => (selectedForm?.entries || []).map((entry) => String(entry.id || "")).filter(Boolean),
@@ -3930,6 +4013,9 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     || selectedForm?.primaryIdentifierVariable
     || fieldAgentDisplayOptions[0]?.name
     || "";
+  const notSavedCodes = forms
+    .map((item) => normalizeAccessCodeInput(item.respondentAccessCode))
+    .filter((code) => code && !savedForms[code]);
   const fieldAgentAllSelected = fieldAgentEntryIds.length > 0 && selectedEntryIds.length === fieldAgentEntryIds.length;
 
   async function refreshFieldAgentSyncStatus(sync = false) {
@@ -3941,9 +4027,79 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     }
   }
 
+  async function refreshSavedForms() {
+    const items = await listOfflineFormPackages().catch(() => []);
+    setSavedForms(Object.fromEntries(items.map((item) => [normalizeAccessCodeInput(item.accessCode), item])));
+    return items;
+  }
+
+  async function downloadForms(codes, { quiet = false } = {}) {
+    const pending = codes.map(normalizeAccessCodeInput).filter(Boolean);
+    if (!pending.length) return;
+    setDownloadingCodes((current) => Array.from(new Set([...current, ...pending])));
+    const failed = [];
+    for (const code of pending) {
+      try {
+        await downloadOfflineFormPackage(code);
+      } catch (error) {
+        failed.push(code);
+        if (error?.status === 404) await removeOfflineFormPackage(code).catch(() => {});
+      } finally {
+        setDownloadingCodes((current) => current.filter((item) => item !== code));
+        await refreshSavedForms();
+      }
+    }
+    if (quiet) return;
+    if (failed.length) {
+      setStatus({ kind: "error", message: `Could not download ${failed.join(", ")} for offline use. Check the connection and try again.` });
+    } else {
+      setStatus({ kind: "ok", message: pending.length === 1 ? "Form saved on this device." : `${pending.length} forms saved on this device.` });
+    }
+  }
+
+  async function removeSavedForm(formItem) {
+    const code = normalizeAccessCodeInput(formItem?.respondentAccessCode);
+    if (!code || !window.confirm(`Remove "${formItem.title || code}" from this device? You will need a connection to fill it again.`)) return;
+    try {
+      await removeOfflineFormPackage(code);
+      await refreshSavedForms();
+      // Offline, the list is the saved forms themselves, so the removed one goes too.
+      if (!isOnline()) setForms((current) => current.filter((item) => normalizeAccessCodeInput(item.respondentAccessCode) !== code));
+      setStatus({ kind: "ok", message: "Removed from this device." });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  // Runs on each fresh list from the server: forms it no longer offers leave
+  // this device, and saved forms that changed on the server are downloaded again.
+  async function reconcileSavedForms(liveForms) {
+    const withdrawn = await removeWithdrawnOfflineForms(liveForms.map((item) => item.respondentAccessCode)).catch(() => []);
+    const saved = await refreshSavedForms();
+    if (withdrawn.length) {
+      const names = withdrawn.map((item) => item.title || item.accessCode).join(", ");
+      setStatus({ kind: "ok", message: `Removed from this device because they are no longer available: ${names}.` });
+    }
+    if (updatingSavedFormsRef.current) return;
+    const savedByCode = new Map(saved.map((item) => [normalizeAccessCodeInput(item.accessCode), item]));
+    const stale = liveForms
+      .filter((item) => {
+        const savedItem = savedByCode.get(normalizeAccessCodeInput(item.respondentAccessCode));
+        return savedItem && item.offlineVersion && savedItem.version !== item.offlineVersion;
+      })
+      .map((item) => item.respondentAccessCode);
+    if (!stale.length) return;
+    updatingSavedFormsRef.current = true;
+    try {
+      await downloadForms(stale, { quiet: true });
+    } finally {
+      updatingSavedFormsRef.current = false;
+    }
+  }
+
   // Forms saved on this device, shown while the server's list loads or in its place.
   async function showSavedForms(message = "") {
-    const savedForms = await listOfflineFormPackages().catch(() => []);
+    const savedForms = await refreshSavedForms();
     const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
     if (!savedForms.length) return false;
     setForms(savedForms.map((item) => {
@@ -3982,6 +4138,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
         ? current
         : nextForms[0]?.respondentAccessCode || "");
       setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
+      void reconcileSavedForms(nextForms);
     } catch (error) {
       if (error?.status === 401 && await onSessionExpired?.()) return;
       if (!(await showSavedForms("Offline. Saved forms are available; entries will load when you reconnect."))) {
@@ -4119,23 +4276,72 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
         <aside className="field-agent-sidebar">
           <div className="section-head compact">
             <h2>Forms</h2>
-            <button className="secondary small" onClick={loadPublishedForms}>
-              <RefreshCw size={14} /> Refresh
-            </button>
+            <div className="field-agent-list-actions">
+              {online && notSavedCodes.length ? (
+                <button className="secondary small" type="button" disabled={downloadingCodes.length > 0} onClick={() => downloadForms(notSavedCodes)}>
+                  <CloudDownload size={14} /> Download all
+                </button>
+              ) : null}
+              <button className="secondary small" onClick={loadPublishedForms}>
+                <RefreshCw size={14} /> Refresh
+              </button>
+            </div>
           </div>
           <div className="field-agent-form-list">
-            {forms.map((formItem) => (
-              <button
-                key={formItem.respondentAccessCode}
-                className={`field-agent-form-button ${selectedForm?.respondentAccessCode === formItem.respondentAccessCode ? "active" : ""}`}
-                onClick={() => setSelectedCode(formItem.respondentAccessCode)}
-                type="button"
-              >
-                <span>{formItem.title}</span>
-                <strong>{formItem.respondentAccessCode}</strong>
-                <small>{formItem.entryCount || 0} entries · {formItem.checkpointCount || 0} incomplete</small>
-              </button>
-            ))}
+            {forms.map((formItem) => {
+              const code = normalizeAccessCodeInput(formItem.respondentAccessCode);
+              const saved = savedForms[code];
+              const downloading = downloadingCodes.includes(code);
+              const outdated = Boolean(saved && online && formItem.offlineVersion && saved.version !== formItem.offlineVersion);
+              let offlineState = "none";
+              if (downloading) offlineState = "downloading";
+              else if (outdated) offlineState = "outdated";
+              else if (saved) offlineState = "saved";
+              return (
+                <div
+                  key={formItem.respondentAccessCode}
+                  className={`field-agent-form-item ${selectedForm?.respondentAccessCode === formItem.respondentAccessCode ? "active" : ""}`}
+                >
+                  <button
+                    className="field-agent-form-button"
+                    onClick={() => setSelectedCode(formItem.respondentAccessCode)}
+                    type="button"
+                  >
+                    <span>{formItem.title}</span>
+                    <strong>{formItem.respondentAccessCode}</strong>
+                    <small>{formItem.entryCount || 0} entries · {formItem.checkpointCount || 0} incomplete</small>
+                    {saved ? (
+                      <small className="offline-saved-note">
+                        {outdated ? "Update available" : `Saved offline ${new Date(saved.cachedAt).toLocaleDateString()}`} · {formatStorageSize(saved.sizeBytes)}
+                      </small>
+                    ) : null}
+                  </button>
+                  <button
+                    className={`offline-toggle offline-toggle-${offlineState}`}
+                    type="button"
+                    disabled={downloading || (!saved && !online)}
+                    title={{
+                      none: online ? "Download for offline use" : "Connect to download for offline use",
+                      downloading: "Downloading...",
+                      outdated: "Download the latest version",
+                      saved: "Saved on this device. Click to remove."
+                    }[offlineState]}
+                    aria-label={{
+                      none: `Download ${formItem.title} for offline use`,
+                      downloading: `Downloading ${formItem.title}`,
+                      outdated: `Update ${formItem.title} on this device`,
+                      saved: `Remove ${formItem.title} from this device`
+                    }[offlineState]}
+                    onClick={() => (offlineState === "saved" ? removeSavedForm(formItem) : downloadForms([code]))}
+                  >
+                    {offlineState === "downloading" ? <RefreshCw size={18} className="spin" /> : null}
+                    {offlineState === "outdated" ? <RefreshCw size={18} /> : null}
+                    {offlineState === "saved" ? <CheckCircle2 size={18} /> : null}
+                    {offlineState === "none" ? <CloudDownload size={18} /> : null}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </aside>
         <section className="field-agent-main">
@@ -4303,9 +4509,24 @@ function RespondentAccessPanel({ initialCode = "", onOpen }) {
 
   useEffect(() => {
     let cancelled = false;
-    listOfflineFormPackages().then((items) => {
-      if (!cancelled) setOfflineForms(items);
-    }).catch(() => {});
+    (async () => {
+      const items = await listOfflineFormPackages().catch(() => []);
+      if (cancelled) return;
+      setOfflineForms(items);
+      if (!isOnline() || !items.length) return;
+      // Online again: forget saved forms the server no longer offers.
+      const withdrawn = [];
+      for (const item of items) {
+        try {
+          await requestJson(`/api/public/forms/${encodeURIComponent(item.accessCode)}`);
+        } catch (error) {
+          if (error?.status !== 404) continue;
+          await removeOfflineFormPackage(item.accessCode).catch(() => {});
+          withdrawn.push(item.accessCode);
+        }
+      }
+      if (!cancelled && withdrawn.length) setOfflineForms(items.filter((item) => !withdrawn.includes(item.accessCode)));
+    })();
     return () => { cancelled = true; };
   }, []);
 
@@ -13153,44 +13374,14 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         let loadedOffline = false;
         let packageCached = false;
         try {
-          data = await requestJson(formApiBase);
-          draft = normalizeFormDraft(data.draft);
-          if (data.hasXml) {
-            const xmlData = await requestJson(`${formApiBase}/xml`);
-            xml = xmlData.xml || "";
-            publishedForm = parseXFormXml(xml, draft);
-          } else {
-            publishedForm = draft;
-          }
-          const attachmentList = await requestJson(`${formApiBase}/attachments`).catch(() => ({ attachments: [] }));
-          attachmentBlobs = await Promise.all((attachmentList.attachments || []).map(async (attachment) => {
-            try {
-              const response = await fetch(`${API_BASE}${formApiBase}/attachments/${encodeURIComponent(attachment.fileName)}`);
-              if (!response.ok) return null;
-              const blob = await response.blob();
-              return { fileName: attachment.fileName, contentType: blob.type || attachment.contentType || "application/octet-stream", blob };
-            } catch { return null; }
-          }));
-          const cachedByName = new Map(attachmentBlobs.filter(Boolean).map((item) => [resourceFileKey(item.fileName), item.blob]));
-          const externalQuestions = (publishedForm.questions || []).filter((question) => (
-            question.type === "select_one_from_file" || question.type === "select_multiple_from_file"
-          ));
-          for (const question of externalQuestions) {
-            const fileName = String(question.listName || "").trim();
-            const blob = cachedByName.get(resourceFileKey(fileName));
-            if (blob) externalChoiceData[question.name] = parseCsvRows(await blob.text());
-          }
-          const savedPackage = {
-            accessCode: normalizeAccessCodeInput(accessCode),
-            title: publishedForm.title || data.title || "ICPH Form",
-            formId: publishedForm.formId || data.formId || "",
-            draft,
-            form: publishedForm,
-            xml,
-            externalChoices: externalChoiceData,
-            attachments: attachmentBlobs.filter(Boolean),
-            cachedAt: Date.now()
-          };
+          const fetched = await fetchFormPackage(formApiBase, accessCode);
+          const savedPackage = fetched.formPackage;
+          data = fetched.data;
+          draft = savedPackage.draft;
+          publishedForm = savedPackage.form;
+          xml = savedPackage.xml;
+          attachmentBlobs = savedPackage.attachments;
+          externalChoiceData = savedPackage.externalChoices;
           try {
             await saveOfflineFormPackage(savedPackage);
             await offlineCryptoKey();
@@ -13198,6 +13389,11 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           } catch {}
           cachedPackageRef.current = savedPackage;
         } catch (networkError) {
+          // The server no longer offers this form: drop the copy saved on this device.
+          if (networkError.status === 404 && accessCode) {
+            await removeOfflineFormPackage(accessCode).catch(() => {});
+            throw new Error("This form is no longer available. It may have been deleted or closed by an admin.");
+          }
           if (networkError.status && networkError.status < 500) throw networkError;
           const savedPackage = accessCode ? await loadOfflineFormPackage(accessCode) : null;
           if (!savedPackage) {

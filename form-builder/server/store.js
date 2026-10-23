@@ -55,7 +55,8 @@ const formSummaryColumns = `
   f.terminology->>'entityCount' AS terminology_entity_count,
   (SELECT count(*)::int FROM entries e WHERE e.workspace_id = f.workspace_id) AS entry_count,
   (SELECT count(*)::int FROM fhir_bundles b WHERE b.workspace_id = f.workspace_id) AS fhir_bundle_count,
-  ARRAY(SELECT a.file_name FROM form_attachments a WHERE a.workspace_id = f.workspace_id) AS attachment_names`;
+  ARRAY(SELECT a.file_name FROM form_attachments a WHERE a.workspace_id = f.workspace_id) AS attachment_names,
+  (SELECT max(a.updated_at) FROM form_attachments a WHERE a.workspace_id = f.workspace_id) AS attachments_updated_at`;
 
 export async function formSummary(workspaceId) {
   return (await query(`SELECT ${formSummaryColumns} FROM forms f WHERE f.workspace_id = $1`, [workspaceId])).rows[0] || null;

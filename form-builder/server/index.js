@@ -1107,6 +1107,7 @@ async function loadPublicForm(value) {
     title: found.draft?.title || meta.title,
     formId: found.draft?.formId || meta.formId,
     hasXml: meta.hasXml,
+    offlineVersion: meta.offlineVersion,
     draft: found.draft
   };
 }
@@ -1136,6 +1137,7 @@ async function listPublicForms() {
       })),
       updatedAt: item.updatedAt,
       publishedAt: item.publishedAt,
+      offlineVersion: item.offlineVersion,
       responseSettings: item.responseSettings,
       displayFields: dataHeadersForDraft(draft).map((name) => {
         const question = (draft.questions || []).find((item) => item.name === name);
@@ -2907,6 +2909,16 @@ async function workspaceMeta(workspaceId) {
   return formMeta(cleanId, await store.formSummary(cleanId), await readFolders());
 }
 
+// Changes whenever anything a device saves for offline filling changes: the
+// form itself (draft, XML) or its attachments. Devices compare it to the copy
+// they hold to know when that copy is out of date.
+function offlineVersionFor(row, attachmentNames) {
+  const stamps = [row?.updated_at, row?.attachments_updated_at]
+    .filter(Boolean)
+    .map((value) => new Date(value).getTime());
+  return `${stamps.length ? Math.max(...stamps) : 0}.${attachmentNames.length}`;
+}
+
 async function formMeta(cleanId, row, folders) {
   let draft = row?.draft || null;
   const hasXml = Boolean(row?.has_xml);
@@ -2960,6 +2972,7 @@ async function formMeta(cleanId, row, folders) {
     hasVersionChanges: formHasVersionChanges(draft || {}),
     attachmentCount: attachmentNames.length,
     attachmentNames,
+    offlineVersion: offlineVersionFor(row, attachmentNames),
     updatedAt: draft?.updatedAt || (row?.updated_at || new Date(0)).toISOString(),
     importedFrom: draft?.importedFrom || null,
     metaFormLink: draft?.metaFormLink || null,
