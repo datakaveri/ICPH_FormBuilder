@@ -67,7 +67,7 @@ const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
 configureAuth(API_BASE);
 configureConnectivity(API_BASE);
 const OFFLINE_DATABASE_NAME = "icph-offline-v1";
-const OFFLINE_DATABASE_VERSION = 1;
+const OFFLINE_DATABASE_VERSION = 2;
 let odkWebFormsLoader = null;
 let offlineDatabasePromise = null;
 let submissionSyncPromise = null;
@@ -1302,6 +1302,8 @@ function openOfflineDatabase() {
         if (!database.objectStoreNames.contains("offlineDrafts")) database.createObjectStore("offlineDrafts", { keyPath: "id" });
         if (!database.objectStoreNames.contains("submissionQueue")) database.createObjectStore("submissionQueue", { keyPath: "id" });
         if (!database.objectStoreNames.contains("meta")) database.createObjectStore("meta", { keyPath: "key" });
+        // Last entry list seen from the server for each saved form, so it can be shown offline.
+        if (!database.objectStoreNames.contains("entryCache")) database.createObjectStore("entryCache", { keyPath: "id" });
       };
       request.onsuccess = () => {
         request.result.onversionchange = () => {
@@ -1490,6 +1492,88 @@ async function downloadOfflineFormPackage(accessCode) {
 
 async function removeOfflineFormPackage(accessCode) {
   await offlineStoreRequest("formPackages", "readwrite", (store) => store.delete(normalizeAccessCodeInput(accessCode)));
+  await removeCachedFormEntries(accessCode).catch(() => {});
+}
+
+// Synced entries of a saved form, kept encrypted on this device for offline viewing.
+async function saveCachedFormEntries(accessCode, entries = []) {
+  const id = normalizeAccessCodeInput(accessCode);
+  if (!id) return;
+  await saveEncryptedOfflineRecord("entryCache", { id, entries, createdAt: Date.now() });
+}
+
+async function readCachedFormEntries() {
+  const records = await readEncryptedOfflineRecords("entryCache");
+  return new Map(records.map((record) => [normalizeAccessCodeInput(record.id), record.entries || []]));
+}
+
+async function removeCachedFormEntries(accessCode) {
+  await offlineStoreRequest("entryCache", "readwrite", (store) => store.delete(normalizeAccessCodeInput(accessCode)));
+}
+
+// Same leaf-value reading the server does for ODK submissions.
+function answersFromInstanceXml(instanceXml) {
+  const answers = {};
+  const decode = (value) => String(value || "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+  const leafPattern = /<([A-Za-z_][\w:.-]*)(?:\s[^>]*)?>([^<]*)<\/\1>/g;
+  let match = null;
+  while ((match = leafPattern.exec(String(instanceXml || "")))) {
+    const name = match[1].replace(/^.*:/, "");
+    if (!name || name === "instanceID" || name === "deprecatedID") continue;
+    const value = decode(match[2]).trim();
+    if (answers[name] === undefined) answers[name] = value;
+    else if (Array.isArray(answers[name])) answers[name].push(value);
+    else answers[name] = [answers[name], value];
+  }
+  return answers;
+}
+
+// Submitted entries still waiting in the sync queue, by form code.
+async function listQueuedEntriesByCode() {
+  const records = await readEncryptedOfflineRecords("submissionQueue");
+  const byCode = new Map();
+  for (const record of records) {
+    const match = String(record.path || "").match(/\/api\/public\/forms\/([^/]+)\/(entries|odk-submissions)$/);
+    let code = "";
+    try { code = normalizeAccessCodeInput(decodeURIComponent(match?.[1] || "")); } catch {}
+    if (!code) continue;
+    const payload = record.payload || {};
+    const answers = match[2] === "odk-submissions" ? answersFromInstanceXml(payload.instanceXml) : (payload.answers || {});
+    const list = byCode.get(code) || [];
+    list.push({
+      id: record.id,
+      clientSubmissionId: record.id,
+      entryId: String(payload.entryId || ""),
+      submittedAt: new Date(record.createdAt || Date.now()).toISOString(),
+      answers,
+      instanceName: String(answers.instanceName || "").trim(),
+      pendingSync: true
+    });
+    byCode.set(code, list);
+  }
+  return byCode;
+}
+
+// Adds queued entries to a form's entry list. Ones the server already has are
+// skipped; queued edits replace the entry they change.
+function mergeQueuedEntries(entries = [], queued = []) {
+  const syncedIds = new Set(entries.map((entry) => entry.clientSubmissionId).filter(Boolean));
+  const merged = [...entries];
+  for (const item of queued) {
+    if (syncedIds.has(item.clientSubmissionId)) continue;
+    const index = item.entryId ? merged.findIndex((entry) => String(entry.id || "") === item.entryId) : -1;
+    if (index >= 0) {
+      merged[index] = { ...merged[index], answers: item.answers, updatedAt: item.submittedAt, pendingSync: true };
+    } else {
+      merged.push(item);
+    }
+  }
+  return merged;
 }
 
 // Drops saved forms the server no longer offers for filling (deleted,
@@ -1555,6 +1639,7 @@ async function syncPendingSubmissions(onlyId = "") {
         if (!error.status || error.status >= 500) break;
       }
     }
+    if (syncedIds.length) notifyCollectionChanged();
     return { syncedIds, errors, pendingCount: await getPendingSubmissionCount() };
   })().finally(() => { submissionSyncPromise = null; });
   return submissionSyncPromise;
@@ -4001,9 +4086,11 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
   const [savedForms, setSavedForms] = useState({});
   const [downloadingCodes, setDownloadingCodes] = useState([]);
   const updatingSavedFormsRef = useRef(false);
+  const formsRef = useRef(forms);
+  formsRef.current = forms;
   const selectedForm = forms.find((item) => item.respondentAccessCode === selectedCode) || forms[0] || null;
   const fieldAgentEntryIds = useMemo(
-    () => (selectedForm?.entries || []).map((entry) => String(entry.id || "")).filter(Boolean),
+    () => (selectedForm?.entries || []).filter((entry) => !entry.pendingSync).map((entry) => String(entry.id || "")).filter(Boolean),
     [selectedForm?.entries]
   );
   const fieldAgentSelectedSet = useMemo(() => new Set(selectedEntryIds), [selectedEntryIds]);
@@ -4022,6 +4109,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     try {
       const result = sync && isOnline() ? await syncPendingSubmissions() : null;
       setPendingSyncCount(result?.pendingCount ?? await getPendingSubmissionCount());
+      if (result?.syncedIds?.length) await loadPublishedForms();
     } catch {
       setPendingSyncCount(await getPendingSubmissionCount());
     }
@@ -4041,6 +4129,8 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     for (const code of pending) {
       try {
         await downloadOfflineFormPackage(code);
+        const listed = formsRef.current.find((item) => normalizeAccessCodeInput(item.respondentAccessCode) === code);
+        if (listed) await saveCachedFormEntries(code, (listed.entries || []).filter((entry) => !entry.pendingSync)).catch(() => {});
       } catch (error) {
         failed.push(code);
         if (error?.status === 404) await removeOfflineFormPackage(code).catch(() => {});
@@ -4101,12 +4191,18 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
   async function showSavedForms(message = "") {
     const savedForms = await refreshSavedForms();
     const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
+    const cachedEntries = await readCachedFormEntries().catch(() => new Map());
+    const queuedEntries = await listQueuedEntriesByCode().catch(() => new Map());
     if (!savedForms.length) return false;
     setForms(savedForms.map((item) => {
-      const checkpoints = localCheckpoints.get(normalizeAccessCodeInput(item.accessCode)) || [];
+      const code = normalizeAccessCodeInput(item.accessCode);
+      const checkpoints = localCheckpoints.get(code) || [];
+      const entries = mergeQueuedEntries(cachedEntries.get(code) || [], queuedEntries.get(code) || []);
       return {
         ...item,
         respondentAccessCode: item.accessCode,
+        entries,
+        entryCount: entries.length,
         checkpoints,
         checkpointCount: checkpoints.length
       };
@@ -4123,6 +4219,12 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     try {
       const data = await requestJson("/api/public/forms");
       const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
+      const queuedEntries = await listQueuedEntriesByCode().catch(() => new Map());
+      const savedCodes = new Set((await listOfflineFormPackages().catch(() => [])).map((item) => normalizeAccessCodeInput(item.accessCode)));
+      for (const form of data.forms || []) {
+        const code = normalizeAccessCodeInput(form.respondentAccessCode);
+        if (savedCodes.has(code)) void saveCachedFormEntries(code, form.entries || []).catch(() => {});
+      }
       const nextForms = (data.forms || []).map((form) => {
         const serverCheckpoints = form.checkpoints || [];
         const localOnly = (localCheckpoints.get(normalizeAccessCodeInput(form.respondentAccessCode)) || [])
@@ -4131,7 +4233,8 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
               === String(localCheckpoint.primaryIdentifierValue || "").trim().toLowerCase()
           )));
         const checkpoints = [...serverCheckpoints, ...localOnly];
-        return { ...form, checkpoints, checkpointCount: checkpoints.length };
+        const entries = mergeQueuedEntries(form.entries || [], queuedEntries.get(normalizeAccessCodeInput(form.respondentAccessCode)) || []);
+        return { ...form, entries, entryCount: entries.length, checkpoints, checkpointCount: checkpoints.length };
       });
       setForms(nextForms);
       setSelectedCode((current) => nextForms.some((item) => item.respondentAccessCode === current)
@@ -4141,7 +4244,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
       void reconcileSavedForms(nextForms);
     } catch (error) {
       if (error?.status === 401 && await onSessionExpired?.()) return;
-      if (!(await showSavedForms("Offline. Saved forms are available; entries will load when you reconnect."))) {
+      if (!(await showSavedForms("Offline. Showing forms and entries saved on this device."))) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
@@ -4175,6 +4278,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
       if (event?.type === "storage" && event.key !== "icph_collection_changed_at") return;
       if (event?.type === "message" && event.data?.type !== "icph:collection-changed") return;
       loadPublishedForms();
+      refreshFieldAgentSyncStatus(false);
     }
     window.addEventListener("storage", handleCollectionSignal);
     window.addEventListener("message", handleCollectionSignal);
@@ -4418,16 +4522,17 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                         checked={fieldAgentAllSelected}
                         onChange={(event) => setSelectedEntryIds(event.target.checked ? fieldAgentEntryIds : [])}
                       />
-                      <span>{selectedEntryIds.length}/{selectedForm.entries.length} selected</span>
+                      <span>{selectedEntryIds.length}/{fieldAgentEntryIds.length} selected</span>
                       <button className="secondary small danger-action" disabled={!selectedEntryIds.length || status.kind === "busy"} onClick={() => deleteFieldAgentEntries(selectedEntryIds)}>
                         <Trash2 size={14} /> Delete
                       </button>
                     </label>
                     {selectedForm.entries.slice().reverse().map((entry) => (
-                      <div className="entry-row field-agent-entry-row" key={entry.id}>
+                      <div className={`entry-row field-agent-entry-row ${entry.pendingSync ? "entry-pending-sync" : ""}`} key={entry.id}>
                         <label className="row-check">
                           <input
                             type="checkbox"
+                            disabled={entry.pendingSync}
                             checked={fieldAgentSelectedSet.has(String(entry.id || ""))}
                             onChange={(event) => toggleFieldAgentEntry(String(entry.id || ""), event.target.checked)}
                           />
@@ -4440,6 +4545,13 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                             {entry.updatedAt ? ` · updated ${new Date(entry.updatedAt).toLocaleString()}` : ""}
                           </small>
                         </div>
+                        {entry.pendingSync ? (
+                          <div className="entry-actions">
+                            <span className="pending-sync-badge" title="Saved on this device. It will sync when the connection is available.">
+                              <RefreshCw size={13} /> Not synced yet
+                            </span>
+                          </div>
+                        ) : (
                         <div className="entry-actions">
                           {selectedForm.responseSettings?.allowResponseEdits ? (
                             <button className="secondary small icon-text-button" onClick={() => openFillForm(selectedForm, entry.id)} title="Edit entry">
@@ -4453,6 +4565,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                             <Trash2 size={14} /> Delete
                           </button>
                         </div>
+                        )}
                       </div>
                     ))}
                   </div>
