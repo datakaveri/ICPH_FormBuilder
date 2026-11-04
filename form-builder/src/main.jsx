@@ -972,9 +972,47 @@ function xlsEndsWith(value, suffix) {
   return String(value ?? "").endsWith(String(suffix ?? ""));
 }
 
+const POSIX_REGEX_CLASSES = {
+  alnum: "A-Za-z0-9",
+  alpha: "A-Za-z",
+  blank: " \\t",
+  digit: "0-9",
+  lower: "a-z",
+  punct: "!-\\/:-@\\[-`{-~",
+  space: "\\s",
+  upper: "A-Z",
+  xdigit: "0-9A-Fa-f"
+};
+
+// ODK Collect accepts POSIX classes such as [:digit:] (alone or inside
+// brackets); JavaScript reads them as plain character sets, so expand them.
+function posixRegexPattern(pattern) {
+  let result = "";
+  let inClass = false;
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index];
+    if (char === "\\") {
+      result += pattern.slice(index, index + 2);
+      index += 1;
+      continue;
+    }
+    const posix = pattern.slice(index).match(/^\[:([a-z]+):\]/);
+    if (posix && POSIX_REGEX_CLASSES[posix[1]]) {
+      const range = POSIX_REGEX_CLASSES[posix[1]];
+      result += inClass ? range : `[${range}]`;
+      index += posix[0].length - 1;
+      continue;
+    }
+    if (char === "[" && !inClass) inClass = true;
+    else if (char === "]" && inClass) inClass = false;
+    result += char;
+  }
+  return result;
+}
+
 function xlsRegex(value, pattern) {
   try {
-    return new RegExp(String(pattern ?? "")).test(String(value ?? ""));
+    return new RegExp(posixRegexPattern(String(pattern ?? ""))).test(String(value ?? ""));
   } catch {
     return false;
   }
@@ -1118,10 +1156,16 @@ function findRepeatEnd(questions, startIndex) {
 function expandRepeatQuestions(form, answers = {}) {
   const questions = form?.questions || [];
   const expanded = [];
+  // relevant expressions of the groups enclosing the current row
+  const groupRelevants = [];
   function appendRange(start, end, repeatPath = [], repeatMeta = []) {
     for (let index = start; index < end; index += 1) {
       const question = questions[index];
-      if (question.type === "end_group" || question.type === "end_repeat") continue;
+      if (question.type === "end_group") {
+        groupRelevants.pop();
+        continue;
+      }
+      if (question.type === "end_repeat") continue;
       if (question.type === "begin_repeat") {
         const endIndex = findRepeatEnd(questions, index);
         const count = repeatCountValue(question, answers, repeatPath);
@@ -1155,8 +1199,10 @@ function expandRepeatQuestions(form, answers = {}) {
         demographicData: Boolean(lastRepeat?.demographicData),
         prefixWithParentIdentifier: Boolean(lastRepeat?.prefixWithParentIdentifier),
         demographicParentIdentifierVariable: lastRepeat?.demographicParentIdentifierVariable || "",
-        demographicRepeatName: lastRepeat?.demographicRepeatName || "member"
+        demographicRepeatName: lastRepeat?.demographicRepeatName || "member",
+        groupRelevants: groupRelevants.filter(Boolean)
       });
+      if (question.type === "begin_group") groupRelevants.push(question.relevant?.trim() || "");
     }
   }
   appendRange(0, questions.length);
@@ -1183,12 +1229,15 @@ function normalizeStoredRepeatAnswers(form, answers = {}) {
 
 function visibleQuestions(form, answers) {
   const calculated = computeCalculatedAnswers(form, answers);
-  return expandRepeatQuestions(form, calculated).filter((question) => (
-    question.type !== "end_group" &&
-    question.type !== "end_repeat" &&
-    !NON_DISPLAY_TYPES.has(question.type) &&
-    isQuestionVisible(question, questionScopedAnswers(question, calculated))
-  ));
+  return expandRepeatQuestions(form, calculated).filter((question) => {
+    const scopedAnswers = questionScopedAnswers(question, calculated);
+    return question.type !== "end_group" &&
+      question.type !== "end_repeat" &&
+      !NON_DISPLAY_TYPES.has(question.type) &&
+      // A hidden group hides everything inside it, as in ODK.
+      (question.groupRelevants || []).every((relevant) => Boolean(evaluateXlsExpression(relevant, scopedAnswers))) &&
+      isQuestionVisible(question, scopedAnswers);
+  });
 }
 
 function groupedQuestionPages(questions = []) {
@@ -1209,7 +1258,8 @@ function validateAnswers(form, answers, questionSubset = null) {
   const calculated = computeCalculatedAnswers(form, answers);
   const errors = [];
   for (const question of questionSubset || visibleQuestions(form, calculated)) {
-    if (question.type === "note" || question.type === "calculate") continue;
+    // Group headers hold no answer; "required" on a group row means nothing in ODK.
+    if (question.type === "note" || question.type === "calculate" || STRUCTURAL_TYPES.has(question.type)) continue;
     const scopedAnswers = questionScopedAnswers(question, calculated);
     const answerKey = questionAnswerKey(question);
     const value = calculated[answerKey] ?? "";
@@ -1217,11 +1267,11 @@ function validateAnswers(form, answers, questionSubset = null) {
       ? Boolean(evaluateXlsExpression(question.requiredExpression, scopedAnswers, value))
       : false;
     if ((question.required || requiredByExpression) && String(value).trim() === "") {
-      errors.push(`${question.label || question.name}${question.repeatIndex ? ` (repeat ${question.repeatIndex})` : ""} is required.`);
+      errors.push(`${plainFormText(question.label) || question.name}${question.repeatIndex ? ` (repeat ${question.repeatIndex})` : ""} is required.`);
     }
     if (String(value).trim() && question.constraint?.trim()) {
       const ok = Boolean(evaluateXlsExpression(question.constraint, scopedAnswers, value));
-      if (!ok) errors.push(question.constraintMessage || `${question.label || question.name} does not satisfy its constraint.`);
+      if (!ok) errors.push(plainFormText(question.constraintMessage) || `${plainFormText(question.label) || question.name} does not satisfy its constraint.`);
     }
   }
   return { answers: calculated, errors };
@@ -1958,7 +2008,32 @@ function xformInputType(bindType) {
   return "text";
 }
 
-function parseXFormChoices(control, choiceInstances) {
+// Multilingual XForms keep labels, hints and messages in <itext> and only
+// reference them (jr:itext('id')). Read them from the default translation.
+function xformItextTexts(all) {
+  const translations = all.filter((node) => xmlLocalName(node) === "translation");
+  const translation = translations.find((node) => isTrueExpression(node.getAttribute("default"))) || translations[0];
+  const texts = new Map();
+  for (const text of directChildren(translation, "text")) {
+    const values = directChildren(text, "value");
+    const value = values.find((node) => !node.getAttribute("form")) || values[0];
+    texts.set(text.getAttribute("id"), value?.textContent?.trim() || "");
+  }
+  return texts;
+}
+
+function itextValue(texts, reference) {
+  const match = String(reference || "").match(/^\s*jr:itext\(\s*['"]([^'"]+)['"]\s*\)\s*$/);
+  return match ? texts.get(match[1]) || "" : "";
+}
+
+function xformText(element, name, texts) {
+  const node = directChild(element, name);
+  if (!node) return "";
+  return itextValue(texts, node.getAttribute("ref")) || node.textContent?.trim() || "";
+}
+
+function parseXFormChoices(control, choiceInstances, texts) {
   const itemset = directChild(control, "itemset");
   if (itemset) {
     const nodeset = itemset.getAttribute("nodeset") || "";
@@ -1968,7 +2043,7 @@ function parseXFormChoices(control, choiceInstances) {
   return directChildren(control, "item").map((item, index) => ({
     id: `xml_choice_${index + 1}`,
     name: childText(item, "value"),
-    label: childText(item, "label")
+    label: xformText(item, "label", texts)
   }));
 }
 
@@ -1992,6 +2067,7 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
     }
   }
 
+  const texts = xformItextTexts(all);
   const choiceInstances = new Map();
   for (const instance of instances.filter((node) => node.getAttribute("id"))) {
     const id = instance.getAttribute("id");
@@ -1999,7 +2075,7 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
     const choices = directChildren(root, "item").map((item, index) => ({
       id: `${id}_${index + 1}`,
       name: childText(item, "name") || childText(item, "value"),
-      label: childText(item, "label") || childText(item, "name") || childText(item, "value")
+      label: childText(item, "label") || texts.get(childText(item, "itextId")) || childText(item, "name") || childText(item, "value")
     }));
     choiceInstances.set(id, choices);
   }
@@ -2008,12 +2084,13 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
   for (const bind of all.filter((node) => xmlLocalName(node) === "bind")) {
     const name = leafNameFromPath(bind.getAttribute("nodeset"));
     if (!name) continue;
+    const constraintMessage = attrBySuffix(bind, "constraintMsg");
     binds.set(name, {
       type: bind.getAttribute("type") || "",
       required: bind.getAttribute("required") || "",
       relevant: bind.getAttribute("relevant") || "",
       constraint: bind.getAttribute("constraint") || "",
-      constraintMessage: attrBySuffix(bind, "constraintMsg"),
+      constraintMessage: itextValue(texts, constraintMessage) || constraintMessage,
       calculation: bind.getAttribute("calculate") || "",
       readOnly: bind.getAttribute("readonly") || ""
     });
@@ -2039,7 +2116,7 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
           : controlType === "trigger"
             ? "acknowledge"
             : xformInputType(bind.type);
-    const options = type === "select_one" || type === "select_multiple" ? parseXFormChoices(control, choiceInstances).map((option) => {
+    const options = type === "select_one" || type === "select_multiple" ? parseXFormChoices(control, choiceInstances, texts).map((option) => {
       const fallbackOption = (fallbackQuestion.options || []).find((item) => String(item.name || "") === String(option.name || ""));
       return fallbackOption ? { ...option, translations: fallbackOption.translations || {} } : option;
     }) : [];
@@ -2047,8 +2124,8 @@ function parseXFormXml(xmlText, fallbackDraft = {}) {
       id: `xml_${index + 1}_${name}`,
       type,
       name,
-      label: childText(control, "label") || name,
-      hint: childText(control, "hint"),
+      label: xformText(control, "label", texts) || name,
+      hint: xformText(control, "hint", texts),
       required: isTrueExpression(bind.required),
       requiredExpression,
       relevant: bind.relevant || "",
@@ -2402,16 +2479,24 @@ function withTranslatedValue(source = {}, key, value, language = "secondary") {
   };
 }
 
+// XLSForm text may carry HTML formatting such as <span style="color:...">.
+// Respondent screens show only the words; the stored text keeps the markup.
+function plainFormText(value) {
+  const text = String(value ?? "");
+  if (!/[<&]/.test(text)) return text;
+  return new DOMParser().parseFromString(text, "text/html").body.textContent || "";
+}
+
 function localizedQuestion(question = {}, key, languageMode = "default") {
-  return languageMode === "secondary"
+  return plainFormText(languageMode === "secondary"
     ? translatedValue(question, key) || question[key] || ""
-    : question[key] || "";
+    : question[key] || "");
 }
 
 function localizedOption(option = {}, key, languageMode = "default") {
-  return languageMode === "secondary"
+  return plainFormText(languageMode === "secondary"
     ? translatedValue(option, key) || option[key] || ""
-    : option[key] || "";
+    : option[key] || "");
 }
 
 function downloadBlob(blob, fileName) {
@@ -13872,11 +13957,12 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
             </button>
           ) : null}
           {hasGroupSections && !isLastGroupPage ? (
-            <button className="primary" disabled={!canAdvanceGroup} onClick={advanceGroupPage}>
+            // Stay clickable while invalid so the click can report what is missing.
+            <button className="primary" disabled={!form || status.kind === "busy"} onClick={advanceGroupPage}>
               Next <ChevronRight size={16} />
             </button>
           ) : (
-            <button className="primary" disabled={!canSubmit} onClick={submitEntry}>
+            <button className="primary" disabled={!form || status.kind === "busy"} onClick={submitEntry}>
               <Check size={16} /> {editingEntry ? "Update" : "Submit"}
             </button>
           )}
