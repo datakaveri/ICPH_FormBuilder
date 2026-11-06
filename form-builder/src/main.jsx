@@ -49,6 +49,9 @@ import {
   ZoomOut,
   X
 } from "lucide-react";
+// Bundled with the app so the type also renders offline in the field.
+import "@fontsource-variable/public-sans/wght.css";
+import "@fontsource/dm-serif-display/latin-400.css";
 import "./styles.css";
 import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, configureAuth, confirmSessionEnded, initAuth, login, logout, reconfirmSession } from "./auth.js";
 import { configureConnectivity, isOnline, onConnectivityChange, reportNetworkFailure, reportNetworkSuccess } from "./connectivity.js";
@@ -4675,7 +4678,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
         />
       ) : null}
       <footer className="builder-footer home-footer" aria-label="Page status">
-        <div className={`footer-status ${status.kind}`}>
+        <div key={`${status.kind}:${status.message}`} className={`footer-status ${status.kind}`} role={status.kind === "error" ? "alert" : "status"}>
           {status.kind === "ok" ? <Check size={16} /> : status.kind === "busy" ? <RefreshCw size={16} /> : <AlertCircle size={16} />}
           <span>{status.message || "Ready."}</span>
         </div>
@@ -6780,7 +6783,7 @@ function HomePage({
         </section>
       </main>
       <footer className="builder-footer home-footer" aria-label="Page status">
-        <div className={`footer-status ${status.kind}`}>
+        <div key={`${status.kind}:${status.message}`} className={`footer-status ${status.kind}`} role={status.kind === "error" ? "alert" : "status"}>
           {status.kind === "ok" ? <Check size={16} /> : status.kind === "busy" ? <RefreshCw size={16} /> : <AlertCircle size={16} />}
           <span>{status.message || "Ready."}</span>
         </div>
@@ -7791,6 +7794,15 @@ function BuilderPage(props) {
               onClick={() => setActiveStage(stage.id)}
             >
               {stage.label}
+              {activeStage === stage.id ? (
+                // Five stacked segments of one outline make the moving
+                // border: long faint tail first, short dark head last.
+                <svg className="stage-tab-snake" aria-hidden="true" focusable="false">
+                  {[0, 1, 2, 3, 4].map((segment) => (
+                    <rect key={segment} width="100%" height="100%" rx="9" pathLength="100" />
+                  ))}
+                </svg>
+              ) : null}
             </button>
           ))}
         </nav>
@@ -8163,7 +8175,7 @@ function BuilderFooter({
 	  const footerKind = activeStage === "terminology" && (reviewIssue || publishDisabledReason) ? "error" : status.kind;
 	  return (
 	    <footer className="builder-footer" aria-label="Page actions">
-	      <div className={`footer-status ${footerKind}`}>
+	      <div key={`${footerKind}:${footerMessage}`} className={`footer-status ${footerKind}`} role={footerKind === "error" ? "alert" : "status"}>
 	        {footerKind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
 	        <span>{footerMessage}</span>
 	      </div>
@@ -13943,7 +13955,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
 	        ) : null}
 	      </main>
 	      {!useOdkViewer ? <footer className="respondent-footer">
-	        <div className={`footer-status ${status.kind}`}>
+	        <div key={`${status.kind}:${status.message}`} className={`footer-status ${status.kind}`} role={status.kind === "error" ? "alert" : "status"}>
 	          {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
 	          <span>{status.message || (hasGroupSections && !isLastGroupPage ? (canAdvanceGroup ? "Ready to continue." : pageValidation.errors[0] || "Complete this section.") : (canSubmit ? "Ready to submit." : answerValidation.errors[0] || "Ready"))}</span>
 	        </div>
@@ -14043,6 +14055,69 @@ function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
     </div>
   );
 }
+
+// Mac Dock style magnification for the header buttons and the footer action
+// dock: the button under the pointer grows most, its neighbours less with
+// distance, and the row widens so nothing overlaps. Mouse/trackpad only, and
+// off when the device asks for reduced motion.
+const DOCK_SELECTOR = ".footer-actions, .topbar-actions";
+const DOCK_MAX_SCALE = 1.22;
+// Text buttons vary in width, so growth is also capped in pixels.
+const DOCK_MAX_GROWTH_PX = 36;
+const DOCK_REACH_PX = 150;
+
+function enableDockMagnification() {
+  const canHover = window.matchMedia("(hover: hover) and (pointer: fine)");
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let activeDock = null;
+  let pointerX = 0;
+  let frame = 0;
+
+  function resetDock(dock) {
+    dock?.querySelectorAll(":scope > button").forEach((button) => {
+      button.style.removeProperty("--dock-scale");
+      button.style.removeProperty("margin-inline");
+    });
+  }
+
+  function magnify() {
+    frame = 0;
+    if (!activeDock) return;
+    activeDock.querySelectorAll(":scope > button").forEach((button) => {
+      const rect = button.getBoundingClientRect();
+      // Distance to the button's nearest edge, so the hovered one is always at full size.
+      const distance = Math.max(0, Math.abs(pointerX - (rect.left + rect.width / 2)) - rect.width / 2);
+      const closeness = Math.max(0, 1 - distance / DOCK_REACH_PX);
+      const maxScale = Math.min(DOCK_MAX_SCALE, 1 + DOCK_MAX_GROWTH_PX / button.offsetWidth);
+      // Smoothstep falloff, like the Dock: a rounded bump rather than a peak.
+      // Disabled buttons stay put so they do not look clickable.
+      const scale = button.disabled ? 1 : 1 + (maxScale - 1) * closeness * closeness * (3 - 2 * closeness);
+      button.style.setProperty("--dock-scale", scale.toFixed(3));
+      // offsetWidth ignores the transform, so this is the button's real width.
+      button.style.marginInline = `${((scale - 1) * button.offsetWidth) / 2}px`;
+    });
+  }
+
+  document.addEventListener("pointermove", (event) => {
+    const dock = canHover.matches && !reducedMotion.matches && event.target instanceof Element
+      ? event.target.closest(DOCK_SELECTOR)
+      : null;
+    if (dock !== activeDock) {
+      resetDock(activeDock);
+      activeDock = dock;
+    }
+    if (!dock) return;
+    pointerX = event.clientX;
+    if (!frame) frame = requestAnimationFrame(magnify);
+  });
+
+  document.documentElement.addEventListener("mouseleave", () => {
+    resetDock(activeDock);
+    activeDock = null;
+  });
+}
+
+enableDockMagnification();
 
 createRoot(document.getElementById("root")).render(
   <AppErrorBoundary>

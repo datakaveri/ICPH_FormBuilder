@@ -1,15 +1,18 @@
 /* ICPH Forms login theme. Colours and type match the form builder app. */
 :root {
-  --icph-primary: #1f6feb;
-  --icph-primary-dark: #174ea6;
-  --icph-primary-light: #3b82f6;
-  --icph-soft: #eef4ff;
-  --icph-page-bg: #f5f7fb;
-  --icph-text: #172033;
-  --icph-muted: #5c667a;
-  --icph-line: #d9e1ee;
+  --icph-primary: #5e4499;
+  --icph-primary-dark: #4a3482;
+  --icph-primary-light: #6d52aa;
+  --icph-soft: #f3effa;
+  --icph-page-bg: #ece9f4;
+  --icph-text: #1d2445;
+  --icph-muted: #5d6178;
+  --icph-line: #ddd8ea;
   --icph-danger: #b42318;
-  --icph-ok: #16794c;
+  --icph-ok: #0b7d72;
+  --icph-frame: #1b2a57;
+  --icph-frame-raised: #24356b;
+  --icph-stripe: linear-gradient(90deg, #5e4499 0 25%, #1bb5a6 25% 50%, #edb327 50% 75%, #f58220 75% 100%);
   --icph-navbar-height: 73px;
   --icph-font: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -30,7 +33,10 @@ body {
   min-height: 100vh;
   font-family: var(--icph-font);
   color: var(--icph-text);
-  background: linear-gradient(160deg, #f6f8fc 0%, var(--icph-page-bg) 38%, var(--icph-soft) 72%, rgba(31, 111, 235, 0.18) 100%);
+  background:
+    radial-gradient(circle at 12% 18%, rgba(94, 68, 153, 0.18), transparent 42%),
+    radial-gradient(circle at 88% 82%, rgba(27, 181, 166, 0.16), transparent 40%),
+    var(--icph-page-bg);
   background-attachment: fixed;
 }
 
@@ -44,8 +50,10 @@ body {
 .icph-navbar {
   width: 100%;
   min-height: var(--icph-navbar-height);
-  background: rgba(255, 255, 255, 0.92);
-  border-bottom: 1px solid var(--icph-line);
+  background:
+    var(--icph-stripe) bottom / 100% 4px no-repeat,
+    linear-gradient(115deg, var(--icph-frame) 0%, var(--icph-frame-raised) 70%, #2e2f72 100%);
+  border-bottom: 0;
   box-sizing: border-box;
 }
 
@@ -61,10 +69,14 @@ body {
   box-sizing: border-box;
 }
 
+/* Both logos are drawn for white paper, so they sit on a white plate. */
 .header-logos {
   display: flex;
   align-items: center;
   gap: 16px;
+  padding: 6px 14px;
+  border-radius: 10px;
+  background: #fff;
 }
 
 .logo-container,
@@ -79,11 +91,11 @@ body {
 }
 
 .logo-image-icph {
-  height: 56px;
+  height: 46px;
 }
 
 .logo-image-cdpg {
-  height: 38px;
+  height: 30px;
 }
 
 .logo-divider {
@@ -94,7 +106,7 @@ body {
 
 .header-back-link,
 .login-pf a.header-back-link {
-  color: var(--icph-text);
+  color: rgba(255, 255, 255, 0.86);
   font-size: 14px;
   font-weight: 500;
   text-decoration: none;
@@ -102,7 +114,7 @@ body {
 }
 
 .login-pf a.header-back-link:hover {
-  color: var(--icph-primary) !important;
+  color: #fff !important;
 }
 
 /* Centered auth card */

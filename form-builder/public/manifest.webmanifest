@@ -6,8 +6,8 @@
   "start_url": "/respondent",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#f5f7fb",
-  "theme_color": "#1f6feb",
+  "background_color": "#f7f6fb",
+  "theme_color": "#5e4499",
   "orientation": "any",
   "icons": [
     {
