@@ -34,8 +34,9 @@ and FHIR handoff depend on them.
 Open:
 
 ```text
-http://localhost:5173
+http://localhost:5174
 ```
+
 
 The React app calls the local API server at:
 
@@ -54,11 +55,11 @@ docker compose up --build
 Open:
 
 ```text
-http://localhost:5173
+http://localhost:5174
 ```
 
 The Docker image builds the frontend first and then serves the built app on
-port `5173`. The compose setup stores forms and submissions in its `postgres`
+port `5174`. The compose setup stores forms and submissions in its `postgres`
 service.
 
 ## Current Flow
@@ -102,7 +103,7 @@ that row plus the rows that reference it:
 | Partly filled responses | `respondent_checkpoints` |
 | FHIR bundles | `fhir_bundles` |
 
-Folders, barcode assignments and MetaForm primary identifiers are in `folders`,
+Projects, barcode assignments and MetaForm primary identifiers are stored in `folders`,
 `participant_registry` and `meta_form_primaries`. The schema is in
 `server/migrations/`; the server applies new migration files on start. Set
 `DATABASE_URL` to point the API at a database.

@@ -1,6 +1,6 @@
 // SQL for everything the form builder persists. Callers pass and receive the
 // same plain objects the API serves; see migrations/001_init.sql for the schema.
-import { query } from "./db.js";
+import { query, withTransaction } from "./db.js";
 
 const json = (value) => JSON.stringify(value);
 const iso = (value) => (value instanceof Date ? value.toISOString() : value || null);
@@ -11,6 +11,7 @@ function folderFromRow(row) {
   return {
     id: row.id,
     name: row.name,
+    ownerUserId: row.owner_user_id || "",
     primaryIdentifierVariable: row.primary_identifier_variable,
     participantIdentifierMode: row.participant_identifier_mode,
     participantIdentifierVariable: row.participant_identifier_variable,
@@ -20,12 +21,250 @@ function folderFromRow(row) {
 }
 
 export async function listFolders() {
-  return (await query("SELECT * FROM folders ORDER BY created_at, id")).rows.map(folderFromRow);
+  const folders = (await query("SELECT * FROM folders ORDER BY created_at, id")).rows.map(folderFromRow);
+  if (!folders.length) return folders;
+  const members = (await query("SELECT folder_id, user_id, username, access_role, added_at FROM folder_members ORDER BY lower(username)")).rows;
+  const byFolder = new Map(folders.map((folder) => [folder.id, []]));
+  for (const member of members) {
+    byFolder.get(member.folder_id)?.push({
+      userId: member.user_id,
+      username: member.username,
+      accessRole: member.access_role,
+      addedAt: iso(member.added_at)
+    });
+  }
+  return folders.map((folder) => ({ ...folder, members: byFolder.get(folder.id) || [] }));
 }
 
-export async function insertFolder(id, name) {
-  const result = await query("INSERT INTO folders (id, name) VALUES ($1, $2) RETURNING *", [id, name]);
+export async function insertFolder(id, name, ownerUserId) {
+  const result = await query(
+    "INSERT INTO folders (id, name, project_code, owner_user_id) VALUES ($1, $2, $1, $3) RETURNING *",
+    [id, name, ownerUserId]
+  );
   return folderFromRow(result.rows[0]);
+}
+
+export async function folderAccess(folderId, userId) {
+  return (await query(
+    `SELECT 1 FROM folders f
+      WHERE f.id = $1 AND (f.owner_user_id = $2 OR EXISTS (
+        SELECT 1 FROM folder_members m WHERE m.folder_id = f.id AND m.user_id = $2 AND m.access_role = 'admin'
+      ))`,
+    [folderId, userId]
+  )).rowCount > 0;
+}
+
+export async function folderOwner(folderId) {
+  return (await query("SELECT owner_user_id FROM folders WHERE id = $1", [folderId])).rows[0]?.owner_user_id || "";
+}
+
+export async function addFolderMember(folderId, { userId, username, accessRole, addedBy }) {
+  if (!userId || !username || !addedBy) {
+    throw new Error("Sharing a project requires a valid user ID, username, and owner ID.");
+  }
+  if (!["admin", "field-agent"].includes(accessRole)) {
+    throw new Error("Sharing a project requires a valid account role.");
+  }
+  await query(
+    `INSERT INTO folder_members (folder_id, user_id, username, access_role, added_by) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (folder_id, user_id) DO UPDATE SET username = EXCLUDED.username, access_role = EXCLUDED.access_role`,
+    [folderId, userId, username, accessRole, addedBy]
+  );
+}
+
+export async function updateFolderMemberRole(folderId, userId, accessRole) {
+  await query("UPDATE folder_members SET access_role = $3 WHERE folder_id = $1 AND user_id = $2", [folderId, userId, accessRole]);
+}
+
+export async function updateFolderMemberRolesForUser(userId, accessRole) {
+  await query("UPDATE folder_members SET access_role = $2 WHERE user_id = $1 AND access_role <> $2", [userId, accessRole]);
+}
+
+export async function removeFolderMember(folderId, username) {
+  await query("DELETE FROM folder_members WHERE folder_id = $1 AND lower(username) = lower($2)", [folderId, username]);
+}
+
+export async function workspaceAccess(workspaceId, userId) {
+  return (await query(
+    `SELECT 1 FROM forms f
+      WHERE f.workspace_id = $1 AND (
+        (f.folder_id IS NULL AND f.owner_user_id = $2) OR
+        (f.folder_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM folders d WHERE d.id = f.folder_id AND (
+              d.owner_user_id = $2 OR EXISTS (
+              SELECT 1 FROM folder_members m WHERE m.folder_id = d.id AND m.user_id = $2 AND m.access_role = 'admin'
+            )
+          )
+        ))
+      )`,
+    [workspaceId, userId]
+  )).rowCount > 0;
+}
+
+export async function fieldAgentWorkspaceAccess(workspaceId, userId) {
+  return (await query(
+    `SELECT 1 FROM forms f
+      WHERE f.workspace_id = $1
+        AND f.xml IS NOT NULL
+        AND f.respondent_access_code IS NOT NULL
+        AND coalesce((f.draft->>'collectionLocked')::boolean, false) = false
+        AND (
+          EXISTS (SELECT 1 FROM form_field_agents a WHERE a.workspace_id = f.workspace_id AND a.user_id = $2)
+          OR EXISTS (
+            SELECT 1 FROM folders d JOIN folder_members m ON m.folder_id = d.id
+             WHERE d.id = f.folder_id AND m.user_id = $2 AND m.access_role = 'field-agent'
+          )
+        )`,
+    [workspaceId, userId]
+  )).rowCount > 0;
+}
+
+export async function folderFieldAgentAccess(workspaceId, userId) {
+  return (await query(
+    `SELECT 1 FROM forms f JOIN folder_members m ON m.folder_id = f.folder_id
+      WHERE f.workspace_id = $1 AND m.user_id = $2 AND m.access_role = 'field-agent'`,
+    [workspaceId, userId]
+  )).rowCount > 0;
+}
+
+export async function listFormFieldAgents(workspaceId) {
+  return (await query(
+    `SELECT user_id AS "userId", username,
+            CASE WHEN bool_or(access_type = 'folder') THEN 'folder' ELSE 'form' END AS "accessType",
+            min(added_at) AS "addedAt"
+       FROM (
+         SELECT a.user_id, a.username, 'form'::text AS access_type, a.added_at
+           FROM form_field_agents a WHERE a.workspace_id = $1
+         UNION ALL
+         SELECT m.user_id, m.username, 'folder'::text AS access_type, m.added_at
+           FROM forms f JOIN folder_members m ON m.folder_id = f.folder_id
+          WHERE f.workspace_id = $1 AND m.access_role = 'field-agent'
+       ) grants
+      GROUP BY user_id, username ORDER BY lower(username)`,
+    [workspaceId]
+  )).rows.map((row) => ({ ...row, addedAt: iso(row.addedAt) }));
+}
+
+export async function addFormFieldAgent(workspaceId, { userId, username, addedBy }) {
+  if (!userId || !username || !addedBy) throw new Error("Sharing a form requires a valid field agent and owner.");
+  await query(
+    `INSERT INTO form_field_agents (workspace_id, user_id, username, added_by) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (workspace_id, user_id) DO UPDATE SET username = EXCLUDED.username`,
+    [workspaceId, userId, username, addedBy]
+  );
+}
+
+export async function removeFormFieldAgent(workspaceId, username) {
+  await query("DELETE FROM form_field_agents WHERE workspace_id = $1 AND lower(username) = lower($2)", [workspaceId, username]);
+}
+
+export async function workspaceAdminIds(workspaceId) {
+  return (await query(
+    `SELECT DISTINCT user_id FROM (
+       SELECT owner_user_id AS user_id FROM forms WHERE workspace_id = $1
+       UNION ALL
+       SELECT m.user_id FROM forms f JOIN folder_members m ON m.folder_id = f.folder_id
+        WHERE f.workspace_id = $1 AND m.access_role = 'admin'
+     ) admins WHERE user_id IS NOT NULL`,
+    [workspaceId]
+  )).rows.map((row) => row.user_id);
+}
+
+export async function folderAdminIds(folderId) {
+  return (await query(
+    `SELECT user_id FROM (
+       SELECT owner_user_id AS user_id FROM folders WHERE id = $1
+       UNION
+       SELECT user_id FROM folder_members WHERE folder_id = $1 AND access_role = 'admin'
+     ) admins WHERE user_id IS NOT NULL`,
+    [folderId]
+  )).rows.map((row) => row.user_id);
+}
+
+export async function workspaceFieldAgentIds(workspaceId) {
+  return (await query(
+    `SELECT DISTINCT user_id FROM (
+       SELECT user_id FROM form_field_agents WHERE workspace_id = $1
+       UNION ALL
+       SELECT m.user_id FROM forms f JOIN folder_members m ON m.folder_id = f.folder_id
+        WHERE f.workspace_id = $1 AND m.access_role = 'field-agent'
+     ) agents`,
+    [workspaceId]
+  )).rows.map((row) => row.user_id);
+}
+
+export async function addNotification({
+  id, userId, eventType, title, message, details = {}, subjectId = '', batchId = '', dedupeKey = ''
+}) {
+  if (!userId) return null;
+  return withTransaction(async () => {
+    if (dedupeKey) {
+      await query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${userId}:${dedupeKey}`]);
+      const existing = (await query(
+        `SELECT n.id, n.item_count AS "itemCount"
+           FROM notification_dedupe_keys d JOIN user_notifications n ON n.id = d.notification_id
+          WHERE d.user_id = $1 AND d.dedupe_key = $2`,
+        [userId, dedupeKey]
+      )).rows[0];
+      if (existing) return existing;
+    }
+    const result = batchId
+      ? await query(
+        `INSERT INTO user_notifications (id, user_id, event_type, title, message, details, subject_id, batch_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (user_id, event_type, subject_id, batch_id) WHERE batch_id <> ''
+         DO UPDATE SET item_count = user_notifications.item_count + 1,
+           message = EXCLUDED.message, details = EXCLUDED.details, created_at = now(), read_at = NULL
+         RETURNING id, item_count AS "itemCount"`,
+        [id, userId, eventType, title, message, json(details), subjectId, batchId]
+      )
+      : await query(
+        `INSERT INTO user_notifications (id, user_id, event_type, title, message, details, subject_id, dedupe_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL) RETURNING id, item_count AS "itemCount"`,
+        [id, userId, eventType, title, message, json(details), subjectId]
+      );
+    const notification = result.rows[0];
+    if (dedupeKey) await query(
+      `INSERT INTO notification_dedupe_keys (user_id, dedupe_key, notification_id)
+       VALUES ($1, $2, $3) ON CONFLICT (user_id, dedupe_key) DO NOTHING`,
+      [userId, dedupeKey, notification.id]
+    );
+    return notification;
+  });
+}
+
+export async function listNotifications(userId, limit = 100) {
+  return (await query(
+    `SELECT id, event_type AS "eventType", title, message, details,
+            subject_id AS "subjectId", item_count AS "itemCount",
+            created_at AS "createdAt", read_at AS "readAt"
+       FROM user_notifications WHERE user_id = $1
+      ORDER BY created_at DESC LIMIT $2`,
+    [userId, Math.max(1, Math.min(Number(limit) || 100, 200))]
+  )).rows;
+}
+
+export async function unreadNotificationCount(userId) {
+  return Number((await query(
+    "SELECT count(*)::int AS count FROM user_notifications WHERE user_id = $1 AND read_at IS NULL",
+    [userId]
+  )).rows[0]?.count || 0);
+}
+
+export async function markNotificationsRead(userId, ids = null) {
+  if (Array.isArray(ids) && ids.length) {
+    await query(
+      "UPDATE user_notifications SET read_at = now() WHERE user_id = $1 AND id = ANY($2::text[]) AND read_at IS NULL",
+      [userId, ids]
+    );
+  } else {
+    await query("UPDATE user_notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL", [userId]);
+  }
+}
+
+export async function claimLegacyOwnership(userId) {
+  await query("UPDATE folders SET owner_user_id = $1 WHERE owner_user_id IS NULL", [userId]);
+  await query("UPDATE forms SET owner_user_id = $1 WHERE owner_user_id IS NULL AND folder_id IS NULL", [userId]);
 }
 
 export async function updateFolderIdentifiers(id, { primaryIdentifierVariable, participantIdentifierMode, participantIdentifierVariable }) {
@@ -47,14 +286,17 @@ export async function deleteFolder(id) {
 // ---- forms -----------------------------------------------------------------
 
 const formSummaryColumns = `
-  f.workspace_id, f.draft, f.updated_at,
+  f.workspace_id, f.folder_id, f.owner_user_id, f.draft, f.updated_at,
+  f.deleted_at, f.deleted_by_user_id, f.deleted_by_username,
   f.xml IS NOT NULL AS has_xml,
   f.xlsx IS NOT NULL AS has_xlsx,
   f.terminology IS NOT NULL AS has_terminology,
   f.terminology->>'status' AS terminology_status,
   f.terminology->>'entityCount' AS terminology_entity_count,
   (SELECT count(*)::int FROM entries e WHERE e.workspace_id = f.workspace_id) AS entry_count,
+  (SELECT count(*)::int FROM respondent_checkpoints c WHERE c.workspace_id = f.workspace_id) AS checkpoint_count,
   (SELECT count(*)::int FROM fhir_bundles b WHERE b.workspace_id = f.workspace_id) AS fhir_bundle_count,
+  (SELECT count(*)::int FROM form_field_agents a WHERE a.workspace_id = f.workspace_id) AS field_agent_count,
   ARRAY(SELECT a.file_name FROM form_attachments a WHERE a.workspace_id = f.workspace_id) AS attachment_names,
   (SELECT max(a.updated_at) FROM form_attachments a WHERE a.workspace_id = f.workspace_id) AS attachments_updated_at`;
 
@@ -63,11 +305,111 @@ export async function formSummary(workspaceId) {
 }
 
 export async function formSummaries() {
-  return (await query(`SELECT ${formSummaryColumns} FROM forms f`)).rows;
+  return (await query(`SELECT ${formSummaryColumns} FROM forms f WHERE f.deleted_at IS NULL`)).rows;
+}
+
+export async function deletedFormSummaries(userId) {
+  return (await query(
+    `SELECT ${formSummaryColumns} FROM forms f
+      WHERE f.deleted_at IS NOT NULL AND f.deleted_by_user_id = $1
+      ORDER BY f.deleted_at DESC`,
+    [userId]
+  )).rows;
+}
+
+export async function findFormByRespondentCode(code, { includeDeleted = false } = {}) {
+  const result = await query(
+    `SELECT workspace_id, draft, deleted_at FROM forms
+      WHERE respondent_access_code = $1 AND coalesce((draft->>'collectionLocked')::boolean, false) = false
+        AND ($2::boolean OR deleted_at IS NULL)`,
+    [code, includeDeleted]
+  );
+  return result.rows[0] || null;
+}
+
+export async function setFormDeleted(workspaceId, user) {
+  return (await query(
+    `UPDATE forms SET deleted_at = now(), deleted_by_user_id = $2,
+       deleted_by_username = $3, updated_at = now()
+      WHERE workspace_id = $1 AND deleted_at IS NULL
+      RETURNING workspace_id`,
+    [workspaceId, user.id, user.username]
+  )).rowCount;
+}
+
+export async function restoreDeletedForm(workspaceId, userId) {
+  return (await query(
+    `UPDATE forms SET deleted_at = NULL, deleted_by_user_id = NULL,
+       deleted_by_username = NULL,
+       folder_id = CASE WHEN EXISTS (SELECT 1 FROM folders d WHERE d.id = forms.folder_id) THEN forms.folder_id ELSE NULL END,
+       draft = CASE WHEN EXISTS (SELECT 1 FROM folders d WHERE d.id = forms.folder_id) THEN forms.draft ELSE (forms.draft::jsonb - 'folderId')::json END,
+       updated_at = now()
+      WHERE workspace_id = $1 AND deleted_at IS NOT NULL AND deleted_by_user_id = $2
+      RETURNING workspace_id`,
+    [workspaceId, userId]
+  )).rowCount;
+}
+
+export async function permanentlyDeleteArchivedForm(workspaceId, userId) {
+  return withTransaction(async () => {
+    const deleted = (await query(
+      `DELETE FROM forms WHERE workspace_id = $1 AND deleted_at IS NOT NULL AND deleted_by_user_id = $2
+       RETURNING workspace_id, respondent_access_code, draft`,
+      [workspaceId, userId]
+    )).rows[0];
+    if (!deleted) return 0;
+    const accessCode = String(deleted.respondent_access_code || deleted.draft?.respondentAccessCode || deleted.draft?.publicAccessCode || "").trim().toUpperCase();
+    if (accessCode) {
+      await query(
+        `INSERT INTO permanently_deleted_forms (respondent_access_code, workspace_id, form_title, deleted_by_user_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (workspace_id) DO UPDATE SET respondent_access_code = EXCLUDED.respondent_access_code,
+           form_title = EXCLUDED.form_title, deleted_by_user_id = EXCLUDED.deleted_by_user_id, deleted_at = now()`,
+        [accessCode, deleted.workspace_id, deleted.draft?.title || deleted.workspace_id, userId]
+      );
+    }
+    return 1;
+  });
+}
+
+export async function findPermanentlyDeletedFormByAccessCode(accessCode) {
+  return (await query(
+    `SELECT respondent_access_code AS "respondentAccessCode", workspace_id AS "workspaceId",
+            form_title AS "formTitle", deleted_at AS "deletedAt"
+       FROM permanently_deleted_forms WHERE respondent_access_code = $1 ORDER BY deleted_at DESC LIMIT 1`,
+    [String(accessCode || "").trim().toUpperCase()]
+  )).rows[0] || null;
+}
+
+export async function findPermanentlyDeletedFormGeneration(accessCode, workspaceId) {
+  return (await query(
+    `SELECT respondent_access_code AS "respondentAccessCode", workspace_id AS "workspaceId",
+            form_title AS "formTitle", deleted_at AS "deletedAt"
+       FROM permanently_deleted_forms WHERE respondent_access_code = $1 AND workspace_id = $2`,
+    [String(accessCode || "").trim().toUpperCase(), String(workspaceId || "")]
+  )).rows[0] || null;
+}
+
+export async function getUserProfile(userId) {
+  return (await query("SELECT username, display_name AS \"displayName\" FROM user_profiles WHERE user_id = $1", [userId])).rows[0] || null;
+}
+
+export async function saveUserProfile(userId, username, displayName) {
+  return (await query(
+    `INSERT INTO user_profiles (user_id, username, display_name) VALUES ($1, $2, $3)
+     ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username,
+       display_name = EXCLUDED.display_name, updated_at = now()
+     RETURNING username, display_name AS \"displayName\"`,
+    [userId, username, displayName]
+  )).rows[0];
 }
 
 export async function formExists(workspaceId) {
   return (await query("SELECT 1 FROM forms WHERE workspace_id = $1", [workspaceId])).rowCount > 0;
+}
+
+export async function formDeleted(workspaceId) {
+  return Boolean((await query("SELECT deleted_at FROM forms WHERE workspace_id = $1", [workspaceId])).rows[0]?.deleted_at);
 }
 
 export async function formHasXml(workspaceId) {
@@ -79,11 +421,11 @@ export async function lockForm(workspaceId) {
   await query("SELECT 1 FROM forms WHERE workspace_id = $1 FOR NO KEY UPDATE", [workspaceId]);
 }
 
-export async function insertForm({ workspaceId, versionBaseId, versionNumber, folderId, draft, xlsxName = null, xlsx = null }) {
+export async function insertForm({ workspaceId, versionBaseId, versionNumber, folderId, ownerUserId = null, draft, xlsxName = null, xlsx = null }) {
   await query(
-    `INSERT INTO forms (workspace_id, version_base_id, version_number, folder_id, draft, xlsx_name, xlsx)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [workspaceId, versionBaseId, versionNumber, folderId, json(draft), xlsxName, xlsx]
+    `INSERT INTO forms (workspace_id, version_base_id, version_number, folder_id, owner_user_id, draft, xlsx_name, xlsx)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [workspaceId, versionBaseId, versionNumber, folderId, ownerUserId, json(draft), xlsxName, xlsx]
   );
 }
 
@@ -108,12 +450,7 @@ export async function maxVersionNumber(versionBaseId) {
 
 // A locked form keeps its code but cannot be opened with it.
 export async function findOpenFormByAccessCode(code) {
-  const result = await query(
-    `SELECT workspace_id, draft FROM forms
-     WHERE respondent_access_code = $1 AND coalesce((draft->>'collectionLocked')::boolean, false) = false`,
-    [code]
-  );
-  return result.rows[0] || null;
+  return findFormByRespondentCode(code);
 }
 
 export async function accessCodeOwner(code) {
@@ -190,8 +527,25 @@ export async function copyFormAttachments(fromWorkspaceId, toWorkspaceId) {
 
 // ---- entries ---------------------------------------------------------------
 
-export async function listEntries(workspaceId) {
-  return (await query("SELECT data FROM entries WHERE workspace_id = $1 ORDER BY seq", [workspaceId])).rows.map((row) => row.data);
+export async function listEntries(workspaceId, userId = null) {
+  const result = userId
+    ? await query(`SELECT e.data, e.user_id, e.review_requested_at, e.review_requested_by,
+                          p.username AS submitted_by_username, p.display_name AS submitted_by_name
+                     FROM entries e LEFT JOIN user_profiles p ON p.user_id = e.user_id
+                    WHERE e.workspace_id = $1 AND e.user_id = $2 ORDER BY e.seq`, [workspaceId, userId])
+    : await query(`SELECT e.data, e.user_id, e.review_requested_at, e.review_requested_by,
+                          p.username AS submitted_by_username, p.display_name AS submitted_by_name
+                     FROM entries e LEFT JOIN user_profiles p ON p.user_id = e.user_id
+                    WHERE e.workspace_id = $1 ORDER BY e.seq`, [workspaceId]);
+  return result.rows.map((row) => ({
+    ...row.data,
+    userId: row.data.userId || row.user_id || "",
+    submittedByUserId: row.data.submittedByUserId || row.user_id || row.data.userId || "",
+    submittedByUsername: row.data.submittedByUsername || row.submitted_by_username || "",
+    submittedByName: row.data.submittedByName || row.submitted_by_name || row.submitted_by_username || "",
+    reviewRequestedAt: iso(row.review_requested_at),
+    reviewRequestedBy: row.review_requested_by || ""
+  }));
 }
 
 export async function insertEntry(workspaceId, entry) {
@@ -212,6 +566,23 @@ export async function deleteEntries(workspaceId, ids) {
   await query("DELETE FROM entries WHERE workspace_id = $1 AND id = ANY($2::text[])", [workspaceId, ids]);
 }
 
+export async function markEntriesForReview(workspaceId, ids, username, userId = null) {
+  const result = await query(
+    `UPDATE entries SET review_requested_at = now(), review_requested_by = $3
+      WHERE workspace_id = $1 AND id = ANY($2::text[]) AND ($4::text IS NULL OR user_id = $4)`,
+    [workspaceId, ids, username, userId]
+  );
+  return result.rowCount;
+}
+
+export async function clearEntryReview(workspaceId, entryId) {
+  const result = await query(
+    "UPDATE entries SET review_requested_at = NULL, review_requested_by = NULL WHERE workspace_id = $1 AND id = $2",
+    [workspaceId, entryId]
+  );
+  return result.rowCount;
+}
+
 export async function putEntryAttachment(workspaceId, entryId, { fileName, contentType, data }) {
   await query(
     `INSERT INTO entry_attachments (workspace_id, entry_id, file_name, content_type, data) VALUES ($1, $2, $3, $4, $5)
@@ -230,27 +601,54 @@ export async function getEntryAttachment(workspaceId, entryId, fileName) {
 
 // ---- respondent checkpoints ------------------------------------------------
 
-export async function listRespondentCheckpoints(workspaceId) {
-  return (await query("SELECT data FROM respondent_checkpoints WHERE workspace_id = $1 ORDER BY saved_at", [workspaceId])).rows.map((row) => row.data);
+export async function listRespondentCheckpoints(workspaceId, userId = null) {
+  const result = userId
+    ? await query(`SELECT c.data, c.user_id, c.review_requested_at, c.review_requested_by,
+        COALESCE(p.display_name, p.username, '') AS saved_by
+      FROM respondent_checkpoints c LEFT JOIN user_profiles p ON p.user_id = c.user_id
+      WHERE c.workspace_id = $1 AND c.user_id = $2 ORDER BY c.saved_at`, [workspaceId, userId])
+    : await query(`SELECT c.data, c.user_id, c.review_requested_at, c.review_requested_by,
+        COALESCE(p.display_name, p.username, '') AS saved_by
+      FROM respondent_checkpoints c LEFT JOIN user_profiles p ON p.user_id = c.user_id
+      WHERE c.workspace_id = $1 ORDER BY c.saved_at`, [workspaceId]);
+  return result.rows.map((row) => ({
+    ...row.data,
+    userId: row.user_id,
+    savedBy: row.saved_by,
+    reviewRequestedAt: iso(row.review_requested_at),
+    reviewRequestedBy: row.review_requested_by || ''
+  }));
 }
 
-export async function getRespondentCheckpoint(workspaceId, identifierKey) {
+export async function getRespondentCheckpoint(workspaceId, identifierKey, userId = '') {
   return (await query(
-    "SELECT data FROM respondent_checkpoints WHERE workspace_id = $1 AND identifier_key = $2",
-    [workspaceId, identifierKey]
+    "SELECT data, review_requested_at, review_requested_by FROM respondent_checkpoints WHERE workspace_id = $1 AND identifier_key = $2 AND user_id = $3",
+    [workspaceId, identifierKey, userId]
   )).rows[0]?.data || null;
 }
 
 export async function putRespondentCheckpoint(workspaceId, identifierKey, checkpoint) {
   await query(
-    `INSERT INTO respondent_checkpoints (workspace_id, identifier_key, data, saved_at) VALUES ($1, $2, $3, $4)
-     ON CONFLICT (workspace_id, identifier_key) DO UPDATE SET data = EXCLUDED.data, saved_at = EXCLUDED.saved_at`,
-    [workspaceId, identifierKey, json(checkpoint), checkpoint.savedAt]
+    `INSERT INTO respondent_checkpoints (workspace_id, identifier_key, user_id, data, saved_at) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (workspace_id, identifier_key, user_id) DO UPDATE SET data = EXCLUDED.data, saved_at = EXCLUDED.saved_at`,
+    [workspaceId, identifierKey, checkpoint.userId || '', json(checkpoint), checkpoint.savedAt]
   );
 }
 
-export async function deleteRespondentCheckpoint(workspaceId, identifierKey) {
-  await query("DELETE FROM respondent_checkpoints WHERE workspace_id = $1 AND identifier_key = $2", [workspaceId, identifierKey]);
+export async function deleteRespondentCheckpoint(workspaceId, identifierKey, userId = null) {
+  if (userId === null) {
+    await query("DELETE FROM respondent_checkpoints WHERE workspace_id = $1 AND identifier_key = $2", [workspaceId, identifierKey]);
+    return;
+  }
+  await query("DELETE FROM respondent_checkpoints WHERE workspace_id = $1 AND identifier_key = $2 AND user_id = $3", [workspaceId, identifierKey, userId]);
+}
+
+export async function markRespondentCheckpointForReview(workspaceId, identifierKey, userId, username) {
+  return (await query(
+    `UPDATE respondent_checkpoints SET review_requested_at = now(), review_requested_by = $4
+      WHERE workspace_id = $1 AND identifier_key = $2 AND user_id = $3`,
+    [workspaceId, identifierKey, userId, username]
+  )).rowCount;
 }
 
 // ---- participant registry and MetaForm primaries ---------------------------

@@ -8,16 +8,20 @@ services:
     init: true
     user: "${ICPH_UID:-1000}:${ICPH_GID:-1000}"
     ports:
-      - "127.0.0.1:5173:5173"
+      - "127.0.0.1:5174:5174"
       - "127.0.0.1:8787:8787"
     environment:
       NODE_ENV: production
       ICPH_FORM_BUILDER_API_PORT: "8787"
+      ICPH_FORM_BUILDER_HOST: "0.0.0.0"
+      ICPH_FORM_BUILDER_PORT: "5174"
       DATABASE_URL: "postgres://${POSTGRES_USER:-icph}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-icph}"
       KEYCLOAK_URL: http://keycloak:8080                                   # token keys, inside compose network
       KEYCLOAK_PUBLIC_URL: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}" # browser-visible URL (login + token issuer)
       KEYCLOAK_REALM: icph
       KEYCLOAK_CLIENT_ID: icph-form-builder
+      KEYCLOAK_DIRECTORY_CLIENT_ID: "${KEYCLOAK_DIRECTORY_CLIENT_ID:-icph-user-directory}"
+      KEYCLOAK_DIRECTORY_CLIENT_SECRET: "${KEYCLOAK_DIRECTORY_CLIENT_SECRET:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -42,7 +46,7 @@ services:
         - CMD
         - node
         - -e
-        - "Promise.all([fetch('http://127.0.0.1:5173/'), fetch('http://127.0.0.1:8787/api/health')]).then(([web, api]) => process.exit(web.ok && api.ok ? 0 : 1)).catch(() => process.exit(1))"
+        - "Promise.all([fetch('http://127.0.0.1:5174/'), fetch('http://127.0.0.1:8787/api/health')]).then(([web, api]) => process.exit(web.ok && api.ok ? 0 : 1)).catch(() => process.exit(1))"
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -137,7 +141,9 @@ services:
       KC_PUBLIC_URL: "${KEYCLOAK_PUBLIC_URL:-http://localhost:8080}"
       KC_ADMIN_USERNAME: "${KEYCLOAK_ADMIN_USERNAME:-admin}"
       KC_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:-password}"
-      APP_URLS: "${ICPH_APP_URLS:-http://localhost:5173}"
+      KC_DIRECTORY_CLIENT_ID: "${KEYCLOAK_DIRECTORY_CLIENT_ID:-icph-user-directory}"
+      KC_DIRECTORY_CLIENT_SECRET: "${KEYCLOAK_DIRECTORY_CLIENT_SECRET:-}"
+      APP_URLS: "${ICPH_APP_URLS:-http://localhost:5174}"
     command: python /setup/setup.py
 
 volumes:
