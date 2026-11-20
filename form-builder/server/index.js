@@ -2713,6 +2713,7 @@ async function saveRespondentCheckpoint(workspaceId, payload, { allowDeleted = f
   const key = checkpointIdentifierKey(primaryIdentifierValue);
   const previous = await store.getRespondentCheckpoint(loaded.workspaceId, key, userId);
   const checkpoint = {
+    ...previous,
     id: previous?.id || `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     workspaceId,
     userId,
@@ -2727,6 +2728,98 @@ async function saveRespondentCheckpoint(workspaceId, payload, { allowDeleted = f
   };
   await store.putRespondentCheckpoint(loaded.workspaceId, key, checkpoint);
   return { workspaceId, primaryIdentifierVariable, primaryIdentifierValue, checkpoint };
+}
+
+async function adminEditAudit(user, previous, editedAt = isoStamp()) {
+  const profile = await store.getUserProfile(user.id);
+  const audit = {
+    userId: user.id,
+    username: String(user.username || profile?.username || ""),
+    name: String(profile?.displayName || user.username || ""),
+    editedAt
+  };
+  return {
+    adminEditedAt: editedAt,
+    adminEditedByUserId: audit.userId,
+    adminEditedByUsername: audit.username,
+    adminEditedByName: audit.name,
+    adminEditHistory: [...(previous?.adminEditHistory || []), audit]
+  };
+}
+
+async function submitAdminCheckpoint(workspaceId, primaryIdentifierValue, userId, answers, admin) {
+  return withFormLock(workspaceId, async () => {
+    const loaded = await loadDraft(workspaceId);
+    const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
+    if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
+    const identifier = cleanCheckpointIdentifier(primaryIdentifierValue);
+    const key = checkpointIdentifierKey(identifier);
+    const checkpoint = await store.getRespondentCheckpoint(loaded.workspaceId, key, userId);
+    if (!checkpoint) {
+      const error = new Error("Incomplete entry not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const submittedAt = isoStamp();
+    const ownerId = checkpoint.userId || userId || admin.id;
+    const ownerProfile = ownerId ? await store.getUserProfile(ownerId) : null;
+    const audit = await adminEditAudit(admin, checkpoint, submittedAt);
+    const entryAnswers = {
+      ...(checkpoint.answers || {}),
+      ...(answers || {}),
+      [primaryIdentifierVariable]: checkpoint.primaryIdentifierValue || identifier
+    };
+    const originalEntry = checkpoint.sourceEntryId
+      ? await store.getEntryIncludingIncomplete(loaded.workspaceId, checkpoint.sourceEntryId)
+      : null;
+    await assertEntryMutationAllowed(loaded.draft, await readEntries(loaded.workspaceId), entryAnswers, originalEntry?.id || "", admin);
+    let entry;
+    if (originalEntry) {
+      const { submissionStatus: _submissionStatus, ...prior } = originalEntry;
+      entry = {
+        ...prior,
+        ...audit,
+        id: originalEntry.id,
+        userId: originalEntry.userId || ownerId,
+        submittedByUserId: originalEntry.submittedByUserId || ownerId,
+        submittedByUsername: originalEntry.submittedByUsername || ownerProfile?.username || "",
+        submittedByName: originalEntry.submittedByName || ownerProfile?.displayName || ownerProfile?.username || checkpoint.savedBy || "",
+        submittedAt,
+        adminSubmittedAt: submittedAt,
+        adminSubmittedByUserId: admin.id,
+        adminSubmittedByUsername: audit.adminEditedByUsername,
+        adminSubmittedByName: audit.adminEditedByName,
+        updatedAt: submittedAt,
+        updatedByUserId: admin.id,
+        instanceName: entryInstanceName(loaded.draft, entryAnswers, submittedAt),
+        answers: entryAnswers
+      };
+      await store.markEntrySubmitted(loaded.workspaceId, entry);
+    } else {
+      entry = {
+        id: checkpoint.id || `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
+        userId: ownerId,
+        submittedByUserId: ownerId,
+        submittedByUsername: ownerProfile?.username || "",
+        submittedByName: ownerProfile?.displayName || ownerProfile?.username || checkpoint.savedBy || "",
+        submittedAt,
+        instanceName: entryInstanceName(loaded.draft, entryAnswers, submittedAt),
+        answers: entryAnswers,
+        adminSubmittedAt: submittedAt,
+        adminSubmittedByUserId: admin.id,
+        adminSubmittedByUsername: audit.adminEditedByUsername,
+        adminSubmittedByName: audit.adminEditedByName,
+        ...audit
+      };
+      await store.insertEntry(loaded.workspaceId, entry);
+    }
+    await store.deleteRespondentCheckpoint(loaded.workspaceId, key, userId);
+    await notifyWorkspaceAdmins(loaded.workspaceId, "checkpoint_submitted_by_admin", "Incomplete entry submitted", `An admin completed and submitted ${checkpoint.primaryIdentifierValue || identifier} for ${loaded.draft.title || loaded.workspaceId}.`, {
+      subjectId: loaded.workspaceId,
+      details: { formTitle: loaded.draft.title || loaded.workspaceId, entryId: entry.id, primaryIdentifierValue: identifier, submittedByAdmin: audit.adminEditedByUsername }
+    });
+    return { ok: true, workspaceId: loaded.workspaceId, entry, entries: await readEntries(loaded.workspaceId), submitted: true };
+  });
 }
 
 async function markRespondentCheckpointForReview(workspaceId, primaryIdentifierValue, user) {
@@ -2983,10 +3076,18 @@ function primaryIdentifierEntryKey(draft, answers = {}) {
   return String(entryValue(answers?.[primaryIdentifierVariable]) || "").trim().toLowerCase();
 }
 
-async function assertEntryMutationAllowed(draft, entries, answers, entryId = "") {
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function assertEntryMutationAllowed(draft, entries, answers, entryId = "", user = null) {
   const settings = normalizeResponseSettings(draft);
   const requestedEntryId = String(entryId || "").trim();
-  if (requestedEntryId && !settings.allowResponseEdits) {
+  if (requestedEntryId && !settings.allowResponseEdits && !user?.roles?.includes(ADMIN_ROLE)) {
     const error = new Error("Responses cannot be changed after submission for this form.");
     error.statusCode = 403;
     throw error;
@@ -3060,6 +3161,59 @@ function submitEntry(workspaceId, payload, user, { allowDeleted = false, allowFi
   return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitEntryUnlocked(workspaceId, payload, user, { allowDeleted, allowFieldAgent })));
 }
 
+async function returnEntryToIncomplete(workspaceId, entryId, answers, admin) {
+  return withFormLock(workspaceId, async () => {
+    const loaded = await loadDraft(workspaceId);
+    const entry = await store.getEntryIncludingIncomplete(loaded.workspaceId, entryId);
+    if (!entry || entry.submissionStatus === "incomplete") {
+      const error = new Error("Submitted entry not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
+    if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
+    const identifier = String(entry.answers?.[primaryIdentifierVariable] || answers?.[primaryIdentifierVariable] || "").trim();
+    if (!identifier) throw new Error(`The incomplete response needs a value for ${primaryIdentifierVariable}.`);
+    const ownerId = entry.userId || entry.submittedByUserId || "";
+    const key = checkpointIdentifierKey(identifier);
+    const previousCheckpoint = await store.getRespondentCheckpoint(loaded.workspaceId, key, ownerId);
+    const now = isoStamp();
+    const audit = await adminEditAudit(admin, entry, now);
+    const checkpoint = {
+      ...previousCheckpoint,
+      id: previousCheckpoint?.id || entry.id,
+      workspaceId: loaded.workspaceId,
+      userId: ownerId,
+      primaryIdentifierVariable,
+      primaryIdentifierValue: identifier,
+      primaryIdentifierKey: key,
+      sourceEntryId: entry.id,
+      savedAt: now,
+      answers: {
+        ...(entry.answers || {}),
+        ...(answers || {}),
+        [primaryIdentifierVariable]: identifier
+      },
+      ...audit
+    };
+    const incompleteEntry = {
+      ...entry,
+      submissionStatus: "incomplete",
+      updatedAt: now,
+      updatedByUserId: admin.id,
+      answers: checkpoint.answers,
+      ...audit
+    };
+    await store.putRespondentCheckpoint(loaded.workspaceId, key, checkpoint);
+    await store.updateEntry(loaded.workspaceId, incompleteEntry);
+    await notifyWorkspaceAdmins(loaded.workspaceId, "entry_returned_to_incomplete", "Entry moved to incomplete", `${identifier} was moved from submitted entries to incomplete entries by an admin.`, {
+      subjectId: loaded.workspaceId,
+      details: { formTitle: loaded.draft.title || loaded.workspaceId, entryId: entry.id, primaryIdentifierValue: identifier, editedBy: audit.adminEditedByUsername }
+    });
+    return { ok: true, workspaceId: loaded.workspaceId, checkpoint, entries: await readEntries(loaded.workspaceId) };
+  });
+}
+
 async function submitEntryUnlocked(requestedWorkspaceId, payload, user, { allowDeleted = false, allowFieldAgent = false } = {}) {
   const loaded = await loadDraft(requestedWorkspaceId, { allowDeleted, allowFieldAgent });
   const workspaceId = loaded.workspaceId;
@@ -3071,13 +3225,16 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload, user, { allowD
   const previousSubmission = clientSubmissionId && existing.find((item) => item.clientSubmissionId === clientSubmissionId);
   if (previousSubmission) return { ok: true, workspaceId, entry: previousSubmission, entries: existing, duplicateRetry: true };
   const requestedEntryId = String(payload.entryId || "").trim();
-  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
+  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId, user);
   if (requestedEntryId) {
     const index = existing.findIndex((item) => String(item.id || "") === requestedEntryId);
     if (index < 0) {
       const error = new Error("Entry not found.");
       error.statusCode = 404;
       throw error;
+    }
+    if (stableJson(existing[index].answers || {}) === stableJson(answers)) {
+      return { ok: true, workspaceId, entry: existing[index], entries: existing, updated: false, unchanged: true };
     }
     const updatedAt = isoStamp();
     const entry = {
@@ -3088,6 +3245,20 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload, user, { allowD
       instanceName: entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt),
       answers
     };
+    if (user.roles?.includes(ADMIN_ROLE)) {
+      const editorProfile = await store.getUserProfile(user.id);
+      const adminEdit = {
+        userId: user.id,
+        username: String(user.username || editorProfile?.username || ""),
+        name: String(editorProfile?.displayName || user.username || ""),
+        editedAt: updatedAt
+      };
+      entry.adminEditedAt = updatedAt;
+      entry.adminEditedByUserId = adminEdit.userId;
+      entry.adminEditedByUsername = adminEdit.username;
+      entry.adminEditedByName = adminEdit.name;
+      entry.adminEditHistory = [...(existing[index].adminEditHistory || []), adminEdit];
+    }
     const entries = [...existing];
     entries[index] = entry;
     await store.updateEntry(workspaceId, entry);
@@ -3095,6 +3266,36 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload, user, { allowD
       await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable], user.id);
     }
     return { ok: true, workspaceId, entry, entries, updated: true };
+  }
+  if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
+    const checkpointKey = checkpointIdentifierKey(answers[primaryIdentifierVariable]);
+    const checkpoint = await store.getRespondentCheckpoint(workspaceId, checkpointKey, user.id);
+    if (checkpoint?.sourceEntryId) {
+      const originalEntry = await store.getEntryIncludingIncomplete(workspaceId, checkpoint.sourceEntryId);
+      if (originalEntry?.submissionStatus === "incomplete") {
+        const { submissionStatus: _submissionStatus, ...prior } = originalEntry;
+        const entry = {
+          ...prior,
+          ...(clientSubmissionId ? { clientSubmissionId } : {}),
+          userId: originalEntry.userId || user.id,
+          submittedAt,
+          updatedAt: submittedAt,
+          updatedByUserId: user.id,
+          instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
+          source: "odk-web-forms",
+          payloadType: payload?.payloadType || "monolithic",
+          submissionMeta: payload?.submissionMeta || null,
+          instanceXml,
+          answers
+        };
+        if (user.roles?.includes(ADMIN_ROLE)) Object.assign(entry, await adminEditAudit(user, originalEntry, submittedAt));
+        if (uploadSummaries.length) entry.attachments = [...(entry.attachments || []), ...uploadSummaries];
+        await store.markEntrySubmitted(workspaceId, entry);
+        for (const upload of uploads) await store.putEntryAttachment(workspaceId, entry.id, upload);
+        await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable], user.id);
+        return { ok: true, workspaceId, entry, entries: await readEntries(workspaceId, fieldAgentDataOwnerId(user)), updated: true };
+      }
+    }
   }
   const submitterProfile = await store.getUserProfile(user.id);
   const submittedByUsername = String(user.username || submitterProfile?.username || "");
@@ -3133,7 +3334,7 @@ async function submitOdkEntryUnlocked(requestedWorkspaceId, payload, user, { all
   const previousSubmission = clientSubmissionId && existing.find((item) => item.clientSubmissionId === clientSubmissionId);
   if (previousSubmission) return { ok: true, workspaceId, entry: previousSubmission, entries: existing, duplicateRetry: true };
   const requestedEntryId = String(payload.entryId || "").trim();
-  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
+  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId, user);
   const uploads = prepareSubmissionAttachments(payload.attachments);
   const uploadSummaries = uploads.map(({ fileName, contentType, data }) => ({ fileName, contentType, sizeBytes: data.length }));
   if (requestedEntryId) {
@@ -3155,12 +3356,50 @@ async function submitOdkEntryUnlocked(requestedWorkspaceId, payload, user, { all
       answers,
       instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt)
     };
+    if (user.roles?.includes(ADMIN_ROLE)) {
+      const editorProfile = await store.getUserProfile(user.id);
+      const adminEdit = {
+        userId: user.id,
+        username: String(user.username || editorProfile?.username || ""),
+        name: String(editorProfile?.displayName || user.username || ""),
+        editedAt: entry.updatedAt
+      };
+      entry.adminEditedAt = entry.updatedAt;
+      entry.adminEditedByUserId = adminEdit.userId;
+      entry.adminEditedByUsername = adminEdit.username;
+      entry.adminEditedByName = adminEdit.name;
+      entry.adminEditHistory = [...(existing[index].adminEditHistory || []), adminEdit];
+    }
     if (uploadSummaries.length) entry.attachments = [...(entry.attachments || []), ...uploadSummaries];
     const entries = [...existing];
     entries[index] = entry;
     await store.updateEntry(workspaceId, entry);
     for (const upload of uploads) await store.putEntryAttachment(workspaceId, entry.id, upload);
     return { ok: true, workspaceId, entry, entries, updated: true };
+  }
+  if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
+    const checkpointKey = checkpointIdentifierKey(answers[primaryIdentifierVariable]);
+    const checkpoint = await store.getRespondentCheckpoint(workspaceId, checkpointKey, user.id);
+    if (checkpoint?.sourceEntryId) {
+      const originalEntry = await store.getEntryIncludingIncomplete(workspaceId, checkpoint.sourceEntryId);
+      if (originalEntry?.submissionStatus === "incomplete") {
+        const { submissionStatus: _submissionStatus, ...prior } = originalEntry;
+        const entry = {
+          ...prior,
+          ...(clientSubmissionId ? { clientSubmissionId } : {}),
+          userId: originalEntry.userId || user.id,
+          submittedAt,
+          updatedAt: submittedAt,
+          updatedByUserId: user.id,
+          instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
+          answers
+        };
+        if (user.roles?.includes(ADMIN_ROLE)) Object.assign(entry, await adminEditAudit(user, originalEntry, submittedAt));
+        await store.markEntrySubmitted(workspaceId, entry);
+        await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable], user.id);
+        return { ok: true, workspaceId, entry, entries: await readEntries(workspaceId, fieldAgentDataOwnerId(user)), updated: true };
+      }
+    }
   }
   const submitterProfile = await store.getUserProfile(user.id);
   const submittedByUsername = String(user.username || submitterProfile?.username || "");
@@ -3719,12 +3958,80 @@ const server = createServer((req, res) => requestContext.run({ user: null }, asy
     if (formWorkspaceMatch && !formCollectionRoutes.has(formWorkspaceMatch[1]) && !formArchiveActionMatch) {
       await requireWorkspace(decodeURIComponent(formWorkspaceMatch[1]));
     }
+    const checkpointSubmitMatch = pathname.match(/^\/api\/forms\/([^/]+)\/checkpoints\/([^/]+)\/submit$/);
+    if (req.method === "POST" && checkpointSubmitMatch) {
+      const workspaceId = decodeURIComponent(checkpointSubmitMatch[1]);
+      const identifier = decodeURIComponent(checkpointSubmitMatch[2]);
+      const payload = await requestBody(req);
+      const result = await submitAdminCheckpoint(workspaceId, identifier, String(payload.userId || ""), payload.answers || {}, admin);
+      const formTitle = (await store.getDraft(workspaceId))?.title || workspaceId;
+      const ownerId = result.entry.userId;
+      if (ownerId && ownerId !== admin.id) await recordActivity(ownerId, "checkpoint_submitted_by_admin", "Incomplete entry submitted", `An admin completed and submitted your saved response for ${formTitle}.`, {
+        subjectId: workspaceId,
+        details: { formTitle, entryId: result.entry.id, primaryIdentifierValue: identifier, submittedByAdmin: admin.username }
+      });
+      return jsonResponse(res, 200, result);
+    }
     const checkpointsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/checkpoints(?:\/([^/]+))?$/);
     if (checkpointsMatch) {
       const workspaceId = decodeURIComponent(checkpointsMatch[1]);
       await requireRole(req, ADMIN_ROLE);
       if (req.method === "GET" && !checkpointsMatch[2]) {
         return jsonResponse(res, 200, { ok: true, checkpoints: await readRespondentCheckpoints(workspaceId) });
+      }
+      if (req.method === "GET" && checkpointsMatch[2]) {
+        const identifier = decodeURIComponent(checkpointsMatch[2]);
+        const checkpointOwnerId = url.searchParams.get("userId") || "";
+        const checkpoint = (await readRespondentCheckpoints(workspaceId)).find((item) => (
+          String(item.primaryIdentifierValue || "").toLowerCase() === identifier.toLowerCase()
+          && String(item.userId || "") === checkpointOwnerId
+        ));
+        if (!checkpoint) {
+          const error = new Error("Incomplete entry not found.");
+          error.statusCode = 404;
+          throw error;
+        }
+        return jsonResponse(res, 200, { ok: true, checkpoint });
+      }
+      if (req.method === "PUT" && checkpointsMatch[2]) {
+        const identifier = decodeURIComponent(checkpointsMatch[2]);
+        const payload = await requestBody(req);
+        const checkpointOwnerId = String(payload.userId || "");
+        const checkpoint = (await readRespondentCheckpoints(workspaceId)).find((item) => (
+          String(item.primaryIdentifierValue || "").toLowerCase() === identifier.toLowerCase()
+          && String(item.userId || "") === checkpointOwnerId
+        ));
+        if (!checkpoint) {
+          const error = new Error("Incomplete entry not found.");
+          error.statusCode = 404;
+          throw error;
+        }
+        const answers = payload.answers && typeof payload.answers === "object" ? payload.answers : {};
+        const normalizedAnswers = { ...(checkpoint.answers || {}), ...answers, [checkpoint.primaryIdentifierVariable]: checkpoint.primaryIdentifierValue };
+        if (stableJson(checkpoint.answers || {}) === stableJson(normalizedAnswers)) {
+          return jsonResponse(res, 200, { ok: true, checkpoint, unchanged: true });
+        }
+        const now = isoStamp();
+        const editor = req.user;
+        const editorProfile = await store.getUserProfile(editor.id);
+        const edit = {
+          userId: editor.id,
+          username: String(editor.username || editorProfile?.username || ""),
+          name: String(editorProfile?.displayName || editor.username || ""),
+          editedAt: now
+        };
+        const updated = {
+          ...checkpoint,
+          savedAt: now,
+          answers: normalizedAnswers,
+          adminEditedAt: now,
+          adminEditedByUserId: edit.userId,
+          adminEditedByUsername: edit.username,
+          adminEditedByName: edit.name,
+          adminEditHistory: [...(checkpoint.adminEditHistory || []), edit]
+        };
+        await store.putRespondentCheckpoint(workspaceId, checkpointIdentifierKey(identifier), updated);
+        return jsonResponse(res, 200, { ok: true, checkpoint: updated, checkpoints: await readRespondentCheckpoints(workspaceId) });
       }
       if (req.method === "DELETE" && checkpointsMatch[2]) {
         const identifier = decodeURIComponent(checkpointsMatch[2]);
@@ -3733,6 +4040,7 @@ const server = createServer((req, res) => requestContext.run({ user: null }, asy
           String(item.primaryIdentifierValue || "").toLowerCase() === identifier.toLowerCase()
           && (checkpointOwnerId === null || String(item.userId || "") === checkpointOwnerId)
         ));
+        if (checkpoint?.sourceEntryId) await store.deleteEntries(workspaceId, [checkpoint.sourceEntryId]);
         await deleteRespondentCheckpoint(workspaceId, identifier, checkpointOwnerId);
         if (checkpoint) await notifyWorkspaceAdmins(workspaceId, "checkpoint_deleted", "Partial response deleted", `Checkpoint ${identifier} was deleted from ${ (await store.getDraft(workspaceId))?.title || workspaceId}.`, {
           subjectId: workspaceId,
@@ -3848,6 +4156,7 @@ const server = createServer((req, res) => requestContext.run({ user: null }, asy
     }
     const formMatch = pathname.match(/^\/api\/forms\/([^/]+)$/);
     const entriesMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries$/);
+    const entryIncompleteMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries\/([^/]+)\/incomplete$/);
     const entryReviewMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries\/([^/]+)\/review$/);
     const submissionAttachmentMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries\/([^/]+)\/attachments\/([^/]+)$/);
     const participantsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants$/);
@@ -3874,6 +4183,12 @@ const server = createServer((req, res) => requestContext.run({ user: null }, asy
     }
     if (req.method === "GET" && entriesMatch) {
       return jsonResponse(res, 200, { ok: true, entries: await readEntries(decodeURIComponent(entriesMatch[1])) });
+    }
+    if (req.method === "POST" && entryIncompleteMatch) {
+      const workspaceId = decodeURIComponent(entryIncompleteMatch[1]);
+      const entryId = decodeURIComponent(entryIncompleteMatch[2]);
+      const payload = await requestBody(req);
+      return jsonResponse(res, 200, await returnEntryToIncomplete(workspaceId, entryId, payload.answers || {}, admin));
     }
     if (req.method === "DELETE" && entryReviewMatch) {
       const workspaceId = decodeURIComponent(entryReviewMatch[1]);

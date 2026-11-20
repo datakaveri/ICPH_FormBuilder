@@ -293,7 +293,7 @@ const formSummaryColumns = `
   f.terminology IS NOT NULL AS has_terminology,
   f.terminology->>'status' AS terminology_status,
   f.terminology->>'entityCount' AS terminology_entity_count,
-  (SELECT count(*)::int FROM entries e WHERE e.workspace_id = f.workspace_id) AS entry_count,
+  (SELECT count(*)::int FROM entries e WHERE e.workspace_id = f.workspace_id AND e.data->>'submissionStatus' IS DISTINCT FROM 'incomplete') AS entry_count,
   (SELECT count(*)::int FROM respondent_checkpoints c WHERE c.workspace_id = f.workspace_id) AS checkpoint_count,
   (SELECT count(*)::int FROM fhir_bundles b WHERE b.workspace_id = f.workspace_id) AS fhir_bundle_count,
   (SELECT count(*)::int FROM form_field_agents a WHERE a.workspace_id = f.workspace_id) AS field_agent_count,
@@ -532,11 +532,11 @@ export async function listEntries(workspaceId, userId = null) {
     ? await query(`SELECT e.data, e.user_id, e.review_requested_at, e.review_requested_by,
                           p.username AS submitted_by_username, p.display_name AS submitted_by_name
                      FROM entries e LEFT JOIN user_profiles p ON p.user_id = e.user_id
-                    WHERE e.workspace_id = $1 AND e.user_id = $2 ORDER BY e.seq`, [workspaceId, userId])
+                    WHERE e.workspace_id = $1 AND e.user_id = $2 AND e.data->>'submissionStatus' IS DISTINCT FROM 'incomplete' ORDER BY e.seq`, [workspaceId, userId])
     : await query(`SELECT e.data, e.user_id, e.review_requested_at, e.review_requested_by,
                           p.username AS submitted_by_username, p.display_name AS submitted_by_name
                      FROM entries e LEFT JOIN user_profiles p ON p.user_id = e.user_id
-                    WHERE e.workspace_id = $1 ORDER BY e.seq`, [workspaceId]);
+                    WHERE e.workspace_id = $1 AND e.data->>'submissionStatus' IS DISTINCT FROM 'incomplete' ORDER BY e.seq`, [workspaceId]);
   return result.rows.map((row) => ({
     ...row.data,
     userId: row.data.userId || row.user_id || "",
@@ -559,6 +559,33 @@ export async function updateEntry(workspaceId, entry) {
   await query(
     "UPDATE entries SET client_submission_id = $3, data = $4 WHERE workspace_id = $1 AND id = $2",
     [workspaceId, entry.id, entry.clientSubmissionId || null, json(entry)]
+  );
+}
+
+export async function getEntryIncludingIncomplete(workspaceId, entryId) {
+  const row = (await query(
+    `SELECT e.data, e.user_id, e.review_requested_at, e.review_requested_by,
+            p.username AS submitted_by_username, p.display_name AS submitted_by_name
+       FROM entries e LEFT JOIN user_profiles p ON p.user_id = e.user_id
+      WHERE e.workspace_id = $1 AND e.id = $2`,
+    [workspaceId, entryId]
+  )).rows[0];
+  if (!row) return null;
+  return {
+    ...row.data,
+    userId: row.data.userId || row.user_id || "",
+    submittedByUserId: row.data.submittedByUserId || row.user_id || row.data.userId || "",
+    submittedByUsername: row.data.submittedByUsername || row.submitted_by_username || "",
+    submittedByName: row.data.submittedByName || row.submitted_by_name || row.submitted_by_username || "",
+    reviewRequestedAt: iso(row.review_requested_at),
+    reviewRequestedBy: row.review_requested_by || ""
+  };
+}
+
+export async function markEntrySubmitted(workspaceId, entry) {
+  await query(
+    "UPDATE entries SET client_submission_id = $3, user_id = $4, data = $5, submitted_at = $6 WHERE workspace_id = $1 AND id = $2",
+    [workspaceId, entry.id, entry.clientSubmissionId || null, entry.userId || "", json(entry), entry.submittedAt]
   );
 }
 

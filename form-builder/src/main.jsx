@@ -3781,11 +3781,24 @@ function App() {
   }
   if (path.startsWith("/fill/")) {
     const params = new URLSearchParams(window.location.search);
-    return <FillForm workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])} entryId={params.get("entryId") || ""} />;
+    return <FillForm
+      workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])}
+      entryId={params.get("entryId") || ""}
+      adminCheckpointIdentifier={params.get("checkpoint") || ""}
+      adminCheckpointUserId={params.get("userId") || ""}
+    />;
   }
   if (path.startsWith("/entry/")) {
     const parts = path.replace("/entry/", "").split("/");
     return <EntryViewer workspaceId={decodeURIComponent(parts[0] || "")} entryId={decodeURIComponent(parts[1] || "")} />;
+  }
+  if (path.startsWith("/checkpoint/")) {
+    const parts = path.replace("/checkpoint/", "").split("/");
+    return <EntryViewer
+      workspaceId={decodeURIComponent(parts[0] || "")}
+      checkpointIdentifier={decodeURIComponent(parts[1] || "")}
+      checkpointUserId={decodeURIComponent(parts[2] || "")}
+    />;
   }
   return <AdminApp />;
 }
@@ -4587,7 +4600,7 @@ function ProfilePage({ session }) {
         </div>
         <div className="topbar-title">
           <h1>My Profile</h1>
-          <p>{isAdmin ? "Admin profile, updates, and deleted forms" : "Field agent profile and updates"}</p>
+          <p>{isAdmin ? "Admin profile, activity, and deleted forms" : "Field agent profile and activity"}</p>
         </div>
         <div className="topbar-brand"><BrandLogos /></div>
       </header>
@@ -4596,7 +4609,7 @@ function ProfilePage({ session }) {
           <button className={activeTab === "personal" ? "active" : ""} type="button" onClick={() => setActiveTab("personal")}>Personal details</button>
           {isAdmin ? <button className={activeTab === "deleted" ? "active" : ""} type="button" onClick={() => setActiveTab("deleted")}>Deleted forms</button> : null}
           <button className={activeTab === "notifications" ? "active" : ""} type="button" onClick={() => setActiveTab("notifications")}>
-            Notifications <NotificationDot count={unreadNotificationCount} className="tab-notification-dot" />
+            Activity <NotificationDot count={unreadNotificationCount} className="tab-notification-dot" />
           </button>
         </nav>
         {activeTab === "personal" ? <section className="panel profile-panel">
@@ -4650,7 +4663,7 @@ function ProfilePage({ session }) {
         {activeTab === "notifications" ? (
           <section className="panel profile-notifications-panel">
             <div className="section-head">
-              <div><h2>Notifications</h2><p>Recent access changes, form activity, and sync results.</p></div>
+              <div><h2>Activity</h2><p>Recent access changes, form activity, and sync results.</p></div>
               <button className="secondary small" type="button" onClick={refreshNotifications}><RefreshCw size={14} /> Refresh</button>
             </div>
             {notifications.length ? <div className="notification-list">
@@ -7126,6 +7139,12 @@ function DashboardApp({ session, onLogout }) {
     window.open(`/entry/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(entryId)}`, "_blank", "noopener,noreferrer");
   }
 
+  function viewCheckpoint(workspaceId, checkpoint) {
+    const identifier = String(checkpoint?.primaryIdentifierValue || "").trim();
+    if (!identifier) return;
+    window.open(`/checkpoint/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(identifier)}/${encodeURIComponent(checkpoint.userId || "")}`, "_blank", "noopener,noreferrer");
+  }
+
   return (
     <div className="app-shell">
       {view === "home" ? (
@@ -7216,6 +7235,7 @@ function DashboardApp({ session, onLogout }) {
           uploadOptionMedia={uploadOptionMedia}
           deleteWorkspaceAttachment={deleteWorkspaceAttachment}
           viewEntry={viewEntry}
+          viewCheckpoint={viewCheckpoint}
           deleteEntries={deleteFormEntries}
           clearEntryReview={clearEntryReview}
           refreshEntries={refreshCurrentEntries}
@@ -8711,6 +8731,7 @@ function BuilderPage(props) {
     uploadOptionMedia,
     deleteWorkspaceAttachment,
     viewEntry,
+    viewCheckpoint,
     deleteEntries,
     clearEntryReview,
     refreshEntries,
@@ -8875,7 +8896,7 @@ function BuilderPage(props) {
               ) : null}
             </div>
             {published ? <ParticipantAssignmentPanel form={form} workspaceId={workspace?.workspaceId} folderParticipantIdentifierVariable={folderParticipantIdentifierVariable} onActivated={onParticipantIdentifierActivated} /> : null}
-            {published ? <IncompleteCheckpointsPanel form={form} workspaceId={workspace?.workspaceId} /> : null}
+            {published ? <IncompleteCheckpointsPanel workspaceId={workspace?.workspaceId} viewCheckpoint={viewCheckpoint} /> : null}
             <EntriesPanel
               form={form}
               entries={entries}
@@ -9348,7 +9369,7 @@ function QuestionResourcesBox({ workspace, requirements, status, locked = false,
   );
 }
 
-function IncompleteCheckpointsPanel({ form, workspaceId }) {
+function IncompleteCheckpointsPanel({ workspaceId, viewCheckpoint }) {
   const [checkpoints, setCheckpoints] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -9386,8 +9407,6 @@ function IncompleteCheckpointsPanel({ form, workspaceId }) {
     }
   }
 
-  const answerEntries = (checkpoint) => Object.entries(checkpoint.answers || {}).filter(([, value]) => value !== "" && value != null);
-
   return (
     <div className="panel entries-panel incomplete-checkpoints-panel">
       <div className="section-head">
@@ -9407,28 +9426,21 @@ function IncompleteCheckpointsPanel({ form, workspaceId }) {
         <div className="entries-table">
           {checkpoints.slice().reverse().map((checkpoint, index) => {
             const identifier = String(checkpoint.primaryIdentifierValue || `Entry ${index + 1}`);
-            const answers = answerEntries(checkpoint);
             return (
               <div className="entry-row incomplete-checkpoint-row" key={`${identifier}-${checkpoint.savedAt || index}`}>
                 <div className="entry-details">
                   <strong>{identifier}</strong>
                   <small>Saved {checkpoint.savedAt ? new Date(checkpoint.savedAt).toLocaleString() : "recently"}</small>
                   <small>Saved by {checkpoint.savedBy || checkpoint.userId || "an earlier account"}</small>
+                  {checkpoint.adminEditedAt ? <small>Edited by {checkpoint.adminEditedByName || checkpoint.adminEditedByUsername || "admin"}{checkpoint.adminEditedByUsername && checkpoint.adminEditedByName && checkpoint.adminEditedByUsername !== checkpoint.adminEditedByName ? ` (@${checkpoint.adminEditedByUsername})` : ""} · {new Date(checkpoint.adminEditedAt).toLocaleString()}</small> : null}
                   {checkpoint.reviewRequestedAt ? (
                     <small className="review-requested-badge">Review requested by {checkpoint.reviewRequestedBy || "field agent"} · {new Date(checkpoint.reviewRequestedAt).toLocaleString()}</small>
                   ) : null}
-                  <details>
-                    <summary>View saved answers ({answers.length})</summary>
-                    <dl className="checkpoint-answer-list">
-                      {answers.map(([name, value]) => {
-                        const question = (form?.questions || []).find((item) => item.name === name);
-                        const displayValue = typeof value === "object" ? JSON.stringify(value) : String(value);
-                        return <div key={name}><dt>{displayFormText(question?.label || name) || name}</dt><dd>{displayFormText(displayValue) || displayValue}</dd></div>;
-                      })}
-                    </dl>
-                  </details>
                 </div>
                 <div className="entry-actions">
+                  <button className="secondary small icon-text-button" type="button" disabled={!workspaceId} onClick={() => viewCheckpoint?.(workspaceId, checkpoint)}>
+                    <ExternalLink size={14} /> View
+                  </button>
                   <button className="danger-action small icon-text-button" type="button" disabled={Boolean(deleting)} onClick={() => removeCheckpoint(checkpoint)}>
                     <Trash2 size={14} /> {deleting === identifier ? "Deleting…" : "Delete"}
                   </button>
@@ -9537,17 +9549,13 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, editEntry, delete
                   {entry.instanceName && entry.instanceName !== entry.id ? ` · ${entry.id}` : ""}
                 </small>
                 <small>Submitted by {entry.submittedByName || entry.submittedByUsername || entry.submittedByUserId || entry.userId || "Unknown user"}{entry.submittedByUsername && entry.submittedByName && entry.submittedByUsername !== entry.submittedByName ? ` (@${entry.submittedByUsername})` : ""}</small>
+                {entry.adminEditedAt ? <small className="admin-edit-audit">Edited by {entry.adminEditedByName || entry.adminEditedByUsername || "admin"}{entry.adminEditedByUsername && entry.adminEditedByName && entry.adminEditedByUsername !== entry.adminEditedByName ? ` (@${entry.adminEditedByUsername})` : ""} · {new Date(entry.adminEditedAt).toLocaleString()}</small> : null}
                 {entry.reviewRequestedAt ? <small className="review-request-note">Review requested by {entry.reviewRequestedBy || "field agent"} · {new Date(entry.reviewRequestedAt).toLocaleString()}</small> : null}
               </div>
               <div className="entry-actions">
                 {entry.reviewRequestedAt ? (
                   <button className="secondary small icon-text-button" disabled={status?.kind === "busy"} onClick={() => clearEntryReview?.(entryId)} title="Clear review request">
                     <CheckCircle2 size={14} /> Clear review
-                  </button>
-                ) : null}
-                {allowResponseEdits ? (
-                  <button className="secondary small" disabled={!workspaceId} onClick={() => editEntry?.(entry.id)} title="Edit entry">
-                    <TextCursorInput size={14} /> Edit
                   </button>
                 ) : null}
                 <button className="secondary small" disabled={!workspaceId} onClick={() => viewEntry(workspaceId, entry.id)}>
@@ -14577,7 +14585,7 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, u
   );
 }
 
-function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkpointAnswers = null, resumePrimaryIdentifierValue = "", resumeCheckpointIdentifier = "", onBackToRespondent }) {
+function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkpointAnswers = null, resumePrimaryIdentifierValue = "", resumeCheckpointIdentifier = "", adminCheckpointIdentifier = "", adminCheckpointUserId = "", onBackToRespondent }) {
   const [formGenerationId, setFormGenerationId] = useState(workspaceId || "");
   const [form, setForm] = useState(null);
   const [formXml, setFormXml] = useState("");
@@ -14621,7 +14629,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   const hasBarcodeQuestions = Boolean(form?.questions?.some((question) => question.type === "barcode"));
   // Use the stateful native renderer for code-based collection so the field
   // agent's answers can be saved as a respondent checkpoint before submission.
-  const useOdkViewer = Boolean(formXml && !accessCode && !hasGroupSections && !hasChoiceQuestions && !hasBarcodeQuestions && !editingEntry && !entryId && checkpointAnswers === null && !resumePrimaryIdentifierValue && !resumeCheckpointIdentifier);
+  const useOdkViewer = Boolean(formXml && !accessCode && !adminCheckpointIdentifier && !hasGroupSections && !hasChoiceQuestions && !hasBarcodeQuestions && !editingEntry && !entryId && checkpointAnswers === null && !resumePrimaryIdentifierValue && !resumeCheckpointIdentifier);
 
   useEffect(() => {
     setActiveGroupPage(0);
@@ -14745,6 +14753,11 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         }
         let loadedCheckpointAnswers = checkpointAnswers && typeof checkpointAnswers === "object" ? checkpointAnswers : null;
         let loadedCheckpointIdentifierValue = resumePrimaryIdentifierValue;
+        if (adminCheckpointIdentifier) {
+          const checkpointData = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(adminCheckpointIdentifier)}?userId=${encodeURIComponent(adminCheckpointUserId)}`);
+          loadedCheckpointAnswers = checkpointData.checkpoint?.answers || {};
+          loadedCheckpointIdentifierValue = checkpointData.checkpoint?.primaryIdentifierValue || adminCheckpointIdentifier;
+        }
         if (accessCode && resumeCheckpointIdentifier && !loadedCheckpointAnswers) {
           try {
             const checkpointData = await requestJson(`${formApiBase}/checkpoint`, {
@@ -14823,7 +14836,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
       }
     }
     loadPublishedForm();
-  }, [accessCode, checkpointAnswers, entryId, formApiBase, fresh, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
+  }, [accessCode, adminCheckpointIdentifier, adminCheckpointUserId, checkpointAnswers, entryId, formApiBase, fresh, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
 
   function setAnswer(name, value) {
     setSubmissionSuccess(false);
@@ -14837,7 +14850,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
     setStatus(failedMessage
       ? { kind: "error", message: `Some saved responses need attention: ${failedMessage}` }
       : result.terminalIds?.length
-        ? { kind: "error", message: `${result.terminalIds.length} item${result.terminalIds.length === 1 ? "" : "s"} belong to a permanently deleted form. Export the data from Profile → Notifications before deleting it.` }
+        ? { kind: "error", message: `${result.terminalIds.length} item${result.terminalIds.length === 1 ? "" : "s"} belong to a permanently deleted form. Export the data from Profile → Activity before deleting it.` }
       : { kind: "ok", message: result.pendingCount ? `${result.pendingCount} item${result.pendingCount === 1 ? "" : "s"} still waiting to sync.` : "All saved responses are synced." });
   }
 
@@ -14860,6 +14873,23 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
     try {
       const validation = validateAnswers(form, answers);
       if (validation.errors.length) {
+        const missingRequired = validation.errors.filter((error) => error.endsWith(" is required."));
+        const otherErrors = validation.errors.filter((error) => !error.endsWith(" is required."));
+        if (!accessCode && (editingEntry || entryId) && missingRequired.length && !otherErrors.length) {
+          const visibleNames = new Set(visibleQuestions(form, validation.answers).map(questionAnswerKey));
+          const incompleteAnswers = {};
+          for (const [name, value] of Object.entries(validation.answers)) {
+            if (visibleNames.has(name)) incompleteAnswers[name] = value;
+          }
+          try {
+            const result = await postJson(`${formApiBase}/entries/${encodeURIComponent(editingEntry?.id || entryId)}/incomplete`, { answers: incompleteAnswers });
+            notifyCollectionChanged();
+            window.location.assign(`/checkpoint/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(result.checkpoint.primaryIdentifierValue)}/${encodeURIComponent(result.checkpoint.userId || "")}?moved=1`);
+          } catch (error) {
+            setStatus({ kind: "error", message: error.message || String(error) });
+          }
+          return;
+        }
         setStatus({ kind: "error", message: validation.errors[0] });
         return;
       }
@@ -14877,17 +14907,19 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
       if (accessCode) {
         result = await saveOfflineFirst(`${formApiBase}/entries`, submissionPayload);
       } else {
-        await postJson(`${formApiBase}/entries`, submissionPayload);
-        result = { queued: false, pendingCount: 0 };
+        result = await postJson(`${formApiBase}/entries`, submissionPayload);
+        result = { ...result, queued: false, pendingCount: 0 };
       }
       notifyCollectionChanged();
       setPendingSyncCount(result.pendingCount);
       setStatus(result.error
         ? { kind: "error", message: `Saved on this device; sync needs attention: ${result.error}` }
+        : result.unchanged
+          ? { kind: "ok", message: "No changes to save. No edit was recorded." }
         : result.queued
           ? { kind: "ok", message: "Saved on this device. It will sync when the connection is available." }
-          : { kind: "ok", message: "Submitted and synced." });
-      setSubmissionSuccess(true);
+          : { kind: "ok", message: editingEntry || entryId ? "Entry updated and synced." : "Submitted and synced." });
+      setSubmissionSuccess(!result.unchanged);
       setLocalDraftSaved(false);
       if (!editingEntry && !entryId) setAnswers({});
     } catch (error) {
@@ -14896,6 +14928,38 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   }
 
   async function saveCheckpoint() {
+    if (adminCheckpointIdentifier) {
+      const validation = validateAnswers(form, answers);
+      const primaryIdentifierVariable = String(form?.participantIdentifierVariable || form?.primaryIdentifierVariable || "").trim();
+      const visibleNames = new Set(visibleQuestions(form, calculatedAnswers).map(questionAnswerKey));
+      const checkpointData = {};
+      for (const [name, value] of Object.entries(calculatedAnswers)) {
+        if (visibleNames.has(name) || name === primaryIdentifierVariable) checkpointData[name] = value;
+      }
+      setStatus({ kind: "busy", message: "Saving admin changes..." });
+      try {
+        if (!validation.errors.length) {
+          const result = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(adminCheckpointIdentifier)}/submit`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ userId: adminCheckpointUserId, answers: checkpointData })
+          });
+          notifyCollectionChanged();
+          window.location.assign(`/entry/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(result.entry.id)}?submitted=1`);
+          return;
+        }
+        const result = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(adminCheckpointIdentifier)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ userId: adminCheckpointUserId, answers: checkpointData })
+        });
+        setSubmissionSuccess(!result.unchanged);
+        setStatus({ kind: "ok", message: result.unchanged ? "No changes to save. No edit was recorded." : "Checkpoint changes saved." });
+      } catch (error) {
+        setStatus({ kind: "error", message: error.message || String(error) });
+      }
+      return;
+    }
     if (!accessCode) {
       setStatus({ kind: "error", message: "Open the form from the respondent page to save a checkpoint." });
       return;
@@ -14969,7 +15033,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
             ) : null}
             <div>
               <h1>{form.title}</h1>
-              <p>{editingEntry ? "Editing submitted entry" : accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
+              <p>{adminCheckpointIdentifier ? "Editing incomplete entry" : editingEntry ? "Editing submitted entry" : accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
             </div>
           </div>
         ) : (
@@ -15035,6 +15099,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
                   question={question}
                   value={calculatedAnswers[answerKey] || ""}
                   onChange={(value) => setAnswer(answerKey, value)}
+                  forceDisabled={Boolean(adminCheckpointIdentifier && question.name === (form.participantIdentifierVariable || form.primaryIdentifierVariable))}
                   languageMode={languageMode}
                   choiceOptions={externalChoices[question.name] || []}
                   workspaceId={workspaceId}
@@ -15046,7 +15111,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         })}
 	        {submissionSuccess ? (
 	          <div className="submission-success-inline">
-	            <Check size={16} /> {editingEntry ? "Updated!" : "Submitted!"}
+	            <Check size={16} /> {adminCheckpointIdentifier ? answerValidation.errors.length ? "Checkpoint saved." : "Submitted!" : editingEntry ? "Updated!" : "Submitted!"}
 	          </div>
 	        ) : null}
 	      </main>
@@ -15056,9 +15121,11 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
 	          <span>{status.message || (hasGroupSections && !isLastGroupPage ? (canAdvanceGroup ? "Ready to continue." : pageValidation.errors[0] || "Complete this section.") : (canSubmit ? "Ready to submit." : answerValidation.errors[0] || "Ready"))}</span>
 	        </div>
 	        <div className="footer-actions">
-	          <button className="secondary" disabled={!form || status.kind === "busy"} onClick={saveCheckpoint}>
-	            <Save size={16} /> Save Checkpoint
-	          </button>
+          {!adminCheckpointIdentifier ? (
+            <button className="secondary" disabled={!form || status.kind === "busy"} onClick={saveCheckpoint}>
+              <Save size={16} /> Save Checkpoint
+            </button>
+          ) : null}
 	          {hasGroupSections && activeGroupPage > 0 ? (
             <button className="secondary group-page-back" disabled={status.kind === "busy"} onClick={goBackGroupPage}>
               <ChevronRight size={16} /> Back
@@ -15070,8 +15137,8 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
               Next <ChevronRight size={16} />
             </button>
           ) : (
-            <button className="primary" disabled={!form || status.kind === "busy"} onClick={submitEntry}>
-              <Check size={16} /> {editingEntry ? "Update" : "Submit"}
+            <button className="primary" disabled={!form || status.kind === "busy"} onClick={adminCheckpointIdentifier ? saveCheckpoint : submitEntry}>
+              <Check size={16} /> {adminCheckpointIdentifier ? answerValidation.errors.length ? "Update" : "Submit" : editingEntry || entryId ? "Update" : "Submit"}
             </button>
           )}
 	        </div>
@@ -15080,7 +15147,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   );
 }
 
-function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
+function EntryViewer({ workspaceId = "", accessCode = "", entryId = "", checkpointIdentifier = "", checkpointUserId = "" }) {
   const [form, setForm] = useState(null);
   const [entry, setEntry] = useState(null);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading entry..." });
@@ -15094,11 +15161,22 @@ function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
           ? encodeURIComponent(normalizeAccessCodeInput(accessCode))
           : encodeURIComponent(workspaceRouteId(workspaceId));
         const formApiBase = accessCode ? `/api/public/forms/${formRouteId}` : `/api/forms/${formRouteId}`;
-        const [formData, entryData] = await Promise.all([
-          requestJson(formApiBase),
-          requestJson(`${formApiBase}/entries`)
-        ]);
-        const found = (entryData.entries || []).find((item) => String(item.id || "") === String(entryId));
+        const formData = await requestJson(formApiBase);
+        let found;
+        if (checkpointIdentifier) {
+          const checkpointData = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(checkpointIdentifier)}?userId=${encodeURIComponent(checkpointUserId)}`);
+          const checkpoint = checkpointData.checkpoint;
+          found = checkpoint ? {
+            ...checkpoint,
+            id: checkpoint.id || checkpoint.primaryIdentifierValue,
+            submittedAt: checkpoint.savedAt,
+            submittedByName: checkpoint.savedBy,
+            isIncompleteCheckpoint: true
+          } : null;
+        } else {
+          const entryData = await requestJson(`${formApiBase}/entries`);
+          found = (entryData.entries || []).find((item) => String(item.id || "") === String(entryId));
+        }
         if (!found) throw new Error("Entry not found.");
         const draft = normalizeFormDraft(formData.draft);
         if (formData.hasXml) {
@@ -15108,13 +15186,27 @@ function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
           setForm(draft);
         }
         setEntry(found);
-        setStatus({ kind: "ok", message: accessCode ? "Read-only public entry view" : formData.hasXml ? "Read-only XML entry view" : "Read-only entry view" });
+        const justSubmitted = new URLSearchParams(window.location.search).get("submitted") === "1";
+        const justMovedToIncomplete = new URLSearchParams(window.location.search).get("moved") === "1";
+        setStatus({ kind: "ok", message: justSubmitted ? "Incomplete response submitted successfully." : justMovedToIncomplete ? "Response moved to incomplete entries." : checkpointIdentifier ? "Read-only incomplete entry view" : accessCode ? "Read-only public entry view" : "Read-only entry view" });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
     loadEntry();
-  }, [accessCode, workspaceId, entryId]);
+  }, [accessCode, workspaceId, entryId, checkpointIdentifier, checkpointUserId]);
+
+  function editViewedResponse() {
+    if (!workspaceId) return;
+    const params = new URLSearchParams();
+    if (checkpointIdentifier) {
+      params.set("checkpoint", checkpointIdentifier);
+      params.set("userId", checkpointUserId);
+    } else {
+      params.set("entryId", entryId);
+    }
+    window.location.href = `/fill/${encodeURIComponent(workspaceRouteId(workspaceId))}?${params.toString()}`;
+  }
 
   if (!form || !entry) {
     return (
@@ -15129,14 +15221,18 @@ function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
       <header className="fill-header">
         <div>
           <h1>{form.title}</h1>
-          <p>{entry.instanceName || entry.displayName || entry.id} · {new Date(entry.submittedAt).toLocaleString()}</p>
+          <p>{entry.isIncompleteCheckpoint ? "Incomplete entry" : entry.instanceName || entry.displayName || entry.id} · {new Date(entry.submittedAt).toLocaleString()}</p>
         </div>
-        <div className={`status-line ${status.kind}`}>
-          {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
-          <span>{status.message}</span>
+        <div className="fill-header-actions">
+          {workspaceId ? <button className="primary small" type="button" onClick={editViewedResponse}><TextCursorInput size={14} /> Edit</button> : null}
+          <div className={`status-line ${status.kind}`}>
+            {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
+            <span>{status.message}</span>
+          </div>
         </div>
       </header>
       <main className="fill-card entry-view-card">
+        {entry.adminEditedAt ? <p className="muted admin-edit-audit">Edited by {entry.adminEditedByName || entry.adminEditedByUsername || "admin"}{entry.adminEditedByUsername && entry.adminEditedByName && entry.adminEditedByUsername !== entry.adminEditedByName ? ` (@${entry.adminEditedByUsername})` : ""} · {new Date(entry.adminEditedAt).toLocaleString()}</p> : null}
         {questionsToShow.map((question) => (
           <PreviewField
             key={question.id}
