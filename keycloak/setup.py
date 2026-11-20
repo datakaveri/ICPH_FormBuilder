@@ -8,8 +8,8 @@ Creates:
                    (carried in the standard realm_access.roles claim)
     - client       icph-form-builder (public SPA, Authorization Code + PKCE,
                    offline_access scope for offline sign-in)
-    - users        admin      -> icph-admin
-                   fieldagent -> icph-field-agent
+    - users        admin, admin2, admin3 -> icph-admin
+                   fieldagent             -> icph-field-agent
 Safe to re-run (409 Conflict is treated as 'already exists').
 
 This is a local development setup: the default passwords are not secrets.
@@ -22,17 +22,28 @@ KC_ADMIN = os.environ.get("KC_ADMIN_USERNAME", "admin")
 KC_ADMIN_PW = os.environ.get("KC_ADMIN_PASSWORD", "password")
 REALM = os.environ.get("KC_REALM", "icph")
 CLIENT_ID = os.environ.get("KC_CLIENT_ID", "icph-form-builder")
+DIRECTORY_CLIENT_ID = os.environ.get("KC_DIRECTORY_CLIENT_ID", "icph-user-directory")
+DIRECTORY_CLIENT_SECRET = os.environ.get("KC_DIRECTORY_CLIENT_SECRET", "")
 LOGIN_THEME = os.environ.get("KC_LOGIN_THEME", "icph")  # keycloak/themes/icph
 # Browser-visible origins of the form builder, comma separated.
-APP_URLS = [u.strip().rstrip("/") for u in os.environ.get("APP_URLS", "http://localhost:5173").split(",") if u.strip()]
+APP_URLS = [u.strip().rstrip("/") for u in os.environ.get("APP_URLS", "http://localhost:5174").split(",") if u.strip()]
 ADMIN_ROLE, FIELD_AGENT_ROLE = "icph-admin", "icph-field-agent"
 ROLES = [(ADMIN_ROLE, "Builds, publishes and reviews forms"),
          (FIELD_AGENT_ROLE, "Collects and reviews entries for published forms")]
 # (username, password, first name, last name, role)
 USERS = [(os.environ.get("APP_ADMIN_USERNAME", "admin"), os.environ.get("APP_ADMIN_PASSWORD", "password"),
           "ICPH", "Admin", ADMIN_ROLE),
+         (os.environ.get("APP_ADMIN2_USERNAME", "admin2"), os.environ.get("APP_ADMIN2_PASSWORD", "password2"),
+          "ICPH", "Admin Two", ADMIN_ROLE),
+         (os.environ.get("APP_ADMIN3_USERNAME", "admin3"), os.environ.get("APP_ADMIN3_PASSWORD", "password3"),
+          "ICPH", "Admin Three", ADMIN_ROLE),
          (os.environ.get("APP_FIELD_AGENT_USERNAME", "fieldagent"), os.environ.get("APP_FIELD_AGENT_PASSWORD", "password"),
           "Field", "Agent", FIELD_AGENT_ROLE)]
+RESET_APP_USER_PASSWORDS = {
+    username.strip()
+    for username in os.environ.get("APP_RESET_PASSWORDS", "").split(",")
+    if username.strip()
+}
 
 def http(method, url, body=None, ctype="application/json", token=None, ok=(200, 201, 204, 409)):
     data = None
@@ -129,6 +140,28 @@ api("PUT", f"/realms/{REALM}/clients/{existing['id']}", {**existing, **client})
 offline_scope = next(s for s in jget(f"/realms/{REALM}/client-scopes") if s["name"] == "offline_access")
 api("PUT", f"/realms/{REALM}/clients/{existing['id']}/optional-client-scopes/{offline_scope['id']}")
 
+# 3b. private service account for username suggestions and explicit sharing.
+# It can search users, but it cannot create accounts or change passwords.
+if DIRECTORY_CLIENT_SECRET:
+    step(f"client {DIRECTORY_CLIENT_ID} (read-only user directory)")
+    directory_client = {
+        "clientId": DIRECTORY_CLIENT_ID, "name": "ICPH User Directory",
+        "protocol": "openid-connect", "enabled": True,
+        "publicClient": False, "clientAuthenticatorType": "client-secret",
+        "secret": DIRECTORY_CLIENT_SECRET, "serviceAccountsEnabled": True,
+        "standardFlowEnabled": False, "directAccessGrantsEnabled": False,
+    }
+    api("POST", f"/realms/{REALM}/clients", directory_client)
+    directory = jget(f"/realms/{REALM}/clients?clientId={DIRECTORY_CLIENT_ID}")[0]
+    api("PUT", f"/realms/{REALM}/clients/{directory['id']}", {**directory, **directory_client})
+    service_user = jget(f"/realms/{REALM}/users?username=service-account-{urllib.parse.quote(DIRECTORY_CLIENT_ID)}&exact=true")[0]
+    realm_management = jget(f"/realms/{REALM}/clients?clientId=realm-management")[0]
+    directory_roles = [
+        jget(f"/realms/{REALM}/clients/{realm_management['id']}/roles/{name}")
+        for name in ("query-users", "view-users")
+    ]
+    api("POST", f"/realms/{REALM}/users/{service_user['id']}/role-mappings/clients/{realm_management['id']}", directory_roles)
+
 # 4. users -------------------------------------------------------------------
 for username, password, first, last, role_name in USERS:
     step(f"user {username} -> {role_name}")
@@ -138,6 +171,10 @@ for username, password, first, last, role_name in USERS:
         "credentials": [{"type": "password", "value": password, "temporary": False}],
     })
     uid = jget(f"/realms/{REALM}/users?username={urllib.parse.quote(username)}&exact=true")[0]["id"]
+    if username in RESET_APP_USER_PASSWORDS:
+        api("PUT", f"/realms/{REALM}/users/{uid}/reset-password", {
+            "type": "password", "value": password, "temporary": False,
+        })
     role = jget(f"/realms/{REALM}/roles/{role_name}")
     api("POST", f"/realms/{REALM}/users/{uid}/role-mappings/realm", [role])
 

@@ -79,7 +79,7 @@ folder.
 Open the app:
 
 ```text
-http://localhost:5173
+http://localhost:5174
 ```
 
 The API is exposed at:
@@ -89,7 +89,7 @@ http://localhost:8787
 ```
 
 The web and API ports are bound to the host loopback interface by default. For
-shared hosting, put an HTTPS reverse proxy in front of ports `5173` and `8787`;
+shared hosting, put an HTTPS reverse proxy in front of ports `5174` and `8787`;
 HTTPS is required for browser camera and geolocation permissions. Do not expose
 the API directly to the public internet.
 
@@ -117,10 +117,10 @@ This stops and removes the containers but keeps the database volume. `docker com
 volume, and with it every form and submission.
 
 The browser picks the API address from the page's own address. When the app is
-opened on an explicit port (such as `http://localhost:5173`), it calls port
+opened on an explicit port (such as `http://localhost:5174`), it calls port
 `8787` on the same host. When it is opened on a standard port, as behind a
 reverse proxy that serves both paths on one HTTPS origin, it calls `/api` on
-that same origin. The proxy should route `/` to port `5173` and `/api/` to port
+that same origin. The proxy should route `/` to port `5174` and `/api/` to port
 `8787`. Set `VITE_FORM_BUILDER_API` in `.env` and rebuild only if the API lives
 somewhere else.
 
@@ -307,8 +307,9 @@ npm run dev
 Open:
 
 ```text
-http://localhost:5173
+http://localhost:5174
 ```
+
 
 ### Sign-in
 
@@ -324,11 +325,29 @@ client, the roles `icph-admin` and `icph-field-agent`, and two users:
 | User | Password | Role |
 |---|---|---|
 | `admin` | `password` | `icph-admin` |
+| `admin2` | `password2` | `icph-admin` |
+| `admin3` | `password3` | `icph-admin` |
 | `fieldagent` | `password` | `icph-field-agent` |
 
 The login page uses the `icph` theme in `keycloak/themes/icph/login/`
 (templates, `resources/css/custom.css`, logos in `resources/img/`). It is
 mounted into the Keycloak container, so edits show on the next page reload.
+
+Each person signs in with their own Keycloak account. The local setup seeds
+three admins and one field agent; add additional accounts in the Keycloak console at
+`http://localhost:8080`, select the `icph` realm, create a user, set a
+non-temporary password, and assign `icph-admin` or `icph-field-agent`.
+
+Forms in a project share one collaborative workspace. The project owner can use
+**Add people** to find an account by username and share that project. Admins who
+are shared in can build and manage everything in the project; field agents who
+are shared in can collect from and review only its published forms. On a
+published form, **Field agent access** grants access to that form individually.
+Project sharing assigns the account's Keycloak role automatically. Forms outside a project
+belong only to the account that created them. Entries are visible to members of
+the form's workspace, while the recorded submitter remains available for audit.
+Field agents cannot delete entries; they can flag entries for admin review, and
+admins can clear the review request after handling it.
 
 For a deployed Keycloak, `keycloak/Dockerfile` builds a production-mode image
 with the theme copied in (`docker build -t <image> keycloak`). It needs a
@@ -392,7 +411,7 @@ alphanumeric respondent form code. A signed-in field agent fills a published
 form from the Field Agent screen, or by entering the code at:
 
 ```text
-http://localhost:5173/respondent
+http://localhost:5174/respondent
 ```
 
 The form-builder API runs on:

@@ -63,19 +63,37 @@ function currentToken() {
 }
 
 async function fetchAuthConfig() {
-  const response = await fetch(`${apiBase}/api/auth/config`);
-  if (!response.ok) throw new Error("Login configuration is unavailable.");
-  const { url, realm, clientId, offlineSignInDays } = await response.json();
-  writeStored(CONFIG_KEY, { url, realm, clientId, offlineSignInDays });
-  return { url, realm, clientId, offlineSignInDays };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    const response = await fetch(`${apiBase}/api/auth/config`, { signal: controller.signal });
+    if (!response.ok) throw new Error(`Login configuration is unavailable (HTTP ${response.status}).`);
+    const { url, realm, clientId, offlineSignInDays } = await response.json();
+    if (!url || !realm || !clientId) throw new Error("Login configuration is incomplete.");
+    writeStored(CONFIG_KEY, { url, realm, clientId, offlineSignInDays });
+    return { url, realm, clientId, offlineSignInDays };
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("Timed out connecting to the sign-in service.");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-// The saved settings are used at once and refreshed for the next start.
+// Use the API's current Keycloak URL before starting a login; fall back to
+// saved config only when the API cannot be reached.
 async function loadAuthConfig() {
   const cached = readStored(CONFIG_KEY);
-  if (!cached) return fetchAuthConfig();
-  if (isOnline()) fetchAuthConfig().catch(() => {});
-  return cached;
+  if (isOnline()) {
+    try {
+      return await fetchAuthConfig();
+    } catch (error) {
+      if (cached) return cached;
+      throw error;
+    }
+  }
+  if (cached) return cached;
+  return fetchAuthConfig();
 }
 
 // Keycloak returns to the app with the login result in the URL fragment.
@@ -148,6 +166,7 @@ export function authSession() {
     needsReconnect,
     offline,
     verifiedAt,
+    userId: claims.sub || "",
     username: claims.preferred_username || "",
     roles: claims.realm_access?.roles || []
   };
@@ -164,9 +183,10 @@ export function initAuth() {
       keycloak.onAuthLogout = persistTokens;
       const stored = readStored(TOKENS_KEY);
       if (!stored?.token || isLoginCallback()) {
-        // Nothing saved to show yet; without a saved login Keycloak starts
-        // without the network unless it is finishing a sign-in.
-        await startKeycloak();
+        // A new visitor has no saved session to restore. Start Keycloak in the
+        // background so an unavailable identity service cannot block the app.
+        if (isLoginCallback()) await startKeycloak();
+        else void startKeycloak();
         return authSession();
       }
       // Open with the saved login straight away and let Keycloak confirm it
@@ -207,7 +227,8 @@ export async function authHeaders() {
   try {
     await initAuth();
   } catch {
-    return {};
+    const storedToken = readStored(TOKENS_KEY)?.token;
+    return storedToken ? { authorization: `Bearer ${storedToken}` } : {};
   }
   if (isOnline()) {
     await withinKeycloakWait((async () => {
@@ -215,7 +236,7 @@ export async function authHeaders() {
       if (keycloak.token) await keycloak.updateToken(30);
     })().catch(() => {}));
   }
-  const token = currentToken();
+  const token = currentToken() || readStored(TOKENS_KEY)?.token;
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 

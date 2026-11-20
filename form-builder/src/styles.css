@@ -563,7 +563,7 @@ button:disabled {
   justify-content: space-between;
   gap: 14px;
   min-height: 66px;
-  padding: 10px 24px;
+  padding: 10px 24px calc(10px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.96);
   box-shadow: 0 -12px 28px rgba(31, 42, 68, 0.1);
@@ -572,6 +572,111 @@ button:disabled {
 
 .home-footer {
   justify-content: flex-start;
+}
+
+.field-agent-footer.has-sync-errors {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 8px;
+}
+
+.field-agent-sync-errors {
+  width: 100%;
+  max-height: 120px;
+  overflow: auto;
+  color: #8a2b20;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.field-agent-sync-errors > div {
+  overflow-wrap: anywhere;
+}
+
+.field-agent-sync-error-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.field-agent-sync-errors small {
+  color: var(--muted);
+}
+
+.profile-layout {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 24px 20px 112px;
+}
+
+.profile-panel,
+.profile-archive-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.profile-panel h2,
+.profile-archive-panel h2 {
+  margin: 0;
+}
+
+.profile-panel form {
+  display: grid;
+  gap: 14px;
+  max-width: 540px;
+}
+
+.profile-readonly-value {
+  display: flex;
+  align-items: center;
+  min-height: 46px;
+  padding: 10px 14px;
+  border: 1px solid #d9dee8;
+  border-radius: 8px;
+  background: #f1f3f6;
+  color: #687386;
+  font-size: 15px;
+  cursor: default;
+  user-select: text;
+}
+
+.profile-archive-row .entry-details {
+  min-width: 0;
+}
+
+.profile-archive-row .entry-actions {
+  flex-wrap: wrap;
+}
+
+.app-shell:has(.field-agent-footer.has-sync-errors) .field-agent-layout {
+  padding-bottom: 220px;
+}
+
+.checkpoint-answer-list {
+  display: grid;
+  gap: 7px;
+  margin: 8px 0 0;
+}
+
+.checkpoint-answer-list > div {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.4fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.checkpoint-answer-list dt {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.checkpoint-answer-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 .footer-status {
@@ -692,6 +797,7 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
   min-height: calc(100vh - 92px);
+  padding-bottom: 96px;
 }
 
 .field-agent-sidebar {
@@ -803,7 +909,7 @@ button:disabled {
   display: grid;
   align-content: start;
   gap: 16px;
-  padding: 22px;
+  padding: 22px 22px 32px;
   min-width: 0;
 }
 
@@ -825,6 +931,25 @@ button:disabled {
 
 .field-agent-entry-row {
   grid-template-columns: 22px minmax(0, 1fr) auto;
+}
+
+.review-request-note {
+  color: #8a5100 !important;
+  font-weight: 600;
+}
+
+.review-request-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid #f0d0a5;
+  border-radius: 999px;
+  color: #8a5100;
+  background: #fff8ed;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 @keyframes spin {
@@ -1021,6 +1146,15 @@ button:disabled {
 .card-head h3 {
   margin: 0 0 4px;
   font-size: 17px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.shared-form-indicator {
+  flex: 0 0 auto;
+  color: var(--muted);
 }
 
 .card-head p,
@@ -1273,6 +1407,104 @@ button:disabled {
 
 .folder-row-head .danger-action {
   color: #b42318;
+}
+
+.folder-row-end-actions {
+  display: grid;
+  justify-items: center;
+  align-content: start;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+
+.shared-people-indicator {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 22px;
+  color: var(--muted);
+}
+
+.folder-share-button {
+  flex: 0 0 auto;
+}
+
+.folder-share-modal {
+  width: min(520px, 100%);
+  gap: 12px;
+}
+
+.folder-share-modal .modal-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.folder-share-modal .modal-heading h2 {
+  margin: 3px 0 0;
+}
+
+.username-suggestions {
+  display: grid;
+  gap: 4px;
+  max-height: 190px;
+  overflow: auto;
+  margin-top: -8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.username-suggestions button,
+.folder-member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 11px;
+}
+
+.username-suggestions button {
+  border: 0;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.username-suggestions button:hover {
+  background: #f2f6fc;
+}
+
+.username-suggestions button span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.folder-member-list {
+  display: grid;
+  gap: 6px;
+}
+
+.folder-member-list h3 {
+  margin: 6px 0 0;
+  font-size: 14px;
+}
+
+.folder-member-list h4 {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.folder-member-row {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fbfcff;
 }
 
 .folder-form-list {
@@ -2152,6 +2384,13 @@ button:disabled {
   accent-color: var(--accent);
 }
 
+.bulk-check-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-right: auto;
+}
+
 .row-check {
   display: grid;
   place-items: center;
@@ -2925,6 +3164,10 @@ button:disabled {
   border-radius: 8px;
   padding: 10px;
   font-size: 13px;
+}
+
+.incomplete-checkpoint-row {
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .entry-actions {
@@ -4889,6 +5132,16 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
+  .layout,
+  .home-layout,
+  .publish-layout,
+  .fhir-layout,
+  .field-agent-layout,
+  .folder-visualization-main,
+  .fill-shell {
+    padding-bottom: calc(156px + env(safe-area-inset-bottom));
+  }
+
   .field-agent-sidebar {
     border-right: 0;
     border-bottom: 1px solid var(--line);
@@ -4977,7 +5230,7 @@ button:disabled {
   .builder-footer {
     align-items: stretch;
     flex-direction: column;
-    padding: 10px 14px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
   }
 
   .footer-actions {
@@ -5757,4 +6010,130 @@ button.resource-row {
   .participant-assignment-row {
     grid-template-columns: 1fr;
   }
+}
+.review-requested-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.3rem 0.6rem;
+  color: #774d00;
+  background: #fff3cf;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.notification-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  margin-left: 5px;
+  border-radius: 50%;
+  background: #e5484d;
+  box-shadow: 0 0 0 2px #fff;
+  animation: notification-pulse 1.5s ease-in-out infinite;
+}
+
+.profile-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.profile-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.profile-tabs button.active {
+  border-bottom-color: #2563eb;
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.profile-tabs .tab-notification-dot {
+  width: 8px;
+  height: 8px;
+}
+
+.profile-notifications-panel {
+  display: grid;
+  gap: 16px;
+}
+
+.notification-list {
+  display: grid;
+  gap: 9px;
+}
+
+.notification-row {
+  padding: 13px 15px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.notification-row.unread {
+  border-color: #bfd3ff;
+  background: #f4f7ff;
+}
+
+.notification-row-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.notification-row p {
+  margin: 5px 0;
+  overflow-wrap: anywhere;
+}
+
+.notification-row time {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.deleted-form-export-actions {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid #f1d3a0;
+  border-radius: 8px;
+  background: #fffaf0;
+}
+
+.deleted-form-export-actions p,
+.deleted-form-export-actions small {
+  margin: 0;
+}
+
+.deleted-form-export-warning {
+  color: #765316;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.notification-unread-label {
+  color: #245fc5;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+@keyframes notification-pulse {
+  50% { opacity: 0.4; transform: scale(0.82); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notification-dot { animation: none; }
 }

@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
   BrowserMultiFormatOneDReader,
@@ -24,6 +25,7 @@ import {
   FileJson,
   FileSpreadsheet,
   FileText,
+  Flag,
   FolderOpen,
   Forward,
   GripVertical,
@@ -44,20 +46,22 @@ import {
   Settings,
   TextCursorInput,
   Upload,
+  UserPlus,
+  Users,
   Trash2,
   ZoomIn,
   ZoomOut,
   X
 } from "lucide-react";
 import "./styles.css";
-import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, configureAuth, confirmSessionEnded, initAuth, login, logout, reconfirmSession } from "./auth.js";
+import { ADMIN_ROLE, FIELD_AGENT_ROLE, authHeaders, authSession, configureAuth, confirmSessionEnded, initAuth, login, logout, reconfirmSession } from "./auth.js";
 import { configureConnectivity, isOnline, onConnectivityChange, reportNetworkFailure, reportNetworkSuccess } from "./connectivity.js";
 import cdpgLogo from "./assets/cdpg-logo.png";
 import icphLogo from "./assets/icph-logo.png";
 
 // Opened on a standard port (behind an ingress or reverse proxy), the API shares
 // the page's origin under /api. Opened on an explicit port (dev server, docker
-// compose on :5173), the API listens on port 8787 of the same host.
+// compose on :5174), the API listens on port 8787 of the same host.
 const DEFAULT_API_BASE = typeof window === "undefined"
   ? "http://localhost:8787"
   : window.location.port
@@ -66,8 +70,13 @@ const DEFAULT_API_BASE = typeof window === "undefined"
 const API_BASE = import.meta.env.VITE_FORM_BUILDER_API || DEFAULT_API_BASE;
 configureAuth(API_BASE);
 configureConnectivity(API_BASE);
+
+function currentOfflineOwnerId() {
+  const session = authSession();
+  return String(session.userId || session.username || "");
+}
 const OFFLINE_DATABASE_NAME = "icph-offline-v1";
-const OFFLINE_DATABASE_VERSION = 2;
+const OFFLINE_DATABASE_VERSION = 3;
 let odkWebFormsLoader = null;
 let offlineDatabasePromise = null;
 let submissionSyncPromise = null;
@@ -1282,40 +1291,41 @@ const OFFLINE_MESSAGE = "You are offline. Connect to the internet and try again.
 // what this device has saved. A read there that gets no answer this soon means
 // the server is out of reach (mobile data on, no signal), so the app is marked
 // offline instead of waiting for the browser to give up.
-const PUBLIC_READ_DEADLINE_MS = 4000;
+const PUBLIC_READ_DEADLINE_MS = 20000;
+const API_REQUEST_DEADLINE_MS = 30000;
 
 async function requestJson(path, options = {}) {
-  // Offline, fail at once instead of trying the network. Callers already fall
-  // back to what this device has saved when a request fails.
   if (!isOnline()) throw new Error(OFFLINE_MESSAGE);
   const controller = new AbortController();
+  const isPublicRead = (options.method || "GET") === "GET" && path.startsWith("/api/public/");
+  const requestDeadlineMs = isPublicRead ? PUBLIC_READ_DEADLINE_MS : API_REQUEST_DEADLINE_MS;
+  let timer = null;
   const send = (async () => {
     const headers = {
       ...(await authHeaders()),
       ...(options.headers || {})
     };
-    return fetch(`${API_BASE}${path}`, { signal: controller.signal, ...options, headers });
+    const response = await fetch(`${API_BASE}${path}`, { signal: controller.signal, ...options, headers });
+    const text = await response.text();
+    return { response, text };
   })();
-  let timer = null;
-  const deadline = (options.method || "GET") === "GET" && path.startsWith("/api/public/")
-    ? new Promise((_, reject) => {
+  const deadline = new Promise((_, reject) => {
       timer = setTimeout(() => {
-        reject(new Error(OFFLINE_MESSAGE));
         controller.abort();
-      }, PUBLIC_READ_DEADLINE_MS);
-    })
-    : null;
+        reject(new Error(`The server did not respond within ${requestDeadlineMs / 1000} seconds. Check the app connection and try again.`));
+      }, requestDeadlineMs);
+    });
   let response;
+  let text;
   try {
-    response = await (deadline ? Promise.race([send, deadline]) : send);
+    ({ response, text } = await Promise.race([send, deadline]));
+    reportNetworkSuccess();
   } catch (error) {
     if (error.name !== "AbortError") reportNetworkFailure();
     throw error;
   } finally {
     clearTimeout(timer);
   }
-  reportNetworkSuccess();
-  const text = await response.text();
   let data = {};
   try {
     data = text ? JSON.parse(text) : {};
@@ -1341,6 +1351,14 @@ function postJson(path, payload) {
   });
 }
 
+function putJson(path, payload) {
+  return requestJson(path, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+}
+
 function openOfflineDatabase() {
   if (!globalThis.indexedDB) return Promise.reject(new Error("Offline storage is unavailable in this browser."));
   if (!offlineDatabasePromise) {
@@ -1349,6 +1367,7 @@ function openOfflineDatabase() {
       request.onupgradeneeded = () => {
         const database = request.result;
         if (!database.objectStoreNames.contains("formPackages")) database.createObjectStore("formPackages", { keyPath: "accessCode" });
+        if (!database.objectStoreNames.contains("accountFormPackages")) database.createObjectStore("accountFormPackages", { keyPath: "id" });
         if (!database.objectStoreNames.contains("offlineDrafts")) database.createObjectStore("offlineDrafts", { keyPath: "id" });
         if (!database.objectStoreNames.contains("submissionQueue")) database.createObjectStore("submissionQueue", { keyPath: "id" });
         if (!database.objectStoreNames.contains("meta")) database.createObjectStore("meta", { keyPath: "key" });
@@ -1426,17 +1445,141 @@ async function readEncryptedOfflineRecords(storeName) {
   return records.filter(Boolean).sort((left, right) => (left.createdAt || 0) - (right.createdAt || 0));
 }
 
-async function loadOfflineFormPackage(accessCode) {
-  return offlineStoreRequest("formPackages", "readonly", (store) => store.get(normalizeAccessCodeInput(accessCode)));
+function queuedRecordAccessCode(record) {
+  const match = String(record?.path || "").match(/\/api\/public\/forms\/([^/]+)/);
+  try { return normalizeAccessCodeInput(match ? decodeURIComponent(match[1]) : ""); } catch { return ""; }
+}
+
+function deletedFormExportKey(ownerId, workspaceId) {
+  return `deleted-form-export:${ownerId}:${workspaceId}`;
+}
+
+async function localDeletedFormExportState(ownerId, workspaceId) {
+  if (!ownerId || !workspaceId) return null;
+  return (await offlineStoreRequest("meta", "readonly", (store) => store.get(deletedFormExportKey(ownerId, workspaceId))))?.value || null;
+}
+
+async function collectLocalDeletedFormData({ accessCode, workspaceId, ownerId }) {
+  const code = normalizeAccessCodeInput(accessCode);
+  const rows = [];
+  const queue = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+  for (const record of queue) {
+    if (record.ownerUserId !== ownerId || queuedRecordAccessCode(record) !== code) continue;
+    if (workspaceId && record.permanentlyDeletedFormWorkspaceId && record.permanentlyDeletedFormWorkspaceId !== workspaceId) continue;
+    if (workspaceId && record.payload?.sourceWorkspaceId && record.payload.sourceWorkspaceId !== workspaceId) continue;
+    const payload = record.payload || {};
+    rows.push({
+      recordType: payload.instanceXml ? "queued ODK submission" : payload.primaryIdentifierValue ? "queued checkpoint" : "queued submission",
+      savedAt: record.lastSyncAttemptAt || record.createdAt,
+      identifier: payload.primaryIdentifierValue || "",
+      answers: payload.answers || {},
+      rawData: payload,
+      syncError: record.lastSyncError || ""
+    });
+  }
+  const drafts = await readEncryptedOfflineRecords("offlineDrafts").catch(() => []);
+  for (const draft of drafts) {
+    if (draft.ownerUserId !== ownerId || normalizeAccessCodeInput(draft.accessCode) !== code) continue;
+    if (workspaceId && draft.workspaceId && draft.workspaceId !== workspaceId) continue;
+    rows.push({ recordType: "local draft", savedAt: draft.updatedAt || draft.createdAt, identifier: "", answers: draft.answers || {}, rawData: draft, syncError: "" });
+  }
+  const cached = (await readEncryptedOfflineRecords("entryCache").catch(() => []))
+    .find((item) => normalizeAccessCodeInput(item.accessCode || String(item.id || "").split(":")[0]) === code && (!workspaceId || !item.workspaceId || item.workspaceId === workspaceId));
+  for (const entry of cached?.entries || []) {
+    if (!ownerId || String(entry.userId || "") !== ownerId) continue;
+    rows.push({
+      recordType: entry.reviewRequestedAt ? "cached entry marked for review" : "cached submitted entry",
+      savedAt: entry.createdAt || entry.submittedAt || cached.createdAt,
+      identifier: "",
+      answers: entry.answers || {},
+      rawData: entry,
+      syncError: ""
+    });
+  }
+  return rows;
+}
+
+function exportDeletedFormDataCsv({ accessCode, formTitle, workspaceId, rows }) {
+  const columns = ["record_type", "form_title", "form_code", "form_workspace_id", "saved_at", "identifier", "answers_json", "raw_data_json", "sync_error"];
+  const csvCell = (value) => {
+    let text = String(value ?? "");
+    if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
+  };
+  const content = [columns, ...rows.map((row) => [
+    row.recordType,
+    formTitle,
+    accessCode,
+    workspaceId,
+    row.savedAt && Number.isFinite(new Date(row.savedAt).getTime()) ? new Date(row.savedAt).toISOString() : "",
+    row.identifier,
+    JSON.stringify(row.answers || {}),
+    JSON.stringify(row.rawData || {}),
+    row.syncError
+  ])].map((line) => line.map(csvCell).join(",")).join("\r\n");
+  const blob = new Blob(["\uFEFF", content], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  const safeCode = normalizeAccessCodeInput(accessCode) || "form";
+  anchor.href = url;
+  anchor.download = `ICPH_${safeCode}_offline_export_${new Date().toISOString().replace(/[:.]/g, "-")}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+async function purgeLocalDeletedFormData({ accessCode, workspaceId, ownerId }) {
+  const code = normalizeAccessCodeInput(accessCode);
+  const queue = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+  await Promise.all(queue.filter((record) => (
+    record.ownerUserId === ownerId && queuedRecordAccessCode(record) === code
+    && (!workspaceId || !record.permanentlyDeletedFormWorkspaceId || record.permanentlyDeletedFormWorkspaceId === workspaceId)
+    && (!workspaceId || !record.payload?.sourceWorkspaceId || record.payload.sourceWorkspaceId === workspaceId)
+  )).map((record) => offlineStoreRequest("submissionQueue", "readwrite", (store) => store.delete(record.id))));
+  const drafts = await readEncryptedOfflineRecords("offlineDrafts").catch(() => []);
+  await Promise.all(drafts.filter((draft) => (
+    draft.ownerUserId === ownerId && normalizeAccessCodeInput(draft.accessCode) === code
+    && (!workspaceId || !draft.workspaceId || draft.workspaceId === workspaceId)
+  )).map((draft) => offlineStoreRequest("offlineDrafts", "readwrite", (store) => store.delete(draft.id))));
+  const formPackage = await loadOfflineFormPackage(code, workspaceId).catch(() => null);
+  if (formPackage && (!workspaceId || !formPackage.workspaceId || formPackage.workspaceId === workspaceId)) {
+    await removeOfflineFormPackage(code, workspaceId);
+  }
+  const cachedEntryRecords = (await readEncryptedOfflineRecords("entryCache").catch(() => []))
+    .filter((item) => normalizeAccessCodeInput(item.accessCode || String(item.id || "").split(":")[0]) === code && (!workspaceId || !item.workspaceId || item.workspaceId === workspaceId));
+  for (const cachedEntries of cachedEntryRecords) {
+    if (cachedEntries.ownerUserId && cachedEntries.ownerUserId !== ownerId) continue;
+    const remaining = (cachedEntries.entries || []).filter((entry) => !entry.userId || entry.userId !== ownerId);
+    if (remaining.length) await saveEncryptedOfflineRecord("entryCache", { ...cachedEntries, entries: remaining, ownerUserId: "" });
+    else await offlineStoreRequest("entryCache", "readwrite", (store) => store.delete(cachedEntries.id));
+  }
+  await offlineStoreRequest("meta", "readwrite", (store) => store.delete(deletedFormExportKey(ownerId, workspaceId)));
+}
+
+async function loadOfflineFormPackage(accessCode, workspaceId = "") {
+  const ownerId = currentOfflineOwnerId();
+  const code = normalizeAccessCodeInput(accessCode);
+  if (!ownerId || !code) return null;
+  const packages = await offlineStoreRequest("accountFormPackages", "readonly", (store) => store.getAll());
+  return packages
+    .filter((item) => item.ownerUserId === ownerId
+      && normalizeAccessCodeInput(item.accessCode) === code
+      && (!workspaceId || !item.workspaceId || item.workspaceId === workspaceId))
+    .sort((left, right) => Number(right.cachedAt || 0) - Number(left.cachedAt || 0))[0] || null;
 }
 
 async function listOfflineFormPackages() {
-  const packages = await offlineStoreRequest("formPackages", "readonly", (store) => store.getAll());
+  const ownerId = currentOfflineOwnerId();
+  if (!ownerId) return [];
+  const packages = (await offlineStoreRequest("accountFormPackages", "readonly", (store) => store.getAll()))
+    .filter((item) => item.ownerUserId === ownerId);
   return packages.map((item) => {
     const form = item.form || item.draft || {};
     const identifier = form.participantIdentifierVariable || form.primaryIdentifierVariable || "";
     return {
       accessCode: item.accessCode,
+      workspaceId: item.workspaceId || "",
       title: item.title || form.title,
       formId: item.formId || form.formId,
       cachedAt: item.cachedAt,
@@ -1456,8 +1599,10 @@ async function listOfflineFormPackages() {
 
 async function listOfflineCheckpointMetadata() {
   const records = await readEncryptedOfflineRecords("submissionQueue");
+  const ownerId = currentOfflineOwnerId();
   const checkpointsByCode = new Map();
   for (const record of records) {
+    if (!ownerId || record.ownerUserId !== ownerId) continue;
     if (!String(record.path || "").endsWith("/checkpoint")) continue;
     const match = String(record.path || "").match(/\/api\/public\/forms\/([^/]+)\/checkpoint$/);
     const code = normalizeAccessCodeInput(match?.[1] || "");
@@ -1482,8 +1627,30 @@ function formatStorageSize(bytes = 0) {
 }
 
 async function saveOfflineFormPackage(formPackage) {
-  await offlineStoreRequest("formPackages", "readwrite", (store) => store.put(formPackage));
+  const ownerId = currentOfflineOwnerId();
+  const accessCode = normalizeAccessCodeInput(formPackage?.accessCode);
+  const workspaceId = String(formPackage?.workspaceId || "").trim();
+  if (!ownerId || !accessCode || !workspaceId) throw new Error("A signed-in account and form version are required to save an offline form.");
+  await offlineStoreRequest("accountFormPackages", "readwrite", (store) => store.put({
+    ...formPackage,
+    id: `${ownerId}:${accessCode}:${workspaceId}`,
+    accessCode,
+    workspaceId,
+    ownerUserId: ownerId
+  }));
   try { await navigator.storage?.persist?.(); } catch {}
+}
+
+async function adoptAuthorizedLegacyFormPackages(authorizedForms = []) {
+  const ownerId = currentOfflineOwnerId();
+  if (!ownerId) return;
+  for (const form of authorizedForms) {
+    const code = normalizeAccessCodeInput(form.respondentAccessCode);
+    if (!code || !form.workspaceId) continue;
+    const legacyPackage = await offlineStoreRequest("formPackages", "readonly", (store) => store.get(code)).catch(() => null);
+    if (!legacyPackage || legacyPackage.workspaceId !== form.workspaceId) continue;
+    await saveOfflineFormPackage(legacyPackage).catch(() => {});
+  }
 }
 
 // Everything needed to fill a form with no connection: its definition, XML,
@@ -1498,15 +1665,27 @@ async function fetchFormPackage(formApiBase, accessCode = "") {
     xml = xmlData.xml || "";
     publishedForm = parseXFormXml(xml, draft);
   }
-  const attachmentList = await requestJson(`${formApiBase}/attachments`).catch(() => ({ attachments: [] }));
-  const attachments = (await Promise.all((attachmentList.attachments || []).map(async (attachment) => {
+  const attachmentList = await requestJson(`${formApiBase}/attachments`);
+  const attachments = await Promise.all((attachmentList.attachments || []).map(async (attachment) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
     try {
-      const response = await fetch(`${API_BASE}${formApiBase}/attachments/${encodeURIComponent(attachment.fileName)}`, { headers: await authHeaders() });
-      if (!response.ok) return null;
+      const response = await fetch(`${API_BASE}${formApiBase}/attachments/${encodeURIComponent(attachment.fileName)}`, {
+        signal: controller.signal,
+        headers: await authHeaders()
+      });
+      if (!response.ok) {
+        throw new Error(`Could not download form attachment "${attachment.fileName}" (HTTP ${response.status}).`);
+      }
       const blob = await response.blob();
       return { fileName: attachment.fileName, contentType: blob.type || attachment.contentType || "application/octet-stream", blob };
-    } catch { return null; }
-  }))).filter(Boolean);
+    } catch (error) {
+      if (error.name === "AbortError") throw new Error(`Timed out downloading form attachment "${attachment.fileName}".`);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }));
   const cachedByName = new Map(attachments.map((item) => [resourceFileKey(item.fileName), item.blob]));
   const externalChoices = {};
   for (const question of publishedForm.questions || []) {
@@ -1518,6 +1697,7 @@ async function fetchFormPackage(formApiBase, accessCode = "") {
     data,
     formPackage: {
       accessCode: normalizeAccessCodeInput(accessCode),
+      workspaceId: data.workspaceId || "",
       title: publishedForm.title || data.title || "ICPH Form",
       formId: publishedForm.formId || data.formId || "",
       version: data.offlineVersion || "",
@@ -1540,25 +1720,62 @@ async function downloadOfflineFormPackage(accessCode) {
   return formPackage;
 }
 
-async function removeOfflineFormPackage(accessCode) {
-  await offlineStoreRequest("formPackages", "readwrite", (store) => store.delete(normalizeAccessCodeInput(accessCode)));
-  await removeCachedFormEntries(accessCode).catch(() => {});
+async function removeOfflineFormPackage(accessCode, workspaceId = "") {
+  const ownerId = currentOfflineOwnerId();
+  const code = normalizeAccessCodeInput(accessCode);
+  if (ownerId && code) {
+    const packages = await offlineStoreRequest("accountFormPackages", "readonly", (store) => store.getAll());
+    await Promise.all(packages.filter((item) => item.ownerUserId === ownerId
+      && normalizeAccessCodeInput(item.accessCode) === code
+      && (!workspaceId || item.workspaceId === workspaceId))
+      .map((item) => offlineStoreRequest("accountFormPackages", "readwrite", (store) => store.delete(item.id))));
+  }
+  await removeCachedFormEntries(accessCode, workspaceId).catch(() => {});
 }
 
 // Synced entries of a saved form, kept encrypted on this device for offline viewing.
-async function saveCachedFormEntries(accessCode, entries = []) {
-  const id = normalizeAccessCodeInput(accessCode);
-  if (!id) return;
-  await saveEncryptedOfflineRecord("entryCache", { id, entries, createdAt: Date.now() });
+async function saveCachedFormEntries(accessCode, entries = [], workspaceId = "") {
+  const code = normalizeAccessCodeInput(accessCode);
+  const ownerId = currentOfflineOwnerId();
+  if (!code || !ownerId) return;
+  const id = `${ownerId}:${code}:${workspaceId || "legacy"}`;
+  await saveEncryptedOfflineRecord("entryCache", { id, ownerUserId: ownerId, accessCode: code, workspaceId, entries, createdAt: Date.now() });
 }
 
 async function readCachedFormEntries() {
   const records = await readEncryptedOfflineRecords("entryCache");
-  return new Map(records.map((record) => [normalizeAccessCodeInput(record.id), record.entries || []]));
+  const ownerId = currentOfflineOwnerId();
+  const output = new Map();
+  for (const record of records) {
+    const recordCode = normalizeAccessCodeInput(record.accessCode || String(record.id || "").split(":")[0]);
+    if (!recordCode) continue;
+    const entries = (record.entries || []).filter((entry) => ownerId && (
+      record.ownerUserId === ownerId ? (!entry.userId || String(entry.userId) === ownerId) : String(entry.userId || "") === ownerId
+    ));
+    output.set(`${recordCode}:${record.workspaceId || "legacy"}`, entries);
+    if (!record.workspaceId) output.set(recordCode, entries);
+  }
+  return output;
 }
 
-async function removeCachedFormEntries(accessCode) {
-  await offlineStoreRequest("entryCache", "readwrite", (store) => store.delete(normalizeAccessCodeInput(accessCode)));
+async function removeCachedFormEntries(accessCode, workspaceId = "") {
+  const code = normalizeAccessCodeInput(accessCode);
+  const ownerId = currentOfflineOwnerId();
+  if (!code || !ownerId) return;
+  const records = await readEncryptedOfflineRecords("entryCache");
+  for (const record of records.filter((item) => (
+    normalizeAccessCodeInput(item.accessCode || String(item.id || "").split(":").at(-2)) === code
+    && (!workspaceId || !item.workspaceId || item.workspaceId === workspaceId)
+    && (!item.ownerUserId || item.ownerUserId === ownerId)
+  ))) {
+    const remaining = (record.entries || []).filter((entry) => !entry.userId || entry.userId !== ownerId);
+    if (remaining.length) await saveEncryptedOfflineRecord("entryCache", { ...record, entries: remaining, ownerUserId: "" });
+    else await offlineStoreRequest("entryCache", "readwrite", (store) => store.delete(record.id));
+  }
+}
+
+function cachedEntriesForForm(cache, code, workspaceId) {
+  return cache.get(`${normalizeAccessCodeInput(code)}:${workspaceId || "legacy"}`) || cache.get(normalizeAccessCodeInput(code)) || [];
 }
 
 // Same leaf-value reading the server does for ODK submissions.
@@ -1586,8 +1803,10 @@ function answersFromInstanceXml(instanceXml) {
 // Submitted entries still waiting in the sync queue, by form code.
 async function listQueuedEntriesByCode() {
   const records = await readEncryptedOfflineRecords("submissionQueue");
+  const ownerId = currentOfflineOwnerId();
   const byCode = new Map();
   for (const record of records) {
+    if (!ownerId || record.ownerUserId !== ownerId) continue;
     const match = String(record.path || "").match(/\/api\/public\/forms\/([^/]+)\/(entries|odk-submissions)$/);
     let code = "";
     try { code = normalizeAccessCodeInput(decodeURIComponent(match?.[1] || "")); } catch {}
@@ -1629,31 +1848,38 @@ function mergeQueuedEntries(entries = [], queued = []) {
 // Drops saved forms the server no longer offers for filling (deleted,
 // unpublished, locked or given a new code while this device was offline).
 // Unsynced entries and checkpoints stay in the queue; only the form goes.
-async function removeWithdrawnOfflineForms(liveAccessCodes) {
+async function findWithdrawnOfflineForms(liveAccessCodes) {
   const live = new Set(Array.from(liveAccessCodes, (code) => normalizeAccessCodeInput(code)));
   const saved = await listOfflineFormPackages();
-  const withdrawn = saved.filter((item) => !live.has(normalizeAccessCodeInput(item.accessCode)));
-  for (const item of withdrawn) await removeOfflineFormPackage(item.accessCode);
-  return withdrawn;
+  // Never erase downloaded forms or cached entries because a server listing
+  // changed. Pending drafts and submissions may still depend on these records.
+  return saved.filter((item) => !live.has(normalizeAccessCodeInput(item.accessCode)));
 }
 
-function offlineDraftId(accessCode, workspaceId = "", entryId = "") {
-  return `${normalizeAccessCodeInput(accessCode) || workspaceRouteId(workspaceId)}:${entryId || "active"}`;
+function offlineDraftId(accessCode, workspaceId = "", entryId = "", ownerId = currentOfflineOwnerId()) {
+  return `${ownerId || "unassigned"}:${normalizeAccessCodeInput(accessCode) || workspaceRouteId(workspaceId)}:${entryId || "active"}`;
 }
 
-async function saveOfflineFirst(path, payload) {
+async function saveOfflineFirst(path, payload, { method = "POST" } = {}) {
   const id = crypto.randomUUID();
+  const ownerUserId = currentOfflineOwnerId();
   try {
     await offlineStoreRequest("meta", "readwrite", (store) => store.put({ key: "apiBase", value: API_BASE }));
     await saveEncryptedOfflineRecord("submissionQueue", {
       id,
+      ownerUserId,
       path,
+      method,
       payload,
       createdAt: Date.now()
     });
   } catch (error) {
     if (!isOnline()) throw error;
-    await postJson(path, { ...payload, clientSubmissionId: id });
+    await requestJson(path, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...payload, clientSubmissionId: id })
+    });
     return { id, queued: false, error: "", pendingCount: await getPendingSubmissionCount() };
   }
   try {
@@ -1675,28 +1901,70 @@ async function syncPendingSubmissions(onlyId = "") {
     return syncPendingSubmissions(onlyId);
   }
   submissionSyncPromise = (async () => {
-    const records = await readEncryptedOfflineRecords("submissionQueue");
+    const ownerId = currentOfflineOwnerId();
+  const records = (await readEncryptedOfflineRecords("submissionQueue"))
+      .filter((record) => ownerId && record.ownerUserId === ownerId && !record.permanentlyDeletedAt);
+    const syncBatchId = crypto.randomUUID();
     const syncedIds = [];
+    const terminalIds = [];
     const errors = {};
     for (const record of records) {
       if (onlyId && record.id !== onlyId) continue;
       try {
-        await postJson(record.path, { ...record.payload, clientSubmissionId: record.id });
+        await requestJson(record.path, {
+          method: record.method || "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...record.payload, sourceWorkspaceId: record.payload?.sourceWorkspaceId || record.formWorkspaceId || "", clientSubmissionId: record.id, clientSyncBatchId: syncBatchId })
+        });
         await offlineStoreRequest("submissionQueue", "readwrite", (store) => store.delete(record.id));
         syncedIds.push(record.id);
       } catch (error) {
-        errors[record.id] = error.message || String(error);
+        const message = error.message || String(error);
+        if (error.status === 410) {
+          const deletedCode = String(record.path || "").match(/\/api\/public\/forms\/([^/]+)/)?.[1] || "";
+          const deletionDetails = error.payload?.details || {};
+          const affectedRecords = deletedCode
+            ? records.filter((candidate) => (
+              String(candidate.path || "").match(/\/api\/public\/forms\/([^/]+)/)?.[1] === deletedCode
+              && (!deletionDetails.formWorkspaceId || !candidate.payload?.sourceWorkspaceId || candidate.payload.sourceWorkspaceId === deletionDetails.formWorkspaceId)
+            ))
+            : [record];
+          await Promise.all(affectedRecords.map((candidate) => saveEncryptedOfflineRecord("submissionQueue", {
+            ...candidate,
+            permanentlyDeletedAt: Date.now(),
+            permanentlyDeletedFormWorkspaceId: deletionDetails.formWorkspaceId || candidate.payload?.sourceWorkspaceId || "",
+            permanentlyDeletedFormTitle: deletionDetails.formTitle || "Deleted form",
+            lastSyncError: message,
+            lastSyncAttemptAt: Date.now(),
+            lastSyncErrorReadAt: null
+          })));
+          terminalIds.push(...affectedRecords.map((candidate) => candidate.id));
+          continue;
+        }
+        errors[record.id] = message;
+        // Keep the latest server response with the encrypted queued submission so
+        // the field-agent portal can explain failures after the fill window closes.
+        await saveEncryptedOfflineRecord("submissionQueue", {
+          ...record,
+          lastSyncError: message,
+          lastSyncAttemptAt: Date.now(),
+          lastSyncErrorReadAt: null
+        }).catch(() => {});
         if (!error.status || error.status >= 500) break;
       }
     }
-    if (syncedIds.length) notifyCollectionChanged();
-    return { syncedIds, errors, pendingCount: await getPendingSubmissionCount() };
+    if (syncedIds.length || terminalIds.length || Object.keys(errors).length) notifyCollectionChanged();
+    return { syncedIds, terminalIds, errors, pendingCount: await getPendingSubmissionCount() };
   })().finally(() => { submissionSyncPromise = null; });
   return submissionSyncPromise;
 }
 
 async function getPendingSubmissionCount() {
-  try { return (await offlineStoreRequest("submissionQueue", "readonly", (store) => store.count())) || 0; }
+  try {
+    const ownerId = currentOfflineOwnerId();
+    if (!ownerId) return 0;
+    return (await readEncryptedOfflineRecords("submissionQueue")).filter((record) => record.ownerUserId === ownerId && !record.permanentlyDeletedAt).length;
+  }
   catch { return 0; }
 }
 
@@ -2571,11 +2839,17 @@ function entryDisplayValue(entry, displayField = "") {
 
 function entriesToCsv(form, entries) {
   const questions = entryCsvQuestions(form);
-  const headers = questions.map((question) => String(question.name || "").trim());
+  const headers = ["submitted_by_name", "submitted_by_username", "submitted_by_user_id", "submitted_at", ...questions.map((question) => String(question.name || "").trim())];
   const rows = [headers.map(csvEscape).join(",")];
   for (const entry of entries) {
     const answers = computeCalculatedAnswers(form, entry.answers || {});
-    rows.push(questions.map((question) => csvEscape(entryExportValue(answers, question))).join(","));
+    rows.push([
+      csvEscape(entry.submittedByName || entry.submittedByUsername || ""),
+      csvEscape(entry.submittedByUsername || ""),
+      csvEscape(entry.submittedByUserId || entry.userId || ""),
+      csvEscape(entry.submittedAt || ""),
+      ...questions.map((question) => csvEscape(entryExportValue(answers, question)))
+    ].join(","));
   }
   return rows.join("\n") + "\n";
 }
@@ -3477,6 +3751,10 @@ function App() {
   if (path.startsWith("/folder-visualization/")) {
     return <FolderVisualizationPage folderId={decodeURIComponent(path.replace("/folder-visualization/", "").split("/")[0] || "")} />;
   }
+  if (path.startsWith("/project-visualization/")) {
+    return <FolderVisualizationPage folderId={decodeURIComponent(path.replace("/project-visualization/", "").split("/")[0] || "")} />;
+  }
+  if (path === "/profile") return <ProfileGate />;
   if (path.startsWith("/respondent")) {
     const initialCode = decodeURIComponent(path.replace(/^\/respondent\/?/, "").split("/")[0] || "");
     return <FieldAgentGate>{() => <RespondentPortal initialCode={initialCode} />}</FieldAgentGate>;
@@ -3489,6 +3767,7 @@ function App() {
     return (
       <FieldAgentGate>
         {() => <FillForm
+          workspaceId={params.get("workspaceId") || ""}
           accessCode={decodeURIComponent(path.replace("/public-fill/", "").split("/")[0])}
           entryId={params.get("entryId") || ""}
           resumeCheckpointIdentifier={params.get("checkpoint") || ""}
@@ -3502,11 +3781,24 @@ function App() {
   }
   if (path.startsWith("/fill/")) {
     const params = new URLSearchParams(window.location.search);
-    return <FillForm workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])} entryId={params.get("entryId") || ""} />;
+    return <FillForm
+      workspaceId={decodeURIComponent(path.replace("/fill/", "").split("/")[0])}
+      entryId={params.get("entryId") || ""}
+      adminCheckpointIdentifier={params.get("checkpoint") || ""}
+      adminCheckpointUserId={params.get("userId") || ""}
+    />;
   }
   if (path.startsWith("/entry/")) {
     const parts = path.replace("/entry/", "").split("/");
     return <EntryViewer workspaceId={decodeURIComponent(parts[0] || "")} entryId={decodeURIComponent(parts[1] || "")} />;
+  }
+  if (path.startsWith("/checkpoint/")) {
+    const parts = path.replace("/checkpoint/", "").split("/");
+    return <EntryViewer
+      workspaceId={decodeURIComponent(parts[0] || "")}
+      checkpointIdentifier={decodeURIComponent(parts[1] || "")}
+      checkpointUserId={decodeURIComponent(parts[2] || "")}
+    />;
   }
   return <AdminApp />;
 }
@@ -3540,7 +3832,7 @@ function folderVisualizationResponseValue(entry, form, displayVariable = "") {
 function FolderVisualizationPage({ folderId }) {
   const [folder, setFolder] = useState(null);
   const [forms, setForms] = useState([]);
-  const [status, setStatus] = useState({ kind: "busy", message: "Loading folder responses..." });
+  const [status, setStatus] = useState({ kind: "busy", message: "Loading project responses..." });
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [positions, setPositions] = useState({});
@@ -3550,14 +3842,14 @@ function FolderVisualizationPage({ folderId }) {
   const graphRef = useRef(null);
 
   async function loadVisualization() {
-    setStatus({ kind: "busy", message: "Loading folder responses..." });
+    setStatus({ kind: "busy", message: "Loading project responses..." });
     try {
       const [folderData, formData] = await Promise.all([
         requestJson("/api/folders"),
         requestJson("/api/forms")
       ]);
       const nextFolder = (folderData.folders || []).find((item) => item.id === folderId);
-      if (!nextFolder) throw new Error("Folder not found.");
+      if (!nextFolder) throw new Error("Project not found.");
       const selectedForms = visibleVersionForFolderForms(formData.forms || [], folderId);
       const enrichedForms = await Promise.all(selectedForms.map(async (form) => {
         const [entryData, draftData] = await Promise.all([
@@ -3583,7 +3875,7 @@ function FolderVisualizationPage({ folderId }) {
   }
 
   async function downloadFolderWorkbook() {
-    setStatus({ kind: "busy", message: "Preparing folder response workbook..." });
+    setStatus({ kind: "busy", message: "Preparing project response workbook..." });
     try {
       const response = await fetch(`${API_BASE}/api/folders/${encodeURIComponent(folderId)}/responses.xlsx`, {
         headers: await authHeaders()
@@ -3592,13 +3884,13 @@ function FolderVisualizationPage({ folderId }) {
         const text = await response.text();
         let message = text;
         try { message = JSON.parse(text).error || text; } catch {}
-        throw new Error(message || "Folder workbook export failed.");
+        throw new Error(message || "Project workbook export failed.");
       }
       const blob = await response.blob();
       const disposition = response.headers.get("content-disposition") || "";
       const match = disposition.match(/filename="?([^";]+)"?/i);
-      downloadBlob(blob, match?.[1] || safeDownloadName(`${folder?.name || "folder"}_responses.xlsx`, "folder_responses.xlsx"));
-      setStatus({ kind: "ok", message: "Folder response workbook downloaded." });
+      downloadBlob(blob, match?.[1] || safeDownloadName(`${folder?.name || "project"}_responses.xlsx`, "project_responses.xlsx"));
+      setStatus({ kind: "ok", message: "Project response workbook downloaded." });
     } catch (error) {
       setStatus({ kind: "error", message: error.message || String(error) });
     }
@@ -3722,16 +4014,16 @@ function FolderVisualizationPage({ folderId }) {
           </button>
         </div>
         <div className="topbar-title">
-          <h1>{folder?.name || "Folder visualization"}</h1>
-          <p>Interactive response map for forms in this folder.</p>
+          <h1>{folder?.name || "Project visualization"}</h1>
+          <p>Interactive response map for forms in this project.</p>
         </div>
         <div className="topbar-brand"><BrandLogos /></div>
       </header>
       <main className="folder-visualization-main">
         <div className="folder-visualization-heading">
           <div>
-            <span className="eyebrow">Folder responses</span>
-            <h2>{folder?.name || "Loading folder..."}</h2>
+            <span className="eyebrow">Project responses</span>
+            <h2>{folder?.name || "Loading project..."}</h2>
             <p>Forms are linked by <strong>{identifierLabel}</strong>. Drag nodes to explore the relationship map.</p>
           </div>
           <div className="folder-graph-actions">
@@ -3750,7 +4042,7 @@ function FolderVisualizationPage({ folderId }) {
         </div>
         <div className="folder-graph-viewport" ref={graphRef} onPointerDown={startPan} onWheel={(event) => { event.preventDefault(); setZoom((value) => Math.max(0.45, Math.min(2.5, value * (event.deltaY > 0 ? 0.9 : 1.1)))); }}>
           {forms.length ? (
-            <svg className="folder-graph-svg" width={graph.width} height={graph.height} viewBox={`0 0 ${graph.width} ${graph.height}`} role="img" aria-label={`Response graph for ${folder?.name || "folder"}`}>
+            <svg className="folder-graph-svg" width={graph.width} height={graph.height} viewBox={`0 0 ${graph.width} ${graph.height}`} role="img" aria-label={`Response graph for ${folder?.name || "project"}`}>
               <defs>
                 <pattern id="folder-graph-grid" width="32" height="32" patternUnits="userSpaceOnUse">
                   <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#e8edf5" strokeWidth="1" />
@@ -3809,7 +4101,7 @@ function FolderVisualizationPage({ folderId }) {
               </g>
             </svg>
           ) : (
-            <div className="folder-graph-empty"><Network size={34} /><p>No forms or responses are available in this folder yet.</p></div>
+            <div className="folder-graph-empty"><Network size={34} /><p>No forms or responses are available in this project yet.</p></div>
           )}
         </div>
         {displayPanelForm ? (
@@ -3849,6 +4141,57 @@ function useOnline() {
     return onConnectivityChange(setOnline);
   }, []);
   return online;
+}
+
+function useUnreadNotificationCount() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const [remote, records] = await Promise.all([
+          requestJson("/api/notifications"),
+          readEncryptedOfflineRecords("submissionQueue").catch(() => [])
+        ]);
+        const remoteClientIds = new Set((remote.notifications || [])
+          .filter((item) => ["sync_failed", "sync_discarded"].includes(item.eventType))
+          .map((item) => String(item.details?.clientSubmissionId || "")).filter(Boolean));
+        const remoteDeletedFormKeys = new Set((remote.notifications || [])
+          .filter((item) => ["form_permanently_deleted", "sync_discarded", "offline_data_purged"].includes(item.eventType))
+          .map((item) => `${normalizeAccessCodeInput(item.details?.accessCode || item.details?.code)}:${item.details?.formWorkspaceId || item.subjectId || ""}`));
+        const ownerId = currentOfflineOwnerId();
+        const localFailures = records.filter((item) => (
+          ownerId && item.ownerUserId === ownerId && item.lastSyncError && !item.lastSyncErrorReadAt
+          && !remoteClientIds.has(String(item.id || ""))
+          && !(item.permanentlyDeletedAt && remoteDeletedFormKeys.has(`${queuedRecordAccessCode(item)}:${item.permanentlyDeletedFormWorkspaceId || item.payload?.sourceWorkspaceId || ""}`))
+        ));
+        const unreadRemote = (remote.notifications || []).filter((item) => !item.readAt).length;
+        if (!cancelled) setCount(unreadRemote + localFailures.length);
+      } catch {
+        const ownerId = currentOfflineOwnerId();
+        const records = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+        if (!cancelled) setCount(records.filter((item) => ownerId && item.ownerUserId === ownerId && item.lastSyncError && !item.lastSyncErrorReadAt).length);
+      }
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 30000);
+    window.addEventListener("focus", refresh);
+    window.addEventListener("icph-notifications-read", refresh);
+    const stopWatching = onConnectivityChange((online) => { if (online) refresh(); });
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refresh);
+      window.removeEventListener("icph-notifications-read", refresh);
+      stopWatching();
+    };
+  }, []);
+  return count;
+}
+
+function NotificationDot({ count = 0, className = "" }) {
+  if (!count) return null;
+  return <span className={`notification-dot ${className}`} title={`${count} unread notification${count === 1 ? "" : "s"}`} aria-label={`${count} unread notification${count === 1 ? "" : "s"}`} />;
 }
 
 function useAuthSession() {
@@ -3905,7 +4248,7 @@ function AdminApp() {
     return <AccessLanding message={authMessage} session={session} />;
   }
 
-  return <DashboardApp onLogout={() => logout("/")} />;
+  return <DashboardApp session={session} onLogout={() => logout("/")} />;
 }
 
 function AccessLanding({ message = "", session }) {
@@ -4016,6 +4359,355 @@ function AccessLanding({ message = "", session }) {
   );
 }
 
+function ProfileGate() {
+  const { session, authMessage } = useAuthSession();
+  if (!session) return <div className="access-shell"><main className="access-card"><p>Loading profile…</p></main></div>;
+  if (!session.authenticated) return <AccessLanding message={authMessage} session={session} />;
+  return <ProfilePage session={session} />;
+}
+
+function ProfilePage({ session }) {
+  const isAdmin = session.roles.includes(ADMIN_ROLE);
+  const unreadNotificationCount = useUnreadNotificationCount();
+  const [profile, setProfile] = useState({ username: session.username, displayName: session.username });
+  const [deletedForms, setDeletedForms] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [activeTab, setActiveTab] = useState("personal");
+  const [status, setStatus] = useState({ kind: "busy", message: "Loading profile…" });
+  const [saving, setSaving] = useState(false);
+
+  async function refreshNotifications() {
+    const makeLocalFailureNotifications = async (records, ownerId) => Promise.all(records
+      .filter((item) => ownerId && item.ownerUserId === ownerId && item.lastSyncError)
+      .map(async (item) => {
+        const code = queuedRecordAccessCode(item);
+        const workspaceId = item.permanentlyDeletedFormWorkspaceId || item.payload?.sourceWorkspaceId || "";
+        const localRows = item.permanentlyDeletedAt && code
+          ? await collectLocalDeletedFormData({ accessCode: code, workspaceId, ownerId })
+          : [];
+        const exportState = item.permanentlyDeletedAt ? await localDeletedFormExportState(ownerId, workspaceId) : null;
+        return {
+          id: `local-${item.id}`,
+          eventType: item.permanentlyDeletedAt ? "sync_discarded" : "sync_failed",
+          title: item.permanentlyDeletedAt ? "Offline form data awaits export" : "Offline sync failed",
+          message: `${item.lastSyncError} · ${item.path || "Queued submission"}`,
+          createdAt: item.lastSyncAttemptAt || item.createdAt,
+          readAt: item.lastSyncErrorReadAt || null,
+          localQueueId: item.id,
+          localDataCount: localRows.length,
+          localExportedAt: exportState?.exportedAt || null,
+          details: { code, accessCode: code, formTitle: item.permanentlyDeletedFormTitle || "Deleted form", formWorkspaceId: workspaceId }
+        };
+      }));
+    try {
+      const data = await requestJson("/api/notifications");
+      const ownerId = currentOfflineOwnerId();
+      let records = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+      if (!isAdmin && ownerId) {
+        const permanentEvents = (data.notifications || []).filter((item) => item.eventType === "form_permanently_deleted" || item.eventType === "sync_discarded");
+        for (const item of permanentEvents) {
+          const code = normalizeAccessCodeInput(item.details?.accessCode || item.details?.code);
+          const workspaceId = String(item.details?.formWorkspaceId || "");
+          if (!code || !workspaceId) continue;
+          const matching = records.filter((record) => (
+            record.ownerUserId === ownerId && queuedRecordAccessCode(record) === code
+            && (!record.payload?.sourceWorkspaceId || record.payload.sourceWorkspaceId === workspaceId)
+          ));
+          await Promise.all(matching.map((record) => saveEncryptedOfflineRecord("submissionQueue", {
+            ...record,
+            permanentlyDeletedAt: record.permanentlyDeletedAt || Date.now(),
+            permanentlyDeletedFormWorkspaceId: workspaceId,
+            permanentlyDeletedFormTitle: item.details?.formTitle || "Deleted form",
+            lastSyncError: record.lastSyncError || "This form was permanently deleted before its offline data could sync.",
+            lastSyncAttemptAt: record.lastSyncAttemptAt || Date.now()
+          })));
+        }
+        records = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+      }
+      const remote = data.notifications || [];
+      const purgedKeys = new Set(remote.filter((item) => item.eventType === "offline_data_purged")
+        .map((item) => `${item.details?.accessCode || ""}:${item.details?.formWorkspaceId || item.subjectId || ""}`));
+      const remoteClientIds = new Set(remote.filter((item) => ["sync_failed", "sync_discarded"].includes(item.eventType))
+        .map((item) => String(item.details?.clientSubmissionId || "")).filter(Boolean));
+      const enrichedRemote = await Promise.all(remote.map(async (item) => {
+        const code = normalizeAccessCodeInput(item.details?.accessCode || item.details?.code);
+        const workspaceId = String(item.details?.formWorkspaceId || "");
+        const exportable = !isAdmin && code && workspaceId && ["form_permanently_deleted", "sync_discarded"].includes(item.eventType);
+        if (!exportable) return item;
+        const key = `${code}:${workspaceId}`;
+        const localRows = await collectLocalDeletedFormData({ accessCode: code, workspaceId, ownerId });
+        const exportState = await localDeletedFormExportState(ownerId, workspaceId);
+        return { ...item, localDataCount: localRows.length, localExportedAt: exportState?.exportedAt || null, localDataConfirmedDeleted: purgedKeys.has(key) };
+      }));
+      const localFailures = (await makeLocalFailureNotifications(records, ownerId))
+        .filter((item) => !remoteClientIds.has(String(item.localQueueId)));
+      const remoteTerminalKeys = new Set(remote.filter((item) => ["form_permanently_deleted", "sync_discarded", "offline_data_purged"].includes(item.eventType))
+        .map((item) => `${normalizeAccessCodeInput(item.details?.accessCode || item.details?.code)}:${item.details?.formWorkspaceId || item.subjectId || ""}`));
+      const visibleLocal = localFailures.filter((item) => !remoteTerminalKeys.has(`${item.details.accessCode}:${item.details.formWorkspaceId}`));
+      setNotifications([...enrichedRemote, ...visibleLocal].sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0)));
+    } catch {
+      const ownerId = currentOfflineOwnerId();
+      const records = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+      const localFailures = await makeLocalFailureNotifications(records, ownerId);
+      setNotifications(localFailures);
+    }
+  }
+
+  async function exportDeletedFormData(item) {
+    const accessCode = normalizeAccessCodeInput(item.details?.accessCode || item.details?.code);
+    const formWorkspaceId = String(item.details?.formWorkspaceId || "");
+    const ownerId = currentOfflineOwnerId();
+    const rows = await collectLocalDeletedFormData({ accessCode, workspaceId: formWorkspaceId, ownerId });
+    if (!rows.length) {
+      setStatus({ kind: "error", message: "No saved form data was found in this browser's offline storage to export." });
+      return;
+    }
+    exportDeletedFormDataCsv({ accessCode, formTitle: item.details?.formTitle || "Deleted form", workspaceId: formWorkspaceId, rows });
+    const exportedAt = Date.now();
+    await offlineStoreRequest("meta", "readwrite", (store) => store.put({
+      key: deletedFormExportKey(ownerId, formWorkspaceId),
+      value: { accessCode, workspaceId: formWorkspaceId, exportedAt }
+    }));
+    setNotifications((current) => current.map((notification) => (
+      notification.details?.formWorkspaceId === formWorkspaceId && normalizeAccessCodeInput(notification.details?.accessCode || notification.details?.code) === accessCode
+        ? { ...notification, localDataCount: rows.length, localExportedAt: exportedAt }
+        : notification
+    )));
+    setStatus({ kind: "ok", message: `Exported ${rows.length} local record${rows.length === 1 ? "" : "s"} to CSV. Confirm below only after you have saved the file.` });
+  }
+
+  async function confirmExportAndDeleteLocalData(item) {
+    const accessCode = normalizeAccessCodeInput(item.details?.accessCode || item.details?.code);
+    const formWorkspaceId = String(item.details?.formWorkspaceId || "");
+    const ownerId = currentOfflineOwnerId();
+    const exportState = await localDeletedFormExportState(ownerId, formWorkspaceId);
+    if (!exportState?.exportedAt) {
+      setStatus({ kind: "error", message: "Export the CSV first, then confirm after saving it." });
+      return;
+    }
+    const warning = "This permanently deletes this form's saved data, drafts, queued syncs, cached entries, and downloaded form copy from this device. If the app's browser cache/storage is cleared before export, that data cannot be recovered. Continue?";
+    if (!window.confirm(warning)) return;
+    try {
+      await postJson("/api/notifications/confirm-deleted-data", { accessCode, formWorkspaceId });
+      await purgeLocalDeletedFormData({ accessCode, workspaceId: formWorkspaceId, ownerId });
+      setNotifications((current) => current.map((notification) => (
+        notification.details?.formWorkspaceId === formWorkspaceId && normalizeAccessCodeInput(notification.details?.accessCode || notification.details?.code) === accessCode
+          ? { ...notification, localDataCount: 0, localDataConfirmedDeleted: true }
+          : notification
+      )));
+      setStatus({ kind: "ok", message: "The CSV was confirmed and this form's local data was deleted from this device." });
+      notifyCollectionChanged();
+    } catch (error) {
+      setStatus({ kind: "error", message: `Could not confirm local deletion: ${error.message || String(error)}. Your local data is still available.` });
+    }
+  }
+
+  async function markNotificationsAsRead() {
+    const unreadIds = notifications.filter((item) => !item.readAt && !item.localQueueId).map((item) => item.id);
+    if (unreadIds.length) {
+      try { await putJson("/api/notifications/read", { ids: unreadIds }); } catch {}
+    }
+    const localItems = notifications.filter((item) => item.localQueueId && !item.readAt);
+    if (localItems.length) {
+      const records = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
+      const readIds = new Set(localItems.map((item) => item.localQueueId));
+      await Promise.all(records.filter((item) => readIds.has(item.id)).map((item) =>
+        saveEncryptedOfflineRecord("submissionQueue", { ...item, lastSyncErrorReadAt: Date.now() })
+      ));
+    }
+    setNotifications((current) => current.map((item) => ({ ...item, readAt: item.readAt || new Date().toISOString() })));
+    window.dispatchEvent(new Event("icph-notifications-read"));
+  }
+
+  async function refreshDeletedForms() {
+    if (!isAdmin) return;
+    const data = await requestJson("/api/forms/deleted");
+    setDeletedForms(data.forms || []);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      requestJson("/api/profile"),
+      isAdmin ? requestJson("/api/forms/deleted") : Promise.resolve({ forms: [] })
+    ]).then(([me, archived]) => {
+      if (cancelled) return;
+      setProfile({ username: me.username || session.username, displayName: me.displayName || me.username || session.username });
+      setDeletedForms(archived.forms || []);
+      setStatus({ kind: "idle", message: "" });
+    }).catch((error) => {
+      if (!cancelled) setStatus({ kind: "error", message: error.message || String(error) });
+    });
+    return () => { cancelled = true; };
+  }, [isAdmin, session.username]);
+
+  useEffect(() => {
+    refreshNotifications();
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === "notifications" && notifications.some((item) => !item.readAt)) markNotificationsAsRead();
+  }, [activeTab, notifications]);
+
+  async function saveProfile(event) {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      const result = await putJson("/api/profile", { displayName: profile.displayName });
+      setProfile({ username: result.username, displayName: result.displayName });
+      setStatus({ kind: "ok", message: "Name saved." });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function restoreForm(form) {
+    if (!window.confirm(`Restore “${form.title}” to the active forms list?`)) return;
+    setStatus({ kind: "busy", message: "Restoring form…" });
+    try {
+      await postJson(`/api/forms/${encodeURIComponent(form.workspaceId)}/restore`, {});
+      await refreshDeletedForms();
+      setStatus({ kind: "ok", message: "Form restored." });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  async function permanentlyDeleteForm(form) {
+    if (!window.confirm(`Permanently delete “${form.title}” and all server-stored data? Field agents' offline data will be kept on their devices so they can export a CSV and confirm local deletion when they reconnect. It will not sync to the deleted form. This cannot be undone.`)) return;
+    setStatus({ kind: "busy", message: "Permanently deleting form…" });
+    try {
+      await postJson(`/api/forms/${encodeURIComponent(form.workspaceId)}/permanent-delete`, {});
+      await refreshDeletedForms();
+      setStatus({ kind: "ok", message: "Form permanently deleted." });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <header className="topbar home-topbar">
+        <div className="topbar-actions">
+          <button className="secondary" type="button" onClick={() => window.location.assign(isAdmin ? "/" : "/field-agent")}>
+            <ChevronLeft size={16} /> Back
+          </button>
+          <button className="secondary topbar-logout" type="button" onClick={() => logout(isAdmin ? "/" : "/field-agent")}>
+            <X size={14} /> Logout
+          </button>
+        </div>
+        <div className="topbar-title">
+          <h1>My Profile</h1>
+          <p>{isAdmin ? "Admin profile, activity, and deleted forms" : "Field agent profile and activity"}</p>
+        </div>
+        <div className="topbar-brand"><BrandLogos /></div>
+      </header>
+      <main className="profile-layout">
+        <nav className="profile-tabs" aria-label="Profile sections">
+          <button className={activeTab === "personal" ? "active" : ""} type="button" onClick={() => setActiveTab("personal")}>Personal details</button>
+          {isAdmin ? <button className={activeTab === "deleted" ? "active" : ""} type="button" onClick={() => setActiveTab("deleted")}>Deleted forms</button> : null}
+          <button className={activeTab === "notifications" ? "active" : ""} type="button" onClick={() => setActiveTab("notifications")}>
+            Activity <NotificationDot count={unreadNotificationCount} className="tab-notification-dot" />
+          </button>
+        </nav>
+        {activeTab === "personal" ? <section className="panel profile-panel">
+          <h2>Personal details</h2>
+          <form onSubmit={saveProfile}>
+            <div className="field">
+              <span>Username</span>
+              <div className="profile-readonly-value">{profile.username}</div>
+              <small>This is your sign-in name.</small>
+            </div>
+            <label className="field">
+              <span>Name shown in the app</span>
+              <input
+                value={profile.displayName}
+                maxLength={80}
+                onChange={(event) => setProfile((current) => ({ ...current, displayName: event.target.value }))}
+                placeholder={profile.username}
+              />
+              <small>By default, this is your username. You can choose a different name.</small>
+            </label>
+            <button className="primary" type="submit" disabled={saving}>
+              <Save size={15} /> {saving ? "Saving…" : "Save name"}
+            </button>
+          </form>
+        </section> : null}
+        {isAdmin && activeTab === "deleted" ? (
+          <section className="panel profile-archive-panel">
+            <div className="section-head">
+              <div><h2>Deleted forms</h2><p>Deleted forms stay here so field agents can finish syncing offline work.</p></div>
+              <button className="secondary small" type="button" onClick={refreshDeletedForms}><RefreshCw size={14} /> Refresh</button>
+            </div>
+            {deletedForms.length ? (
+              <div className="entries-table">
+                {deletedForms.map((form) => (
+                  <div className="entry-row profile-archive-row" key={form.workspaceId}>
+                    <div className="entry-details">
+                      <strong>{form.title}</strong>
+                      <small>{form.respondentAccessCode ? `Form code ${form.respondentAccessCode} · ` : ""}Deleted {form.deletedAt ? new Date(form.deletedAt).toLocaleString() : "recently"}</small>
+                      <small>{form.entryCount || 0} stored entries · {form.checkpointCount || 0} incomplete checkpoints</small>
+                    </div>
+                    <div className="entry-actions">
+                      <button className="secondary small" type="button" onClick={() => restoreForm(form)}><Forward size={14} /> Restore</button>
+                      <button className="danger-action small" type="button" onClick={() => permanentlyDeleteForm(form)}><Trash2 size={14} /> Permanently delete</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="muted">You have no deleted forms.</p>}
+          </section>
+        ) : null}
+        {activeTab === "notifications" ? (
+          <section className="panel profile-notifications-panel">
+            <div className="section-head">
+              <div><h2>Activity</h2><p>Recent access changes, form activity, and sync results.</p></div>
+              <button className="secondary small" type="button" onClick={refreshNotifications}><RefreshCw size={14} /> Refresh</button>
+            </div>
+            {notifications.length ? <div className="notification-list">
+              {notifications.map((item) => (
+                <article className={`notification-row${item.readAt ? " read" : " unread"}`} key={item.id}>
+                  <div className="notification-row-heading">
+                    <strong>{item.title}</strong>
+                    {!item.readAt ? <span className="notification-unread-label">New</span> : null}
+                  </div>
+                  <p>{Number(item.itemCount) > 1 ? `${item.itemCount} updates · ` : ""}{item.message}</p>
+                  <time dateTime={new Date(item.createdAt || Date.now()).toISOString()}>{new Date(item.createdAt || Date.now()).toLocaleString()}</time>
+                  {!isAdmin && ["form_permanently_deleted", "sync_discarded"].includes(item.eventType) && item.details?.accessCode ? (
+                    <div className="deleted-form-export-actions">
+                      {item.localDataConfirmedDeleted ? (
+                        <p className="muted">Export confirmed; this form’s local data has been deleted from this device.</p>
+                      ) : item.localDataCount > 0 ? (
+                        <>
+                          <p className="deleted-form-export-warning">Export the CSV before confirming deletion. If browser app storage/cache is cleared first, unsynced data may be lost and cannot be recovered.</p>
+                          {!item.localExportedAt ? (
+                            <button className="secondary small" type="button" onClick={() => exportDeletedFormData(item)}><Download size={14} /> Export data</button>
+                          ) : (
+                            <>
+                              <small>CSV export started {new Date(item.localExportedAt).toLocaleString()}. Save it on this device before continuing.</small>
+                              <button className="danger-action small" type="button" onClick={() => confirmExportAndDeleteLocalData(item)}>Confirm save — delete data</button>
+                            </>
+                          )}
+                        </>
+                      ) : (
+                        <p className="deleted-form-export-warning">No local form data was found in this browser’s storage to export. If app storage/cache was cleared before export, that data cannot be recovered.</p>
+                      )}
+                    </div>
+                  ) : null}
+                </article>
+              ))}
+            </div> : <p className="muted">No updates yet.</p>}
+          </section>
+        ) : null}
+        {status.message ? <p className={`status-line ${status.kind}`} role="status">{status.message}</p> : null}
+      </main>
+      <footer className="builder-footer home-footer"><div className={`footer-status ${status.kind}`}>{status.message || "Ready."}</div></footer>
+    </div>
+  );
+}
+
 function RespondentPortal({ initialCode = "" }) {
   const [session, setSession] = useState(() => {
     const code = normalizeAccessCodeInput(initialCode);
@@ -4109,7 +4801,7 @@ function FieldAgentGate({ children }) {
   }
 
   if (session.authenticated && [FIELD_AGENT_ROLE, ADMIN_ROLE].some((role) => session.roles.includes(role))) {
-    return children({ onLogout: () => logout("/"), onSessionExpired: expireSession });
+    return children({ session, onLogout: () => logout("/"), onSessionExpired: expireSession });
   }
 
   async function signIn() {
@@ -4157,28 +4849,38 @@ function FieldAgentGate({ children }) {
   );
 }
 
-function FieldAgentPortal({ onLogout, onSessionExpired }) {
+function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
   const [forms, setForms] = useState([]);
   const [selectedCode, setSelectedCode] = useState("");
   const [displayFieldByCode, setDisplayFieldByCode] = useState({});
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
   const online = useOnline();
+  const unreadNotificationCount = useUnreadNotificationCount();
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
+  const [syncErrors, setSyncErrors] = useState([]);
   const [statisticsForm, setStatisticsForm] = useState(null);
   const [statisticsLoading, setStatisticsLoading] = useState(false);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading published forms..." });
+  const [displayName, setDisplayName] = useState(session?.username || "");
   // Forms saved on this device, by form code, and the codes downloading now.
   const [savedForms, setSavedForms] = useState({});
   const [downloadingCodes, setDownloadingCodes] = useState([]);
   const updatingSavedFormsRef = useRef(false);
   const formsRef = useRef(forms);
   formsRef.current = forms;
+  useEffect(() => {
+    requestJson("/api/profile").then((data) => setDisplayName(data.displayName || data.username || session?.username || ""))
+      .catch(() => setDisplayName(session?.username || ""));
+  }, [session?.username]);
   const selectedForm = forms.find((item) => item.respondentAccessCode === selectedCode) || forms[0] || null;
   const fieldAgentEntryIds = useMemo(
     () => (selectedForm?.entries || []).filter((entry) => !entry.pendingSync).map((entry) => String(entry.id || "")).filter(Boolean),
     [selectedForm?.entries]
   );
   const fieldAgentSelectedSet = useMemo(() => new Set(selectedEntryIds), [selectedEntryIds]);
+  const fieldAgentSelectedReviewIds = (selectedForm?.entries || [])
+    .filter((entry) => fieldAgentSelectedSet.has(String(entry.id || "")) && !entry.reviewRequestedAt && !entry.pendingSync)
+    .map((entry) => String(entry.id || "")).filter(Boolean);
   const fieldAgentDisplayOptions = selectedForm?.displayFields || [];
   const fieldAgentDisplayField = displayFieldByCode[selectedForm?.respondentAccessCode]
     || selectedForm?.participantIdentifierVariable
@@ -4194,6 +4896,16 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     try {
       const result = sync && isOnline() ? await syncPendingSubmissions() : null;
       setPendingSyncCount(result?.pendingCount ?? await getPendingSubmissionCount());
+      const ownerId = currentOfflineOwnerId();
+      const queued = (await readEncryptedOfflineRecords("submissionQueue"))
+        .filter((record) => ownerId && record.ownerUserId === ownerId);
+      setSyncErrors(queued.filter((record) => record.lastSyncError).map((record) => ({
+        id: record.id,
+        message: record.lastSyncError,
+        attemptedAt: record.lastSyncAttemptAt || record.createdAt,
+        identifier: String(record.payload?.primaryIdentifierValue || "").trim(),
+        code: String(record.path || "").match(/\/api\/public\/forms\/([^/]+)/)?.[1] || ""
+      })).slice(-5).reverse());
       if (result?.syncedIds?.length) await loadPublishedForms();
     } catch {
       setPendingSyncCount(await getPendingSubmissionCount());
@@ -4215,10 +4927,9 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
       try {
         await downloadOfflineFormPackage(code);
         const listed = formsRef.current.find((item) => normalizeAccessCodeInput(item.respondentAccessCode) === code);
-        if (listed) await saveCachedFormEntries(code, (listed.entries || []).filter((entry) => !entry.pendingSync)).catch(() => {});
+        if (listed) await saveCachedFormEntries(code, (listed.entries || []).filter((entry) => !entry.pendingSync), listed.workspaceId || "").catch(() => {});
       } catch (error) {
-        failed.push(code);
-        if (error?.status === 404) await removeOfflineFormPackage(code).catch(() => {});
+        failed.push({ code, reason: String(error?.message || error || "Unknown download error") });
       } finally {
         setDownloadingCodes((current) => current.filter((item) => item !== code));
         await refreshSavedForms();
@@ -4226,34 +4937,21 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     }
     if (quiet) return;
     if (failed.length) {
-      setStatus({ kind: "error", message: `Could not download ${failed.join(", ")} for offline use. Check the connection and try again.` });
+      const details = failed.map(({ code, reason }) => `${code}: ${reason}`).join("; ");
+      setStatus({ kind: "error", message: `Could not download form for offline use: ${details}` });
     } else {
       setStatus({ kind: "ok", message: pending.length === 1 ? "Form saved on this device." : `${pending.length} forms saved on this device.` });
     }
   }
 
-  async function removeSavedForm(formItem) {
-    const code = normalizeAccessCodeInput(formItem?.respondentAccessCode);
-    if (!code || !window.confirm(`Remove "${formItem.title || code}" from this device? You will need a connection to fill it again.`)) return;
-    try {
-      await removeOfflineFormPackage(code);
-      await refreshSavedForms();
-      // Offline, the list is the saved forms themselves, so the removed one goes too.
-      if (!isOnline()) setForms((current) => current.filter((item) => normalizeAccessCodeInput(item.respondentAccessCode) !== code));
-      setStatus({ kind: "ok", message: "Removed from this device." });
-    } catch (error) {
-      setStatus({ kind: "error", message: error.message || String(error) });
-    }
-  }
-
-  // Runs on each fresh list from the server: forms it no longer offers leave
-  // this device, and saved forms that changed on the server are downloaded again.
+  // A missing form can mean deletion, revoked access, or a temporary mismatch.
+  // Preserve local packages, cached entries, drafts, and queued submissions.
   async function reconcileSavedForms(liveForms) {
-    const withdrawn = await removeWithdrawnOfflineForms(liveForms.map((item) => item.respondentAccessCode)).catch(() => []);
+    const withdrawn = await findWithdrawnOfflineForms(liveForms.map((item) => item.respondentAccessCode)).catch(() => []);
     const saved = await refreshSavedForms();
     if (withdrawn.length) {
       const names = withdrawn.map((item) => item.title || item.accessCode).join(", ");
-      setStatus({ kind: "ok", message: `Removed from this device because they are no longer available: ${names}.` });
+      setStatus({ kind: "error", message: `Saved offline data is being kept on this device because the server no longer lists: ${names}. Pending entries and drafts have not been removed.` });
     }
     if (updatingSavedFormsRef.current) return;
     const savedByCode = new Map(saved.map((item) => [normalizeAccessCodeInput(item.accessCode), item]));
@@ -4282,7 +4980,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     setForms(savedForms.map((item) => {
       const code = normalizeAccessCodeInput(item.accessCode);
       const checkpoints = localCheckpoints.get(code) || [];
-      const entries = mergeQueuedEntries(cachedEntries.get(code) || [], queuedEntries.get(code) || []);
+      const entries = mergeQueuedEntries(cachedEntriesForForm(cachedEntries, code, item.workspaceId), queuedEntries.get(code) || []);
       return {
         ...item,
         respondentAccessCode: item.accessCode,
@@ -4303,12 +5001,15 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     setStatus({ kind: "busy", message: "Loading published forms..." });
     try {
       const data = await requestJson("/api/public/forms");
+      await adoptAuthorizedLegacyFormPackages(data.forms || []);
       const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
       const queuedEntries = await listQueuedEntriesByCode().catch(() => new Map());
-      const savedCodes = new Set((await listOfflineFormPackages().catch(() => [])).map((item) => normalizeAccessCodeInput(item.accessCode)));
+      const savedPackages = await listOfflineFormPackages().catch(() => []);
+      const savedCodes = new Set(savedPackages.map((item) => normalizeAccessCodeInput(item.accessCode)));
+      const cachedEntries = await readCachedFormEntries().catch(() => new Map());
       for (const form of data.forms || []) {
         const code = normalizeAccessCodeInput(form.respondentAccessCode);
-        if (savedCodes.has(code)) void saveCachedFormEntries(code, form.entries || []).catch(() => {});
+        if (savedCodes.has(code)) void saveCachedFormEntries(code, form.entries || [], form.workspaceId || "").catch(() => {});
       }
       const nextForms = (data.forms || []).map((form) => {
         const serverCheckpoints = form.checkpoints || [];
@@ -4321,11 +5022,34 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
         const entries = mergeQueuedEntries(form.entries || [], queuedEntries.get(normalizeAccessCodeInput(form.respondentAccessCode)) || []);
         return { ...form, entries, entryCount: entries.length, checkpoints, checkpointCount: checkpoints.length };
       });
+      const listedCodes = new Set(nextForms.map((item) => normalizeAccessCodeInput(item.respondentAccessCode)));
+      const locallySavedButUnlisted = savedPackages
+        .filter((item) => !listedCodes.has(normalizeAccessCodeInput(item.accessCode)))
+        .map((item) => {
+          const code = normalizeAccessCodeInput(item.accessCode);
+          const entries = mergeQueuedEntries(cachedEntriesForForm(cachedEntries, code, form.workspaceId), queuedEntries.get(code) || []);
+          const checkpoints = localCheckpoints.get(code) || [];
+          return {
+            ...item,
+            respondentAccessCode: item.accessCode,
+            entries,
+            entryCount: entries.length,
+            checkpoints,
+            checkpointCount: checkpoints.length,
+            offlineOnly: true
+          };
+        });
+      nextForms.push(...locallySavedButUnlisted);
       setForms(nextForms);
       setSelectedCode((current) => nextForms.some((item) => item.respondentAccessCode === current)
         ? current
         : nextForms[0]?.respondentAccessCode || "");
-      setStatus({ kind: "ok", message: nextForms.length ? "Ready." : "No published forms available." });
+      setStatus({
+        kind: locallySavedButUnlisted.length ? "error" : "ok",
+        message: locallySavedButUnlisted.length
+          ? `The server no longer lists ${locallySavedButUnlisted.map((item) => item.title || item.respondentAccessCode).join(", ")}. Their saved forms, drafts, and entries are preserved on this device.`
+          : nextForms.length ? "Ready." : "No published forms available."
+      });
       void reconcileSavedForms(nextForms);
     } catch (error) {
       if (error?.status === 401 && await onSessionExpired?.()) return;
@@ -4379,6 +5103,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     const code = normalizeAccessCodeInput(form?.respondentAccessCode);
     if (!code) return;
     const params = new URLSearchParams();
+    if (form.workspaceId) params.set("workspaceId", form.workspaceId);
     if (entryId) params.set("entryId", entryId);
     if (checkpointIdentifierValue) params.set("checkpoint", checkpointIdentifierValue);
     const query = params.toString() ? `?${params.toString()}` : "";
@@ -4412,19 +5137,40 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
       : current.filter((id) => id !== entryId));
   }
 
-  async function deleteFieldAgentEntries(entryIds) {
+  async function markFieldAgentEntriesForReview(entryIds) {
     const ids = (Array.isArray(entryIds) ? entryIds : [entryIds]).filter(Boolean);
     const code = normalizeAccessCodeInput(selectedForm?.respondentAccessCode);
     if (!ids.length || !code) return;
-    const confirmed = window.confirm(`Delete ${ids.length} entr${ids.length === 1 ? "y" : "ies"}? This cannot be undone.`);
-    if (!confirmed) return;
-    setStatus({ kind: "busy", message: "Deleting entries..." });
+    setStatus({ kind: "busy", message: `Marking ${ids.length} entr${ids.length === 1 ? "y" : "ies"} for admin review...` });
     try {
-      await deleteJson(`/api/public/forms/${encodeURIComponent(code)}/entries`, { entryIds: ids });
+      const result = await saveOfflineFirst(`/api/public/forms/${encodeURIComponent(code)}/entries/review`, { entryIds: ids, sourceWorkspaceId: selectedForm.workspaceId || "" }, { method: "PUT" });
       setSelectedEntryIds([]);
       notifyCollectionChanged();
-      await loadPublishedForms();
-      setStatus({ kind: "ok", message: `Deleted ${ids.length} entr${ids.length === 1 ? "y" : "ies"}.` });
+      setPendingSyncCount(result.pendingCount);
+      if (!result.queued) await loadPublishedForms();
+      setStatus(result.queued
+        ? { kind: "ok", message: `Review request saved on this device for ${ids.length} entr${ids.length === 1 ? "y" : "ies"}. It will sync when the connection is available.` }
+        : { kind: "ok", message: `Marked ${ids.length} entr${ids.length === 1 ? "y" : "ies"} for admin review.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || String(error) });
+    }
+  }
+
+  async function markFieldAgentCheckpointForReview(checkpoint) {
+    const primaryIdentifierValue = String(checkpoint?.primaryIdentifierValue || "").trim();
+    const code = normalizeAccessCodeInput(selectedForm?.respondentAccessCode);
+    if (!primaryIdentifierValue || !code || checkpoint?.reviewRequestedAt) return;
+    setStatus({ kind: "busy", message: `Requesting admin review for ${primaryIdentifierValue}...` });
+    try {
+      const result = await saveOfflineFirst(`/api/public/forms/${encodeURIComponent(code)}/checkpoint/review`, { primaryIdentifierValue, sourceWorkspaceId: selectedForm.workspaceId || "" }, { method: "PUT" });
+      setPendingSyncCount(result.pendingCount);
+      notifyCollectionChanged();
+      setStatus(result.error
+        ? { kind: "error", message: `Review request saved on this device; sync needs attention: ${result.error}` }
+        : result.queued
+          ? { kind: "ok", message: "Review request saved on this device. It will sync when the connection is available." }
+          : { kind: "ok", message: "Checkpoint marked for admin review." });
+      if (!result.queued) await loadPublishedForms();
     } catch (error) {
       setStatus({ kind: "error", message: error.message || String(error) });
     }
@@ -4434,6 +5180,9 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
     <div className="app-shell">
       <header className="topbar field-agent-topbar">
         <div className="topbar-actions">
+          <button className="secondary topbar-home" type="button" onClick={() => window.location.assign("/profile")}>
+            <UserPlus size={15} /> Profile <NotificationDot count={unreadNotificationCount} />
+          </button>
           <button className="secondary topbar-home" onClick={() => window.location.assign("/")}>
             <Home size={18} /> Home
           </button>
@@ -4445,7 +5194,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
           </button>
         </div>
         <div className="topbar-title">
-          <h1>Field Agent</h1>
+          <h1>Hello, {displayName || session?.username || "Field Agent"} · Field Agent</h1>
           <p>Published form collection</p>
         </div>
         <div className="field-agent-sync-status" aria-live="polite">
@@ -4499,6 +5248,9 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                     <span>{formItem.title}</span>
                     <strong>{formItem.respondentAccessCode}</strong>
                     <small>{formItem.entryCount || 0} entries · {formItem.checkpointCount || 0} incomplete</small>
+                    {formItem.offlineOnly ? (
+                      <small className="offline-saved-note">Server access unavailable · local data preserved</small>
+                    ) : null}
                     {saved ? (
                       <small className="offline-saved-note">
                         {outdated ? "Update available" : `Saved offline ${new Date(saved.cachedAt).toLocaleDateString()}`} · {formatStorageSize(saved.sizeBytes)}
@@ -4508,20 +5260,20 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                   <button
                     className={`offline-toggle offline-toggle-${offlineState}`}
                     type="button"
-                    disabled={downloading || (!saved && !online)}
+                    disabled={downloading || offlineState === "saved" || (!saved && !online)}
                     title={{
                       none: online ? "Download for offline use" : "Connect to download for offline use",
                       downloading: "Downloading...",
                       outdated: "Download the latest version",
-                      saved: "Saved on this device. Click to remove."
+                      saved: "Saved on this device. Field agents cannot delete offline form data."
                     }[offlineState]}
                     aria-label={{
                       none: `Download ${formItem.title} for offline use`,
                       downloading: `Downloading ${formItem.title}`,
                       outdated: `Update ${formItem.title} on this device`,
-                      saved: `Remove ${formItem.title} from this device`
+                      saved: `${formItem.title} is saved on this device`
                     }[offlineState]}
-                    onClick={() => (offlineState === "saved" ? removeSavedForm(formItem) : downloadForms([code]))}
+                    onClick={() => offlineState !== "saved" && downloadForms([code])}
                   >
                     {offlineState === "downloading" ? <RefreshCw size={18} className="spin" /> : null}
                     {offlineState === "outdated" ? <RefreshCw size={18} /> : null}
@@ -4586,6 +5338,13 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                           <button className="secondary small icon-text-button" onClick={() => openFillForm(selectedForm, "", checkpoint.primaryIdentifierValue)}>
                             <Forward size={14} /> Continue
                           </button>
+                          {checkpoint.reviewRequestedAt ? (
+                            <span className="review-requested-badge">Marked for review</span>
+                          ) : (
+                            <button className="secondary small icon-text-button" type="button" onClick={() => markFieldAgentCheckpointForReview(checkpoint)}>
+                              <Flag size={14} /> Mark for review
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -4601,17 +5360,19 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                 </div>
                 {selectedForm.entries?.length ? (
                   <div className="entries-table">
-                    <label className="bulk-check-row">
-                      <input
-                        type="checkbox"
-                        checked={fieldAgentAllSelected}
-                        onChange={(event) => setSelectedEntryIds(event.target.checked ? fieldAgentEntryIds : [])}
-                      />
-                      <span>{selectedEntryIds.length}/{fieldAgentEntryIds.length} selected</span>
-                      <button className="secondary small danger-action" disabled={!selectedEntryIds.length || status.kind === "busy"} onClick={() => deleteFieldAgentEntries(selectedEntryIds)}>
-                        <Trash2 size={14} /> Delete
+                    <div className="bulk-check-row">
+                      <label className="bulk-check-control">
+                        <input
+                          type="checkbox"
+                          checked={fieldAgentAllSelected}
+                          onChange={(event) => setSelectedEntryIds(event.target.checked ? fieldAgentEntryIds : [])}
+                        />
+                        <span>{selectedEntryIds.length}/{fieldAgentEntryIds.length} selected</span>
+                      </label>
+                      <button className="secondary small" disabled={!fieldAgentSelectedReviewIds.length || status.kind === "busy"} onClick={() => markFieldAgentEntriesForReview(fieldAgentSelectedReviewIds)}>
+                        <Flag size={14} /> Mark for review
                       </button>
-                    </label>
+                    </div>
                     {selectedForm.entries.slice().reverse().map((entry) => (
                       <div className={`entry-row field-agent-entry-row ${entry.pendingSync ? "entry-pending-sync" : ""}`} key={entry.id}>
                         <label className="row-check">
@@ -4629,6 +5390,7 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                             {new Date(entry.submittedAt).toLocaleString()}
                             {entry.updatedAt ? ` · updated ${new Date(entry.updatedAt).toLocaleString()}` : ""}
                           </small>
+                          {entry.reviewRequestedAt ? <small className="review-request-note">Review requested by {entry.reviewRequestedBy || "field agent"}</small> : null}
                         </div>
                         {entry.pendingSync ? (
                           <div className="entry-actions">
@@ -4646,9 +5408,11 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
                           <button className="secondary small icon-text-button" onClick={() => viewEntry(selectedForm, entry.id)} title="View entry">
                             <ExternalLink size={14} /> View
                           </button>
-                          <button className="secondary small danger-action" disabled={status.kind === "busy"} onClick={() => deleteFieldAgentEntries([entry.id])}>
-                            <Trash2 size={14} /> Delete
-                          </button>
+                          {entry.reviewRequestedAt ? <span className="review-request-badge"><Flag size={13} /> Needs review</span> : (
+                            <button className="secondary small icon-text-button" disabled={status.kind === "busy"} onClick={() => markFieldAgentEntriesForReview([entry.id])}>
+                              <Flag size={14} /> Mark for review
+                            </button>
+                          )}
                         </div>
                         )}
                       </div>
@@ -4674,11 +5438,23 @@ function FieldAgentPortal({ onLogout, onSessionExpired }) {
           onClose={() => setStatisticsForm(null)}
         />
       ) : null}
-      <footer className="builder-footer home-footer" aria-label="Page status">
+      <footer className={`builder-footer home-footer field-agent-footer ${syncErrors.length ? "has-sync-errors" : ""}`} aria-label="Page status">
         <div className={`footer-status ${status.kind}`}>
           {status.kind === "ok" ? <Check size={16} /> : status.kind === "busy" ? <RefreshCw size={16} /> : <AlertCircle size={16} />}
           <span>{status.message || "Ready."}</span>
         </div>
+        {syncErrors.length ? (
+          <div className="field-agent-sync-errors" role="status" aria-live="polite">
+            <strong>Sync needs attention</strong>
+            {syncErrors.map((item) => (
+              <div className="field-agent-sync-error-row" key={item.id}>
+                {item.identifier ? <span>{item.identifier}: </span> : null}
+                <span>{item.message}</span>
+                {item.attemptedAt ? <small> · Last tried {new Date(item.attemptedAt).toLocaleString()}</small> : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
       </footer>
     </div>
   );
@@ -4711,19 +5487,8 @@ function RespondentAccessPanel({ initialCode = "", onOpen }) {
       const items = await listOfflineFormPackages().catch(() => []);
       if (cancelled) return;
       setOfflineForms(items);
-      if (!isOnline() || !items.length) return;
-      // Online again: forget saved forms the server no longer offers.
-      const withdrawn = [];
-      for (const item of items) {
-        try {
-          await requestJson(`/api/public/forms/${encodeURIComponent(item.accessCode)}`);
-        } catch (error) {
-          if (error?.status !== 404) continue;
-          await removeOfflineFormPackage(item.accessCode).catch(() => {});
-          withdrawn.push(item.accessCode);
-        }
-      }
-      if (!cancelled && withdrawn.length) setOfflineForms(items.filter((item) => !withdrawn.includes(item.accessCode)));
+      // Keep device packages even if a prior form is now archived or access
+      // has changed. They may be the only remaining way to recover local work.
     })();
     return () => { cancelled = true; };
   }, []);
@@ -4906,7 +5671,8 @@ function RespondentAccessPanel({ initialCode = "", onOpen }) {
   );
 }
 
-function DashboardApp({ onLogout }) {
+function DashboardApp({ session, onLogout }) {
+  const [displayName, setDisplayName] = useState(session?.username || "");
   const [view, setView] = useState("home");
   const [forms, setForms] = useState([]);
   const [folders, setFolders] = useState([]);
@@ -4934,6 +5700,11 @@ function DashboardApp({ onLogout }) {
   const [selectedId, setSelectedId] = useState(null);
   const [draggedId, setDraggedId] = useState(null);
   const [status, setStatus] = useState({ kind: "idle", message: "" });
+
+  useEffect(() => {
+    requestJson("/api/profile").then((data) => setDisplayName(data.displayName || data.username || session?.username || ""))
+      .catch(() => setDisplayName(session?.username || ""));
+  }, [session?.username]);
 
   const selectedQuestion = (form.questions || []).find((question) => question.id === selectedId) || null;
   const issues = useMemo(() => validateForm(form), [form]);
@@ -4974,12 +5745,12 @@ function DashboardApp({ onLogout }) {
   }
 
   async function createFolder() {
-    const name = window.prompt("Folder name");
+    const name = window.prompt("Project name");
     if (!name?.trim()) return;
     try {
       const data = await postJson("/api/folders", { name: name.trim() });
       setFolders(data.folders || []);
-      setStatus({ kind: "ok", message: `Created folder: ${name.trim()}` });
+      setStatus({ kind: "ok", message: `Created project: ${name.trim()}` });
     } catch (error) {
       handleRequestError(error);
     }
@@ -4987,14 +5758,14 @@ function DashboardApp({ onLogout }) {
 
   async function deleteFolder(folderId, name) {
     const confirmed = await requestConfirmation({
-      title: "Delete Folder?",
-      message: `Delete "${name || folderId}" and every form inside it? This permanently removes the folder's forms, entries, XLSForms, XML, and FHIR bundles.`,
+      title: "Delete Project?",
+      message: `Delete project "${name || folderId}" and move its forms to your profile archive? Field agents can still sync offline work for those forms.`,
       confirmLabel: "Delete",
       confirmIcon: "trash",
       danger: true
     });
     if (!confirmed) return;
-    setStatus({ kind: "busy", message: "Deleting folder and its forms..." });
+    setStatus({ kind: "busy", message: "Deleting project and its forms..." });
     try {
       const data = await deleteJson(`/api/folders/${encodeURIComponent(folderId)}`);
       if (data.deletedWorkspaceIds?.some((id) => workspaceRouteId(workspace?.workspaceId) === workspaceRouteId(id))) {
@@ -5009,7 +5780,7 @@ function DashboardApp({ onLogout }) {
       }
       setFolders(data.folders || []);
       await refreshForms();
-      setStatus({ kind: "ok", message: `Deleted folder: ${name || folderId}` });
+      setStatus({ kind: "ok", message: `Deleted project: ${name || folderId}` });
     } catch (error) {
       handleRequestError(error);
     }
@@ -5241,7 +6012,7 @@ function DashboardApp({ onLogout }) {
   function removeQuestion(id) {
     const question = form.questions.find((item) => item.id === id);
     if (question?.identifierLocked) {
-      setStatus({ kind: "error", message: "This shared folder identifier is locked and cannot be deleted." });
+      setStatus({ kind: "error", message: "This shared project identifier is locked and cannot be deleted." });
       return;
     }
     if (question?.demographicGeneratedId && isDemographicGeneratedIdLocked(form.questions, id)) {
@@ -5256,7 +6027,7 @@ function DashboardApp({ onLogout }) {
 
   function duplicateQuestion(question) {
     if (question.identifierLocked) {
-      setStatus({ kind: "error", message: "This shared folder identifier is locked and cannot be duplicated." });
+      setStatus({ kind: "error", message: "This shared project identifier is locked and cannot be duplicated." });
       return;
     }
     if (question.demographicGeneratedId) {
@@ -5283,7 +6054,7 @@ function DashboardApp({ onLogout }) {
     const draggedQuestion = (form.questions || []).find((question) => question.id === draggedId);
     const targetQuestion = (form.questions || []).find((question) => question.id === targetId);
     if (draggedQuestion?.identifierLocked || targetQuestion?.identifierLocked) {
-      setStatus({ kind: "error", message: "Shared folder identifiers stay in a fixed position." });
+      setStatus({ kind: "error", message: "Shared project identifiers stay in a fixed position." });
       return;
     }
     const fromIndex = (form.questions || []).findIndex((question) => question.id === draggedId);
@@ -5489,7 +6260,7 @@ function DashboardApp({ onLogout }) {
     const selectedPrimaryIdentifier = String(explicitPrimaryIdentifier || form.primaryIdentifierVariable || "").trim();
     const folderUsesBarcodeIdentifier = currentFolder?.participantIdentifierMode === "barcode";
     if (form.folderId && folderPrimaryIdentifier && selectedPrimaryIdentifier && selectedPrimaryIdentifier !== folderPrimaryIdentifier && !folderUsesBarcodeIdentifier) {
-      setStatus({ kind: "error", message: `Forms in this folder must use the shared primary identifier variable "${folderPrimaryIdentifier}".` });
+      setStatus({ kind: "error", message: `Forms in this project must use the shared primary identifier variable "${folderPrimaryIdentifier}".` });
       return;
     }
     const selectedRespondentCode = respondentCodeMode === RESPONDENT_CODE_MODE_CUSTOM
@@ -6108,7 +6879,7 @@ function DashboardApp({ onLogout }) {
     const id = workspaceRouteId(workspaceId);
     const confirmed = await requestConfirmation({
       title: "Delete Form?",
-      message: `Delete "${title || id}"? This will permanently remove its backend folder, including XLSForm, XML, entries, and FHIR bundles.`,
+      message: `Delete "${title || id}"? It will move to Deleted forms in your profile. Offline submissions from field agents will still sync.`,
       confirmLabel: "Delete",
       confirmIcon: "trash",
       danger: true
@@ -6199,6 +6970,19 @@ function DashboardApp({ onLogout }) {
       await refreshForms();
       notifyCollectionChanged();
       setStatus({ kind: "ok", message: `Deleted ${data.deletedCount || ids.length} entr${ids.length === 1 ? "y" : "ies"}.` });
+    } catch (error) {
+      handleRequestError(error);
+    }
+  }
+
+  async function clearEntryReview(entryId) {
+    if (!workspace?.workspaceId || !entryId) return;
+    setStatus({ kind: "busy", message: "Clearing review status..." });
+    try {
+      const data = await deleteJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspace.workspaceId))}/entries/${encodeURIComponent(entryId)}/review`);
+      setEntries(data.entries || []);
+      notifyCollectionChanged();
+      setStatus({ kind: "ok", message: "Review request cleared." });
     } catch (error) {
       handleRequestError(error);
     }
@@ -6355,17 +7139,24 @@ function DashboardApp({ onLogout }) {
     window.open(`/entry/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(entryId)}`, "_blank", "noopener,noreferrer");
   }
 
+  function viewCheckpoint(workspaceId, checkpoint) {
+    const identifier = String(checkpoint?.primaryIdentifierValue || "").trim();
+    if (!identifier) return;
+    window.open(`/checkpoint/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(identifier)}/${encodeURIComponent(checkpoint.userId || "")}`, "_blank", "noopener,noreferrer");
+  }
+
   return (
     <div className="app-shell">
       {view === "home" ? (
         <HomePage
+          displayName={displayName}
           forms={forms}
           folders={folders}
           schemaDocuments={schemaDocuments}
           schemaSummary={schemaSummary}
           status={status}
           createWorkspace={(folderId = "") => folderId
-            ? setFolderFormPrompt({ folderId, folderName: folders.find((folder) => folder.id === folderId)?.name || "this folder" })
+            ? setFolderFormPrompt({ folderId, folderName: folders.find((folder) => folder.id === folderId)?.name || "this project" })
             : setNewFormPromptOpen(true)}
           uploadXlsxToFolder={(folderId, event) => {
             setFolderFormPrompt(null);
@@ -6444,7 +7235,9 @@ function DashboardApp({ onLogout }) {
           uploadOptionMedia={uploadOptionMedia}
           deleteWorkspaceAttachment={deleteWorkspaceAttachment}
           viewEntry={viewEntry}
+          viewCheckpoint={viewCheckpoint}
           deleteEntries={deleteFormEntries}
+          clearEntryReview={clearEntryReview}
           refreshEntries={refreshCurrentEntries}
           respondentCodeMode={respondentCodeMode}
           setRespondentCodeMode={setRespondentCodeMode}
@@ -6466,7 +7259,7 @@ function DashboardApp({ onLogout }) {
           form={form}
           status={status}
           candidates={primaryIdentifierCandidates()}
-          folderName={currentFolder?.name || "this folder"}
+          folderName={currentFolder?.name || "this project"}
           requiresFolderAcknowledgement={needsFolderPrimaryAcknowledgement}
           onCancel={() => {
             setPublishIdentifierPrompt(false);
@@ -6518,9 +7311,11 @@ function HomePage({
 		  createFolder,
 		  folderFormPrompt,
 		  cancelFolderForm,
-		  createEmptyFolderForm,
-		  uploadXlsxToFolder
+	  createEmptyFolderForm,
+	  uploadXlsxToFolder,
+  displayName
 }) {
+  const unreadNotificationCount = useUnreadNotificationCount();
 	  const homeRef = useRef(null);
 	  const [connectors, setConnectors] = useState([]);
 	  const [selectedVersionByGroup, setSelectedVersionByGroup] = useState({});
@@ -6619,12 +7414,15 @@ function HomePage({
     <>
       <header className="topbar home-topbar">
         <div className="topbar-actions">
+          <button className="secondary topbar-home" type="button" onClick={() => window.location.assign("/profile")}>
+            <UserPlus size={15} /> Profile <NotificationDot count={unreadNotificationCount} />
+          </button>
           <button className="secondary topbar-logout" onClick={() => onLogout?.()}>
             <X size={14} /> Logout
           </button>
         </div>
         <div className="topbar-title">
-          <h1>ICPH Forms</h1>
+          <h1>Hello, {displayName || "Admin"} · Admin</h1>
           <p>Connect MetaForms with generated XLSForms for context and tracking.</p>
         </div>
         <div className="topbar-brand">
@@ -6691,7 +7489,7 @@ function HomePage({
                 >
                   <div className="card-head">
                     <div className="card-head-main">
-	                      <h3>{item.title}</h3>
+	                      <h3>{item.title}{item.isShared ? <Users className="shared-form-indicator" size={14} title="Shared form" aria-label="Shared form" /> : null}</h3>
 	                      <p>{item.formId || item.workspaceId}</p>
 	                      {group.versions.length > 1 ? (
 	                        <label className="version-picker">
@@ -6857,7 +7655,7 @@ function FolderFormModal({ folderName, onCancel, onCreateEmpty, onUpload }) {
             <input type="file" accept=".xlsx" onChange={onUpload} />
           </label>
         </div>
-        <p className="modal-subtle-note">The uploaded XLS form will be imported into this folder and opened in the builder for review.</p>
+      <p className="modal-subtle-note">The uploaded XLS form will be imported into this project and opened in the builder for review.</p>
         <div className="modal-actions">
           <button className="secondary" type="button" onClick={onCancel}>Cancel</button>
         </div>
@@ -6867,6 +7665,7 @@ function FolderFormModal({ folderName, onCancel, onCreateEmpty, onUpload }) {
 }
 
 function FoldersPanel({ folders = [], forms = [], createFolder, deleteFolder, createWorkspace, openWorkspace }) {
+  const [sharingFolder, setSharingFolder] = useState(null);
   const folderFormGroups = new Map();
   for (const form of forms.filter((item) => item.folderId)) {
     const groupKey = form.versionBaseId
@@ -6890,12 +7689,13 @@ function FoldersPanel({ folders = [], forms = [], createFolder, deleteFolder, cr
   }
 
   return (
-    <section className="folders-panel">
+    <>
+      <section className="folders-panel">
       <div className="home-column-head folders-heading">
-        <div><h2>Folders</h2><p>Organise forms outside MetaForms.</p></div>
-        <button className="icon-button" type="button" onClick={createFolder} aria-label="Create folder"><Plus size={18} /></button>
+          <div><h2>Projects</h2><p>Organise forms outside MetaForms.</p></div>
+          <button className="icon-button" type="button" onClick={createFolder} aria-label="Create project"><Plus size={18} /></button>
       </div>
-      {!folders.length ? <p className="muted">No folders yet.</p> : (
+        {!folders.length ? <p className="muted">No projects yet.</p> : (
         <div className="folder-list">
           {folders.map((folder) => {
             const folderForms = visibleFolderForms(folder.id);
@@ -6910,9 +7710,13 @@ function FoldersPanel({ folders = [], forms = [], createFolder, deleteFolder, cr
                 <div className="folder-row-head">
                   <FolderOpen size={16} />
                   <strong>{folder.name} {folderPrimaryIdentifier ? <span className="primary-identifier-inline">({folderPrimaryIdentifier})</span> : null}{folderParticipantIdentifier ? <span className="primary-identifier-inline"> (barcode: {folderParticipantIdentifier})</span> : null}</strong>
-                  <button className="icon-button small" type="button" onClick={() => window.open(`/folder-visualization/${encodeURIComponent(folder.id)}`, "_blank", "noopener,noreferrer")} aria-label={`Visualize responses in ${folder.name}`} title="Visualize folder responses"><Network size={15} /></button>
+                  {folder.isOwner ? <button className="secondary small folder-share-button" type="button" onClick={() => setSharingFolder(folder)}><UserPlus size={14} /> Add people</button> : null}
+                  <button className="icon-button small" type="button" onClick={() => window.open(`/project-visualization/${encodeURIComponent(folder.id)}`, "_blank", "noopener,noreferrer")} aria-label={`Visualize responses in ${folder.name}`} title="Visualize project responses"><Network size={15} /></button>
                   <button className="icon-button small" type="button" onClick={() => createWorkspace(folder.id)} aria-label={`Create form in ${folder.name}`}><Plus size={15} /></button>
-                  <button className="icon-button small danger-action" type="button" onClick={() => deleteFolder(folder.id, folder.name)} aria-label={`Delete ${folder.name}`}><Trash2 size={15} /></button>
+                  <div className="folder-row-end-actions">
+                    {folder.isOwner ? <button className="icon-button small danger-action" type="button" onClick={() => deleteFolder(folder.id, folder.name)} aria-label={`Delete ${folder.name}`}><Trash2 size={15} /></button> : null}
+                    {folder.members?.length ? <span className="shared-people-indicator" title={`Shared with ${folder.members.length} ${folder.members.length === 1 ? "person" : "people"}`} aria-label="Shared project"><Users size={14} /></span> : null}
+                  </div>
                 </div>
                 {folderForms.length ? (
                   <div className="folder-form-list">
@@ -6922,13 +7726,217 @@ function FoldersPanel({ folders = [], forms = [], createFolder, deleteFolder, cr
                       </button>
                     ))}
                   </div>
-                ) : <small className="muted">No forms in this folder.</small>}
+                ) : <small className="muted">No forms in this project.</small>}
               </div>
             );
           })}
         </div>
       )}
     </section>
+    {sharingFolder ? createPortal(<FolderShareModal folder={sharingFolder} onClose={() => setSharingFolder(null)} />, document.body) : null}
+    </>
+  );
+}
+
+function FolderShareModal({ folder, onClose }) {
+  const [members, setMembers] = useState(folder.members || []);
+  const [username, setUsername] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [status, setStatus] = useState({ kind: "idle", message: "" });
+  const folderPath = `/api/folders/${encodeURIComponent(folder.id)}/members`;
+
+  useEffect(() => {
+    requestJson(folderPath)
+      .then((data) => setMembers(data.members || []))
+      .catch((error) => setStatus({ kind: "error", message: error.message || "Could not load project members." }));
+  }, [folderPath]);
+
+  useEffect(() => {
+    const search = username.trim();
+    if (search.length < 2) {
+      setSuggestions([]);
+      return undefined;
+    }
+    let active = true;
+    const timer = setTimeout(() => {
+      requestJson(`/api/users/search?q=${encodeURIComponent(search)}`)
+        .then((data) => {
+          if (active) setSuggestions((data.users || []).filter((user) => !members.some((member) => member.username.toLowerCase() === user.username.toLowerCase())));
+        })
+        .catch((error) => {
+          if (active) setStatus({ kind: "error", message: error.message || "Could not search users." });
+        });
+    }, 180);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [username, members]);
+
+  async function addMember(value) {
+    const nextUsername = String(value || username).trim();
+    if (!nextUsername) return;
+    setStatus({ kind: "busy", message: `Sharing with ${nextUsername}...` });
+    try {
+      const data = await postJson(folderPath, { username: nextUsername });
+      setMembers(data.members || []);
+      setUsername("");
+      setSuggestions([]);
+      const added = (data.members || []).find((member) => member.username.toLowerCase() === nextUsername.toLowerCase());
+      const roleLabel = added?.accessRole === "field-agent" ? "field agent" : "admin";
+      setStatus({ kind: "ok", message: `Shared project ${folder.name} with ${nextUsername} as a ${roleLabel}.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || "Could not share this project." });
+    }
+  }
+
+  async function removeMember(member) {
+    setStatus({ kind: "busy", message: `Removing ${member.username}...` });
+    try {
+      const data = await deleteJson(`${folderPath}/${encodeURIComponent(member.username)}`);
+      setMembers(data.members || []);
+      setStatus({ kind: "ok", message: `Removed ${member.username} from project ${folder.name}.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || "Could not update project access." });
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="link-modal folder-share-modal" role="dialog" aria-modal="true" aria-labelledby="folder-share-title">
+        <div className="modal-heading">
+          <div><span className="eyebrow">Collaborative workspace</span><h2 id="folder-share-title">Share {folder.name}</h2></div>
+          <button className="icon-button" type="button" aria-label="Close" onClick={onClose}><X size={18} /></button>
+        </div>
+        <label className="field">
+          <span>Add people by username</span>
+          <input value={username} onChange={(event) => setUsername(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && suggestions[0]) { event.preventDefault(); void addMember(suggestions[0].username); } }} placeholder="Start typing a username" autoComplete="off" autoFocus />
+        </label>
+        {suggestions.length ? (
+          <div className="username-suggestions" role="listbox" aria-label="Matching users">
+            {suggestions.map((user) => <button type="button" role="option" key={user.id || user.username} onClick={() => void addMember(user.username)}><strong>{user.username}</strong><span>{user.accessRole === "field-agent" ? "Field agent" : "Admin"}</span></button>)}
+          </div>
+        ) : username.trim().length >= 2 && status.kind !== "busy" ? <p className="muted">No matching users found.</p> : null}
+        <div className="folder-member-list">
+          <h3>People with access</h3>
+          <h4>Admins</h4>
+          <div className="folder-member-row"><span>You (owner)</span><span className="muted">Owner</span></div>
+          {members.filter((member) => member.accessRole !== "field-agent").length ? members.filter((member) => member.accessRole !== "field-agent").map((member) => (
+            <div className="folder-member-row" key={member.userId || member.username}><span>{member.username}</span><button className="secondary small" type="button" onClick={() => void removeMember(member)}>Remove</button></div>
+          )) : <p className="muted">No other admins have access yet.</p>}
+          <h4>Field agents</h4>
+          {members.filter((member) => member.accessRole === "field-agent").length ? members.filter((member) => member.accessRole === "field-agent").map((member) => (
+            <div className="folder-member-row" key={member.userId || member.username}><span>{member.username}</span><button className="secondary small" type="button" onClick={() => void removeMember(member)}>Remove</button></div>
+          )) : <p className="muted">No field agents have access yet.</p>}
+        </div>
+        {status.message ? <div className={`status-line ${status.kind}`}><span>{status.message}</span></div> : null}
+        <div className="modal-actions"><button className="secondary" type="button" onClick={onClose}>Done</button></div>
+      </section>
+    </div>
+  );
+}
+
+function FieldAgentAccessModal({ workspaceId, formName, onClose }) {
+  const [members, setMembers] = useState([]);
+  const [username, setUsername] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+  const [status, setStatus] = useState({ kind: "busy", message: "Loading field-agent access..." });
+  const accessPath = `/api/forms/${encodeURIComponent(workspaceId)}/field-agents`;
+
+  useEffect(() => {
+    requestJson(accessPath)
+      .then((data) => {
+        setMembers(data.members || []);
+        setStatus({ kind: "idle", message: "" });
+      })
+      .catch((error) => setStatus({ kind: "error", message: error.message || "Could not load field-agent access." }));
+  }, [accessPath]);
+
+  useEffect(() => {
+    const search = username.trim();
+    if (search.length < 2) {
+      setSuggestions([]);
+      return undefined;
+    }
+    let active = true;
+    const timer = setTimeout(() => {
+      requestJson(`/api/users/search?q=${encodeURIComponent(search)}&role=field-agent`)
+        .then((data) => {
+          if (active) setSuggestions(data.users || []);
+        })
+        .catch((error) => {
+          if (active) setStatus({ kind: "error", message: error.message || "Could not search field agents." });
+        });
+    }, 180);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [username, members]);
+
+  async function addMember(value) {
+    const nextUsername = String(value || username).trim();
+    if (!nextUsername) return;
+    setStatus({ kind: "busy", message: `Sharing ${formName} with ${nextUsername}...` });
+    try {
+      const data = await postJson(accessPath, { username: nextUsername });
+      setMembers(data.members || []);
+      setUsername("");
+      setSuggestions([]);
+      setStatus({ kind: "ok", message: `Field-agent access added for ${nextUsername}.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || "Could not share this form." });
+    }
+  }
+
+  async function removeMember(member) {
+    setStatus({ kind: "busy", message: `Removing ${member.username}...` });
+    try {
+      const data = await deleteJson(`${accessPath}/${encodeURIComponent(member.username)}`);
+      setMembers(data.members || []);
+      setStatus({ kind: "ok", message: `Field-agent access removed for ${member.username}.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: error.message || "Could not update field-agent access." });
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="link-modal folder-share-modal" role="dialog" aria-modal="true" aria-labelledby="field-agent-access-title">
+        <div className="modal-heading">
+          <div><span className="eyebrow">Published form access</span><h2 id="field-agent-access-title">Field agent access</h2><p>{formName}</p></div>
+          <button className="icon-button" type="button" aria-label="Close" onClick={onClose}><X size={18} /></button>
+        </div>
+        <label className="field">
+          <span>Add field agents by username</span>
+          <input value={username} onChange={(event) => setUsername(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && suggestions[0]) { event.preventDefault(); void addMember(suggestions[0].username); } }} placeholder="Start typing a username" autoComplete="off" autoFocus />
+        </label>
+        {suggestions.length ? (
+          <div className="username-suggestions" role="listbox" aria-label="Matching field agents">
+            {suggestions.map((user) => {
+              const existing = members.find((member) => member.username.toLowerCase() === user.username.toLowerCase());
+              return (
+                <button type="button" role="option" key={user.id || user.username} disabled={Boolean(existing)} onClick={() => void addMember(user.username)}>
+                  <strong>{user.username}</strong>
+          <span>{existing ? existing.accessType === "folder" ? "Already added through project" : "Already added" : "Add field agent"}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : username.trim().length >= 2 && status.kind !== "busy" ? <p className="muted">No matching field agents found.</p> : null}
+        <div className="folder-member-list">
+          <h3>Field agents with access</h3>
+          {!members.length ? <p className="muted">No field agents have access to this form yet.</p> : members.map((member) => (
+            <div className="folder-member-row" key={member.userId || member.username}>
+              <span>{member.username}</span>
+          {member.accessType === "folder" ? <span className="muted">Project access</span> : <button className="secondary small" type="button" onClick={() => void removeMember(member)}>Remove</button>}
+            </div>
+          ))}
+        </div>
+        {status.message ? <div className={`status-line ${status.kind}`}><span>{status.message}</span></div> : null}
+        <div className="modal-actions"><button className="secondary" type="button" onClick={onClose}>Done</button></div>
+      </section>
+    </div>
   );
 }
 
@@ -7365,7 +8373,7 @@ function XlsImportLinkModal({ pending, documents, forms = [], status, onCancel, 
               onChange={(event) => setFolderPrimaryAcknowledged(event.target.checked)}
             />
             <span>
-              I acknowledge that <strong>{effectivePrimaryIdentifier || "the selected variable"}</strong> is the common Primary Identifier Variable for every form created in <strong>{pending.folderName || "this folder"}</strong>.
+              I acknowledge that <strong>{effectivePrimaryIdentifier || "the selected variable"}</strong> is the common Primary Identifier Variable for every form created in <strong>{pending.folderName || "this project"}</strong>.
             </span>
           </label>
         ) : null}
@@ -7431,7 +8439,7 @@ function PublishIdentifierModal({
   form,
   candidates,
   status,
-  folderName = "this folder",
+  folderName = "this project",
   requiresFolderAcknowledgement = false,
   onCancel,
   onPublish
@@ -7723,7 +8731,9 @@ function BuilderPage(props) {
     uploadOptionMedia,
     deleteWorkspaceAttachment,
     viewEntry,
+    viewCheckpoint,
     deleteEntries,
+    clearEntryReview,
     refreshEntries,
     respondentCodeMode,
     setRespondentCodeMode,
@@ -7761,6 +8771,7 @@ function BuilderPage(props) {
   );
   const [questionTypeToAdd, setQuestionTypeToAdd] = useState(QUESTION_TYPES[0]?.type || "text");
   const [statisticsOpen, setStatisticsOpen] = useState(false);
+  const [fieldAgentAccessOpen, setFieldAgentAccessOpen] = useState(false);
 
   return (
     <>
@@ -7885,6 +8896,7 @@ function BuilderPage(props) {
               ) : null}
             </div>
             {published ? <ParticipantAssignmentPanel form={form} workspaceId={workspace?.workspaceId} folderParticipantIdentifierVariable={folderParticipantIdentifierVariable} onActivated={onParticipantIdentifierActivated} /> : null}
+            {published ? <IncompleteCheckpointsPanel workspaceId={workspace?.workspaceId} viewCheckpoint={viewCheckpoint} /> : null}
             <EntriesPanel
               form={form}
               entries={entries}
@@ -7892,6 +8904,7 @@ function BuilderPage(props) {
               viewEntry={viewEntry}
               editEntry={(entryId) => fillForm(workspace.workspaceId, entryId)}
               deleteEntries={deleteEntries}
+              clearEntryReview={clearEntryReview}
               refreshEntries={refreshEntries}
               status={status}
               allowResponseEdits={allowResponseEdits}
@@ -8103,7 +9116,7 @@ function BuilderPage(props) {
 	        finishBuild={finishBuild}
 	        exportXlsForm={exportXlsForm}
 	        fillForm={fillForm}
-	        refreshEntries={refreshEntries}
+	        onManageFieldAgents={() => setFieldAgentAccessOpen(true)}
 	        passToMapper={passToMapper}
 	        goToPublish={() => setActiveStage("publish")}
 	        reviewIssue={reviewIssue}
@@ -8113,6 +9126,10 @@ function BuilderPage(props) {
 	        leaveAllTerminologyUnmappedAndPublish={leaveAllTerminologyUnmappedAndPublish}
 	      />
       {statisticsOpen ? <StatisticsModal form={form} entries={entries} onClose={() => setStatisticsOpen(false)} /> : null}
+      {fieldAgentAccessOpen && workspace?.workspaceId ? createPortal(
+        <FieldAgentAccessModal workspaceId={workspace.workspaceId} formName={form.title || workspace.workspaceId} onClose={() => setFieldAgentAccessOpen(false)} />,
+        document.body
+      ) : null}
     </>
   );
 }
@@ -8131,7 +9148,7 @@ function BuilderFooter({
 	  finishBuild,
 	  exportXlsForm,
 	  fillForm,
-	  refreshEntries,
+	  onManageFieldAgents,
 	  passToMapper,
 	  goToPublish,
 	  reviewIssue,
@@ -8205,8 +9222,8 @@ function BuilderFooter({
             <button className="primary" disabled={!workspace?.workspaceId} onClick={() => fillForm(workspace.workspaceId)}>
               <ExternalLink size={16} /> Fill Form
             </button>
-            <button className="secondary" disabled={busy} onClick={refreshEntries}>
-              <RefreshCw size={16} /> Refresh Entries
+            <button className="secondary" disabled={busy} onClick={onManageFieldAgents}>
+              <UserPlus size={16} /> Field agent access
             </button>
 	            <button className="secondary" disabled={!entries.length || busy} onClick={passToMapper}>
 	              <Forward size={16} /> Generate FHIR
@@ -8352,7 +9369,92 @@ function QuestionResourcesBox({ workspace, requirements, status, locked = false,
   );
 }
 
-function EntriesPanel({ form, entries, workspaceId, viewEntry, editEntry, deleteEntries, refreshEntries, status, allowResponseEdits = false }) {
+function IncompleteCheckpointsPanel({ workspaceId, viewCheckpoint }) {
+  const [checkpoints, setCheckpoints] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [deleting, setDeleting] = useState("");
+
+  async function refresh() {
+    if (!workspaceId) return;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await requestJson(`/api/forms/${encodeURIComponent(workspaceId)}/checkpoints`);
+      setCheckpoints(result.checkpoints || []);
+    } catch (reason) {
+      setError(reason.message || String(reason));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { refresh(); }, [workspaceId]);
+
+  async function removeCheckpoint(checkpoint) {
+    const identifier = String(checkpoint.primaryIdentifierValue || "").trim();
+    if (!identifier) return;
+    if (!window.confirm(`Delete the incomplete entry for "${identifier}"? This cannot be undone.`)) return;
+    setDeleting(identifier);
+    setError("");
+    try {
+      const result = await deleteJson(`/api/forms/${encodeURIComponent(workspaceId)}/checkpoints/${encodeURIComponent(identifier)}?userId=${encodeURIComponent(checkpoint.userId || "")}`);
+      setCheckpoints(result.checkpoints || []);
+    } catch (reason) {
+      setError(reason.message || String(reason));
+    } finally {
+      setDeleting("");
+    }
+  }
+
+  return (
+    <div className="panel entries-panel incomplete-checkpoints-panel">
+      <div className="section-head">
+        <h2>Incomplete entries</h2>
+        <div className="section-actions">
+          <span>{checkpoints.length} saved</span>
+          <button className="secondary small" type="button" disabled={loading} onClick={refresh}>
+            <RefreshCw size={14} /> Refresh
+          </button>
+        </div>
+      </div>
+      <p className="muted">Saved checkpoints that have not been submitted yet.</p>
+      {error ? <p className="status-line error" role="alert">{error}</p> : null}
+      {loading && !checkpoints.length ? <p className="muted">Loading incomplete entries…</p> : null}
+      {!loading && !checkpoints.length ? <p className="muted">No incomplete entries.</p> : null}
+      {checkpoints.length ? (
+        <div className="entries-table">
+          {checkpoints.slice().reverse().map((checkpoint, index) => {
+            const identifier = String(checkpoint.primaryIdentifierValue || `Entry ${index + 1}`);
+            return (
+              <div className="entry-row incomplete-checkpoint-row" key={`${identifier}-${checkpoint.savedAt || index}`}>
+                <div className="entry-details">
+                  <strong>{identifier}</strong>
+                  <small>Saved {checkpoint.savedAt ? new Date(checkpoint.savedAt).toLocaleString() : "recently"}</small>
+                  <small>Saved by {checkpoint.savedBy || checkpoint.userId || "an earlier account"}</small>
+                  {checkpoint.adminEditedAt ? <small>Edited by {checkpoint.adminEditedByName || checkpoint.adminEditedByUsername || "admin"}{checkpoint.adminEditedByUsername && checkpoint.adminEditedByName && checkpoint.adminEditedByUsername !== checkpoint.adminEditedByName ? ` (@${checkpoint.adminEditedByUsername})` : ""} · {new Date(checkpoint.adminEditedAt).toLocaleString()}</small> : null}
+                  {checkpoint.reviewRequestedAt ? (
+                    <small className="review-requested-badge">Review requested by {checkpoint.reviewRequestedBy || "field agent"} · {new Date(checkpoint.reviewRequestedAt).toLocaleString()}</small>
+                  ) : null}
+                </div>
+                <div className="entry-actions">
+                  <button className="secondary small icon-text-button" type="button" disabled={!workspaceId} onClick={() => viewCheckpoint?.(workspaceId, checkpoint)}>
+                    <ExternalLink size={14} /> View
+                  </button>
+                  <button className="danger-action small icon-text-button" type="button" disabled={Boolean(deleting)} onClick={() => removeCheckpoint(checkpoint)}>
+                    <Trash2 size={14} /> {deleting === identifier ? "Deleting…" : "Delete"}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function EntriesPanel({ form, entries, workspaceId, viewEntry, editEntry, deleteEntries, clearEntryReview, refreshEntries, status, allowResponseEdits = false }) {
   const entryIds = useMemo(() => entries.map((entry) => String(entry.id || "")).filter(Boolean), [entries]);
   const entryIdKey = entryIds.join("|");
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
@@ -8446,11 +9548,14 @@ function EntriesPanel({ form, entries, workspaceId, viewEntry, editEntry, delete
                   {new Date(entry.submittedAt).toLocaleString()}
                   {entry.instanceName && entry.instanceName !== entry.id ? ` · ${entry.id}` : ""}
                 </small>
+                <small>Submitted by {entry.submittedByName || entry.submittedByUsername || entry.submittedByUserId || entry.userId || "Unknown user"}{entry.submittedByUsername && entry.submittedByName && entry.submittedByUsername !== entry.submittedByName ? ` (@${entry.submittedByUsername})` : ""}</small>
+                {entry.adminEditedAt ? <small className="admin-edit-audit">Edited by {entry.adminEditedByName || entry.adminEditedByUsername || "admin"}{entry.adminEditedByUsername && entry.adminEditedByName && entry.adminEditedByUsername !== entry.adminEditedByName ? ` (@${entry.adminEditedByUsername})` : ""} · {new Date(entry.adminEditedAt).toLocaleString()}</small> : null}
+                {entry.reviewRequestedAt ? <small className="review-request-note">Review requested by {entry.reviewRequestedBy || "field agent"} · {new Date(entry.reviewRequestedAt).toLocaleString()}</small> : null}
               </div>
               <div className="entry-actions">
-                {allowResponseEdits ? (
-                  <button className="secondary small" disabled={!workspaceId} onClick={() => editEntry?.(entry.id)} title="Edit entry">
-                    <TextCursorInput size={14} /> Edit
+                {entry.reviewRequestedAt ? (
+                  <button className="secondary small icon-text-button" disabled={status?.kind === "busy"} onClick={() => clearEntryReview?.(entryId)} title="Clear review request">
+                    <CheckCircle2 size={14} /> Clear review
                   </button>
                 ) : null}
                 <button className="secondary small" disabled={!workspaceId} onClick={() => viewEntry(workspaceId, entry.id)}>
@@ -9883,7 +10988,7 @@ function ParticipantAssignmentPanel({ form, workspaceId, folderParticipantIdenti
   async function activateParticipantIdentifier() {
     const assignedCount = rows.filter((row) => row.barcode).length;
     if (!assignedCount || identifierActivated) return;
-    setStatus({ kind: "busy", message: "Updating folder participant identifier..." });
+    setStatus({ kind: "busy", message: "Updating project participant identifier..." });
     try {
       const data = await postJson(`/api/forms/${encodeURIComponent(workspaceRouteId(workspaceId))}/participants/activate`, {
         participantIdentifierVariable: barcodeVariable
@@ -9940,7 +11045,7 @@ function ParticipantAssignmentPanel({ form, workspaceId, folderParticipantIdenti
           placeholder="participant_barcode"
           onChange={(event) => setBarcodeVariable(slug(event.target.value))}
         />
-        <small>{folderParticipantIdentifierVariable || identifierActivated ? "This variable is locked after changing the participant identifier." : "Choose this before changing the participant identifier. It will be shared by later forms in the folder."}</small>
+        <small>{folderParticipantIdentifierVariable || identifierActivated ? "This variable is locked after changing the participant identifier." : "Choose this before changing the participant identifier. It will be shared by later forms in the project."}</small>
       </label>
       {rows.length ? (
         <div className="participant-assignment-list">
@@ -10574,6 +11679,7 @@ function OdkWebFormIsland({ form, formXml, workspaceId, formApiBase, onSubmitted
       })));
       const payloadBody = {
         instanceXml,
+        sourceWorkspaceId: workspaceId || "",
         payloadType: payload?.payloadType || "monolithic",
         submissionMeta: payload?.submissionMeta || null,
         attachments
@@ -13479,7 +14585,8 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, u
   );
 }
 
-function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkpointAnswers = null, resumePrimaryIdentifierValue = "", resumeCheckpointIdentifier = "", onBackToRespondent }) {
+function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkpointAnswers = null, resumePrimaryIdentifierValue = "", resumeCheckpointIdentifier = "", adminCheckpointIdentifier = "", adminCheckpointUserId = "", onBackToRespondent }) {
+  const [formGenerationId, setFormGenerationId] = useState(workspaceId || "");
   const [form, setForm] = useState(null);
   const [formXml, setFormXml] = useState("");
   const [answers, setAnswers] = useState({});
@@ -13520,7 +14627,9 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   const canAdvanceGroup = Boolean(form && status.kind !== "busy" && !pageValidation.errors.length);
   const secondaryLanguage = form ? secondaryLanguageName(form) : "";
   const hasBarcodeQuestions = Boolean(form?.questions?.some((question) => question.type === "barcode"));
-  const useOdkViewer = Boolean(formXml && !hasGroupSections && !hasChoiceQuestions && !hasBarcodeQuestions && !editingEntry && !entryId && checkpointAnswers === null && !resumePrimaryIdentifierValue && !resumeCheckpointIdentifier);
+  // Use the stateful native renderer for code-based collection so the field
+  // agent's answers can be saved as a respondent checkpoint before submission.
+  const useOdkViewer = Boolean(formXml && !accessCode && !adminCheckpointIdentifier && !hasGroupSections && !hasChoiceQuestions && !hasBarcodeQuestions && !editingEntry && !entryId && checkpointAnswers === null && !resumePrimaryIdentifierValue && !resumeCheckpointIdentifier);
 
   useEffect(() => {
     setActiveGroupPage(0);
@@ -13547,14 +14656,16 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
     if (!form || !answersReady || !accessCode) return undefined;
     const timeout = window.setTimeout(() => {
       saveEncryptedOfflineRecord("offlineDrafts", {
-        id: offlineDraftId(accessCode, workspaceId, entryId),
+        id: offlineDraftId(accessCode, formGenerationId, entryId),
+        ownerUserId: currentOfflineOwnerId(),
         accessCode,
+        workspaceId: formGenerationId,
         answers,
         updatedAt: Date.now()
       }).then(() => setLocalDraftSaved(true)).catch(() => {});
     }, 250);
     return () => window.clearTimeout(timeout);
-  }, [accessCode, answers, answersReady, entryId, form, workspaceId]);
+  }, [accessCode, answers, answersReady, entryId, form, formGenerationId]);
 
   useEffect(() => () => {
     Object.values(cachedAttachmentUrls).forEach((url) => URL.revokeObjectURL(url));
@@ -13569,12 +14680,14 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         let xml = "";
         let attachmentBlobs = [];
         let externalChoiceData = {};
+        let loadedWorkspaceId = workspaceId || "";
         let loadedOffline = false;
         let packageCached = false;
         try {
           const fetched = await fetchFormPackage(formApiBase, accessCode);
           const savedPackage = fetched.formPackage;
           data = fetched.data;
+          loadedWorkspaceId = data.workspaceId || savedPackage.workspaceId || loadedWorkspaceId;
           draft = savedPackage.draft;
           publishedForm = savedPackage.form;
           xml = savedPackage.xml;
@@ -13587,13 +14700,10 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           } catch {}
           cachedPackageRef.current = savedPackage;
         } catch (networkError) {
-          // The server no longer offers this form: drop the copy saved on this device.
-          if (networkError.status === 404 && accessCode) {
-            await removeOfflineFormPackage(accessCode).catch(() => {});
-            throw new Error("This form is no longer available. It may have been deleted or closed by an admin.");
-          }
-          if (networkError.status && networkError.status < 500) throw networkError;
-          const savedPackage = accessCode ? await loadOfflineFormPackage(accessCode) : null;
+          // A deleted, inaccessible, or temporarily unreachable server copy
+          // must not destroy a package that may contain the only usable copy
+          // for an agent's draft. Prefer the saved package for all API failures.
+          const savedPackage = accessCode ? await loadOfflineFormPackage(accessCode, workspaceId) : null;
           if (!savedPackage) {
             if (!isOnline()) throw new Error("This form is not saved on this device yet. Open it once while online to make it available offline.");
             throw networkError;
@@ -13606,13 +14716,15 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           loadedOffline = true;
           packageCached = true;
           cachedPackageRef.current = savedPackage;
-          data = { draft: savedPackage.draft, hasXml: Boolean(savedPackage.xml), title: savedPackage.title };
+          loadedWorkspaceId = savedPackage.workspaceId || loadedWorkspaceId;
+          data = { draft: savedPackage.draft, hasXml: Boolean(savedPackage.xml), title: savedPackage.title, workspaceId: loadedWorkspaceId };
           draft = normalizeFormDraft(savedPackage.draft);
           publishedForm = savedPackage.form || (savedPackage.xml ? parseXFormXml(savedPackage.xml, draft) : draft);
           xml = savedPackage.xml || "";
           attachmentBlobs = savedPackage.attachments || [];
           externalChoiceData = savedPackage.externalChoices || {};
         }
+        setFormGenerationId(loadedWorkspaceId);
         setFormXml(xml);
         setForm(publishedForm);
         setExternalChoices(externalChoiceData);
@@ -13641,12 +14753,17 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         }
         let loadedCheckpointAnswers = checkpointAnswers && typeof checkpointAnswers === "object" ? checkpointAnswers : null;
         let loadedCheckpointIdentifierValue = resumePrimaryIdentifierValue;
+        if (adminCheckpointIdentifier) {
+          const checkpointData = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(adminCheckpointIdentifier)}?userId=${encodeURIComponent(adminCheckpointUserId)}`);
+          loadedCheckpointAnswers = checkpointData.checkpoint?.answers || {};
+          loadedCheckpointIdentifierValue = checkpointData.checkpoint?.primaryIdentifierValue || adminCheckpointIdentifier;
+        }
         if (accessCode && resumeCheckpointIdentifier && !loadedCheckpointAnswers) {
           try {
             const checkpointData = await requestJson(`${formApiBase}/checkpoint`, {
               method: "PUT",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ primaryIdentifierValue: resumeCheckpointIdentifier })
+              body: JSON.stringify({ primaryIdentifierValue: resumeCheckpointIdentifier, sourceWorkspaceId: loadedWorkspaceId })
             });
             if (!checkpointData.checkpoint) throw new Error("Saved checkpoint not found.");
             loadedCheckpointAnswers = checkpointData.checkpoint.answers || {};
@@ -13670,7 +14787,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         if (!fresh && !entryId && !Object.keys(resumedAnswers).length && accessCode) {
           try {
             const drafts = await readEncryptedOfflineRecords("offlineDrafts");
-            const saved = drafts.find((item) => item.id === offlineDraftId(accessCode, workspaceId, entryId));
+            const saved = drafts.find((item) => item.id === offlineDraftId(accessCode, loadedWorkspaceId, entryId));
             interruptedAnswers = saved?.answers || {};
             setLocalDraftSaved(Object.keys(interruptedAnswers).length > 0);
           } catch {}
@@ -13719,7 +14836,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
       }
     }
     loadPublishedForm();
-  }, [accessCode, checkpointAnswers, entryId, formApiBase, fresh, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
+  }, [accessCode, adminCheckpointIdentifier, adminCheckpointUserId, checkpointAnswers, entryId, formApiBase, fresh, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
 
   function setAnswer(name, value) {
     setSubmissionSuccess(false);
@@ -13732,6 +14849,8 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
     const failedMessage = Object.values(result.errors)[0];
     setStatus(failedMessage
       ? { kind: "error", message: `Some saved responses need attention: ${failedMessage}` }
+      : result.terminalIds?.length
+        ? { kind: "error", message: `${result.terminalIds.length} item${result.terminalIds.length === 1 ? "" : "s"} belong to a permanently deleted form. Export the data from Profile → Activity before deleting it.` }
       : { kind: "ok", message: result.pendingCount ? `${result.pendingCount} item${result.pendingCount === 1 ? "" : "s"} still waiting to sync.` : "All saved responses are synced." });
   }
 
@@ -13754,6 +14873,23 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
     try {
       const validation = validateAnswers(form, answers);
       if (validation.errors.length) {
+        const missingRequired = validation.errors.filter((error) => error.endsWith(" is required."));
+        const otherErrors = validation.errors.filter((error) => !error.endsWith(" is required."));
+        if (!accessCode && (editingEntry || entryId) && missingRequired.length && !otherErrors.length) {
+          const visibleNames = new Set(visibleQuestions(form, validation.answers).map(questionAnswerKey));
+          const incompleteAnswers = {};
+          for (const [name, value] of Object.entries(validation.answers)) {
+            if (visibleNames.has(name)) incompleteAnswers[name] = value;
+          }
+          try {
+            const result = await postJson(`${formApiBase}/entries/${encodeURIComponent(editingEntry?.id || entryId)}/incomplete`, { answers: incompleteAnswers });
+            notifyCollectionChanged();
+            window.location.assign(`/checkpoint/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(result.checkpoint.primaryIdentifierValue)}/${encodeURIComponent(result.checkpoint.userId || "")}?moved=1`);
+          } catch (error) {
+            setStatus({ kind: "error", message: error.message || String(error) });
+          }
+          return;
+        }
         setStatus({ kind: "error", message: validation.errors[0] });
         return;
       }
@@ -13764,23 +14900,26 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
       }
       const submissionPayload = {
         entryId: editingEntry?.id || entryId || "",
+        sourceWorkspaceId: formGenerationId || "",
         answers: submissionAnswers
       };
       let result;
       if (accessCode) {
         result = await saveOfflineFirst(`${formApiBase}/entries`, submissionPayload);
       } else {
-        await postJson(`${formApiBase}/entries`, submissionPayload);
-        result = { queued: false, pendingCount: 0 };
+        result = await postJson(`${formApiBase}/entries`, submissionPayload);
+        result = { ...result, queued: false, pendingCount: 0 };
       }
       notifyCollectionChanged();
       setPendingSyncCount(result.pendingCount);
       setStatus(result.error
         ? { kind: "error", message: `Saved on this device; sync needs attention: ${result.error}` }
+        : result.unchanged
+          ? { kind: "ok", message: "No changes to save. No edit was recorded." }
         : result.queued
           ? { kind: "ok", message: "Saved on this device. It will sync when the connection is available." }
-          : { kind: "ok", message: "Submitted and synced." });
-      setSubmissionSuccess(true);
+          : { kind: "ok", message: editingEntry || entryId ? "Entry updated and synced." : "Submitted and synced." });
+      setSubmissionSuccess(!result.unchanged);
       setLocalDraftSaved(false);
       if (!editingEntry && !entryId) setAnswers({});
     } catch (error) {
@@ -13789,6 +14928,38 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   }
 
   async function saveCheckpoint() {
+    if (adminCheckpointIdentifier) {
+      const validation = validateAnswers(form, answers);
+      const primaryIdentifierVariable = String(form?.participantIdentifierVariable || form?.primaryIdentifierVariable || "").trim();
+      const visibleNames = new Set(visibleQuestions(form, calculatedAnswers).map(questionAnswerKey));
+      const checkpointData = {};
+      for (const [name, value] of Object.entries(calculatedAnswers)) {
+        if (visibleNames.has(name) || name === primaryIdentifierVariable) checkpointData[name] = value;
+      }
+      setStatus({ kind: "busy", message: "Saving admin changes..." });
+      try {
+        if (!validation.errors.length) {
+          const result = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(adminCheckpointIdentifier)}/submit`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ userId: adminCheckpointUserId, answers: checkpointData })
+          });
+          notifyCollectionChanged();
+          window.location.assign(`/entry/${encodeURIComponent(workspaceRouteId(workspaceId))}/${encodeURIComponent(result.entry.id)}?submitted=1`);
+          return;
+        }
+        const result = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(adminCheckpointIdentifier)}`, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ userId: adminCheckpointUserId, answers: checkpointData })
+        });
+        setSubmissionSuccess(!result.unchanged);
+        setStatus({ kind: "ok", message: result.unchanged ? "No changes to save. No edit was recorded." : "Checkpoint changes saved." });
+      } catch (error) {
+        setStatus({ kind: "error", message: error.message || String(error) });
+      }
+      return;
+    }
     if (!accessCode) {
       setStatus({ kind: "error", message: "Open the form from the respondent page to save a checkpoint." });
       return;
@@ -13811,6 +14982,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         if (visibleNames.has(name) || name === primaryIdentifierVariable) checkpointData[name] = value;
       }
       const result = await saveOfflineFirst(`${formApiBase}/checkpoint`, {
+        sourceWorkspaceId: formGenerationId || "",
         primaryIdentifierValue: checkpointIdentifierValue,
         answers: checkpointData
       });
@@ -13861,7 +15033,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
             ) : null}
             <div>
               <h1>{form.title}</h1>
-              <p>{editingEntry ? "Editing submitted entry" : accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
+              <p>{adminCheckpointIdentifier ? "Editing incomplete entry" : editingEntry ? "Editing submitted entry" : accessCode ? `Respondent code ${normalizeAccessCodeInput(accessCode)}` : form.formId}</p>
             </div>
           </div>
         ) : (
@@ -13900,7 +15072,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
 	          <OdkWebFormIsland
 	            form={form}
 	            formXml={formXml}
-            workspaceId={workspaceId}
+            workspaceId={formGenerationId}
             formApiBase={formApiBase}
             offlineCapable={Boolean(accessCode)}
             cachedAttachmentUrls={cachedAttachmentUrls}
@@ -13927,6 +15099,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
                   question={question}
                   value={calculatedAnswers[answerKey] || ""}
                   onChange={(value) => setAnswer(answerKey, value)}
+                  forceDisabled={Boolean(adminCheckpointIdentifier && question.name === (form.participantIdentifierVariable || form.primaryIdentifierVariable))}
                   languageMode={languageMode}
                   choiceOptions={externalChoices[question.name] || []}
                   workspaceId={workspaceId}
@@ -13938,7 +15111,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         })}
 	        {submissionSuccess ? (
 	          <div className="submission-success-inline">
-	            <Check size={16} /> {editingEntry ? "Updated!" : "Submitted!"}
+	            <Check size={16} /> {adminCheckpointIdentifier ? answerValidation.errors.length ? "Checkpoint saved." : "Submitted!" : editingEntry ? "Updated!" : "Submitted!"}
 	          </div>
 	        ) : null}
 	      </main>
@@ -13948,9 +15121,11 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
 	          <span>{status.message || (hasGroupSections && !isLastGroupPage ? (canAdvanceGroup ? "Ready to continue." : pageValidation.errors[0] || "Complete this section.") : (canSubmit ? "Ready to submit." : answerValidation.errors[0] || "Ready"))}</span>
 	        </div>
 	        <div className="footer-actions">
-	          <button className="secondary" disabled={!form || status.kind === "busy"} onClick={saveCheckpoint}>
-	            <Save size={16} /> Save Checkpoint
-	          </button>
+          {!adminCheckpointIdentifier ? (
+            <button className="secondary" disabled={!form || status.kind === "busy"} onClick={saveCheckpoint}>
+              <Save size={16} /> Save Checkpoint
+            </button>
+          ) : null}
 	          {hasGroupSections && activeGroupPage > 0 ? (
             <button className="secondary group-page-back" disabled={status.kind === "busy"} onClick={goBackGroupPage}>
               <ChevronRight size={16} /> Back
@@ -13962,8 +15137,8 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
               Next <ChevronRight size={16} />
             </button>
           ) : (
-            <button className="primary" disabled={!form || status.kind === "busy"} onClick={submitEntry}>
-              <Check size={16} /> {editingEntry ? "Update" : "Submit"}
+            <button className="primary" disabled={!form || status.kind === "busy"} onClick={adminCheckpointIdentifier ? saveCheckpoint : submitEntry}>
+              <Check size={16} /> {adminCheckpointIdentifier ? answerValidation.errors.length ? "Update" : "Submit" : editingEntry || entryId ? "Update" : "Submit"}
             </button>
           )}
 	        </div>
@@ -13972,7 +15147,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   );
 }
 
-function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
+function EntryViewer({ workspaceId = "", accessCode = "", entryId = "", checkpointIdentifier = "", checkpointUserId = "" }) {
   const [form, setForm] = useState(null);
   const [entry, setEntry] = useState(null);
   const [status, setStatus] = useState({ kind: "busy", message: "Loading entry..." });
@@ -13986,11 +15161,22 @@ function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
           ? encodeURIComponent(normalizeAccessCodeInput(accessCode))
           : encodeURIComponent(workspaceRouteId(workspaceId));
         const formApiBase = accessCode ? `/api/public/forms/${formRouteId}` : `/api/forms/${formRouteId}`;
-        const [formData, entryData] = await Promise.all([
-          requestJson(formApiBase),
-          requestJson(`${formApiBase}/entries`)
-        ]);
-        const found = (entryData.entries || []).find((item) => String(item.id || "") === String(entryId));
+        const formData = await requestJson(formApiBase);
+        let found;
+        if (checkpointIdentifier) {
+          const checkpointData = await requestJson(`${formApiBase}/checkpoints/${encodeURIComponent(checkpointIdentifier)}?userId=${encodeURIComponent(checkpointUserId)}`);
+          const checkpoint = checkpointData.checkpoint;
+          found = checkpoint ? {
+            ...checkpoint,
+            id: checkpoint.id || checkpoint.primaryIdentifierValue,
+            submittedAt: checkpoint.savedAt,
+            submittedByName: checkpoint.savedBy,
+            isIncompleteCheckpoint: true
+          } : null;
+        } else {
+          const entryData = await requestJson(`${formApiBase}/entries`);
+          found = (entryData.entries || []).find((item) => String(item.id || "") === String(entryId));
+        }
         if (!found) throw new Error("Entry not found.");
         const draft = normalizeFormDraft(formData.draft);
         if (formData.hasXml) {
@@ -14000,13 +15186,27 @@ function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
           setForm(draft);
         }
         setEntry(found);
-        setStatus({ kind: "ok", message: accessCode ? "Read-only public entry view" : formData.hasXml ? "Read-only XML entry view" : "Read-only entry view" });
+        const justSubmitted = new URLSearchParams(window.location.search).get("submitted") === "1";
+        const justMovedToIncomplete = new URLSearchParams(window.location.search).get("moved") === "1";
+        setStatus({ kind: "ok", message: justSubmitted ? "Incomplete response submitted successfully." : justMovedToIncomplete ? "Response moved to incomplete entries." : checkpointIdentifier ? "Read-only incomplete entry view" : accessCode ? "Read-only public entry view" : "Read-only entry view" });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
     }
     loadEntry();
-  }, [accessCode, workspaceId, entryId]);
+  }, [accessCode, workspaceId, entryId, checkpointIdentifier, checkpointUserId]);
+
+  function editViewedResponse() {
+    if (!workspaceId) return;
+    const params = new URLSearchParams();
+    if (checkpointIdentifier) {
+      params.set("checkpoint", checkpointIdentifier);
+      params.set("userId", checkpointUserId);
+    } else {
+      params.set("entryId", entryId);
+    }
+    window.location.href = `/fill/${encodeURIComponent(workspaceRouteId(workspaceId))}?${params.toString()}`;
+  }
 
   if (!form || !entry) {
     return (
@@ -14021,14 +15221,18 @@ function EntryViewer({ workspaceId = "", accessCode = "", entryId }) {
       <header className="fill-header">
         <div>
           <h1>{form.title}</h1>
-          <p>{entry.instanceName || entry.displayName || entry.id} · {new Date(entry.submittedAt).toLocaleString()}</p>
+          <p>{entry.isIncompleteCheckpoint ? "Incomplete entry" : entry.instanceName || entry.displayName || entry.id} · {new Date(entry.submittedAt).toLocaleString()}</p>
         </div>
-        <div className={`status-line ${status.kind}`}>
-          {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
-          <span>{status.message}</span>
+        <div className="fill-header-actions">
+          {workspaceId ? <button className="primary small" type="button" onClick={editViewedResponse}><TextCursorInput size={14} /> Edit</button> : null}
+          <div className={`status-line ${status.kind}`}>
+            {status.kind === "ok" ? <Check size={16} /> : <AlertCircle size={16} />}
+            <span>{status.message}</span>
+          </div>
         </div>
       </header>
       <main className="fill-card entry-view-card">
+        {entry.adminEditedAt ? <p className="muted admin-edit-audit">Edited by {entry.adminEditedByName || entry.adminEditedByUsername || "admin"}{entry.adminEditedByUsername && entry.adminEditedByName && entry.adminEditedByUsername !== entry.adminEditedByName ? ` (@${entry.adminEditedByUsername})` : ""} · {new Date(entry.adminEditedAt).toLocaleString()}</p> : null}
         {questionsToShow.map((question) => (
           <PreviewField
             key={question.id}

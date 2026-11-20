@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -36,6 +37,9 @@ const keycloakUrl = String(process.env.KEYCLOAK_URL || "http://localhost:8080").
 const keycloakPublicUrl = String(process.env.KEYCLOAK_PUBLIC_URL || keycloakUrl).replace(/\/+$/, "");
 const keycloakRealm = process.env.KEYCLOAK_REALM || "icph";
 const keycloakClientId = process.env.KEYCLOAK_CLIENT_ID || "icph-form-builder";
+const keycloakDirectoryClientId = process.env.KEYCLOAK_DIRECTORY_CLIENT_ID || "icph-user-directory";
+const keycloakDirectoryClientSecret = process.env.KEYCLOAK_DIRECTORY_CLIENT_SECRET || "";
+const legacyOwnerUsername = process.env.ICPH_LEGACY_OWNER_USERNAME || "admin";
 const keycloakIssuer = `${keycloakPublicUrl}/realms/${keycloakRealm}`;
 // Days a signed-in user may keep working offline before the app needs Keycloak
 // to confirm the login again. Keep it below the realm's Offline Session Idle.
@@ -44,6 +48,9 @@ const keycloakKeys = createRemoteJWKSet(new URL(`${keycloakUrl}/realms/${keycloa
 const ADMIN_ROLE = "icph-admin";
 const FIELD_AGENT_ROLE = "icph-field-agent";
 const activeSubmissionRequests = new Map();
+const requestContext = new AsyncLocalStorage();
+const legacyOwnershipClaimed = new Set();
+let directoryToken = null;
 // Running terminology extractions by workspace: the child process and the scratch file it reports progress in.
 const terminologyRuns = new Map();
 const accessCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -101,7 +108,8 @@ async function requestBody(req) {
     chunks.push(chunk);
   }
   const text = Buffer.concat(chunks).toString("utf8");
-  return text ? JSON.parse(text) : {};
+  req.parsedBody = text ? JSON.parse(text) : {};
+  return req.parsedBody;
 }
 
 function slugify(value) {
@@ -174,13 +182,101 @@ async function requireRole(req, ...roles) {
     throw error;
   }
   req.user = user;
+  const context = requestContext.getStore();
+  if (context) context.user = user;
   if (!roles.some((role) => user.roles.includes(role))) {
     console.warn(`[auth] ${req.method} ${req.url}: user "${user.username}" has roles [${user.roles.join(", ")}], needs one of [${roles.join(", ")}]`);
     const error = new Error("Your account does not have access to this.");
     error.statusCode = 403;
     throw error;
   }
+  if (user.roles.includes(ADMIN_ROLE) && user.username === legacyOwnerUsername && !legacyOwnershipClaimed.has(user.id)) {
+    await store.claimLegacyOwnership(user.id);
+    legacyOwnershipClaimed.add(user.id);
+  }
   return user;
+}
+
+function currentRequestUser() {
+  return requestContext.getStore()?.user || null;
+}
+
+async function recordActivity(userId, eventType, title, message, options = {}) {
+  return store.addNotification({
+    id: `${timestampId()}_${randomBytes(5).toString("hex")}`,
+    userId,
+    eventType,
+    title,
+    message,
+    details: options.details || {},
+    subjectId: options.subjectId || "",
+    batchId: options.batchId || "",
+    dedupeKey: options.dedupeKey || ""
+  });
+}
+
+async function notifyWorkspaceAdmins(workspaceId, eventType, title, message, options = {}) {
+  const recipients = await store.workspaceAdminIds(workspaceId);
+  await Promise.all(recipients.map((userId) => recordActivity(userId, eventType, title, message, {
+    ...options,
+    dedupeKey: options.dedupeKey ? `${userId}:${options.dedupeKey}` : ""
+  })));
+}
+
+async function notifyFolderAdmins(folderId, eventType, title, message, options = {}) {
+  const recipients = await store.folderAdminIds(folderId);
+  await Promise.all(recipients.map((userId) => recordActivity(userId, eventType, title, message, {
+    ...options,
+    dedupeKey: options.dedupeKey ? `${userId}:${options.dedupeKey}` : ""
+  })));
+}
+
+async function keycloakDirectoryAccessToken() {
+  if (directoryToken && directoryToken.expiresAt > Date.now() + 30_000) return directoryToken.value;
+  if (!keycloakDirectoryClientSecret) throw new Error("Keycloak user directory is not configured.");
+  const response = await fetch(`${keycloakUrl}/realms/${encodeURIComponent(keycloakRealm)}/protocol/openid-connect/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: keycloakDirectoryClientId,
+      client_secret: keycloakDirectoryClientSecret
+    })
+  });
+  if (!response.ok) throw new Error(`Keycloak user directory token failed (${response.status}).`);
+  const payload = await response.json();
+  directoryToken = { value: payload.access_token, expiresAt: Date.now() + Number(payload.expires_in || 60) * 1000 };
+  return directoryToken.value;
+}
+
+async function searchKeycloakUsers(search, { exact = false, limit = 10 } = {}) {
+  const queryText = String(search || "").trim();
+  if (!queryText || (!exact && queryText.length < 2)) return [];
+  const url = new URL(`${keycloakUrl}/admin/realms/${encodeURIComponent(keycloakRealm)}/users`);
+  url.searchParams.set(exact ? "username" : "search", queryText);
+  url.searchParams.set("max", String(limit));
+  if (exact) url.searchParams.set("exact", "true");
+  const response = await fetch(url, { headers: { authorization: `Bearer ${await keycloakDirectoryAccessToken()}` } });
+  if (!response.ok) throw new Error(`Keycloak user search failed (${response.status}).`);
+  const users = await response.json();
+  const candidates = (Array.isArray(users) ? users : []).filter((user) => user.enabled !== false && user.username && user.id);
+  const appUsers = await Promise.all(candidates.map(async (user) => {
+    const roleResponse = await fetch(
+      `${keycloakUrl}/admin/realms/${encodeURIComponent(keycloakRealm)}/users/${encodeURIComponent(user.id)}/role-mappings/realm`,
+      { headers: { authorization: `Bearer ${await keycloakDirectoryAccessToken()}` } }
+    );
+    if (!roleResponse.ok) throw new Error(`Could not inspect roles for Keycloak user "${user.username}" (${roleResponse.status}).`);
+    const roles = await roleResponse.json();
+    const isAdmin = roles.some((role) => role.name === ADMIN_ROLE);
+    const isFieldAgent = roles.some((role) => role.name === FIELD_AGENT_ROLE);
+    if (!isAdmin && !isFieldAgent) return null;
+    return {
+      id: String(user.id),
+      username: String(user.username),
+      accessRole: isAdmin ? "admin" : "field-agent"
+    };
+  }));
+  return appUsers.filter(Boolean);
 }
 
 function cleanRespondentAccessCode(value) {
@@ -462,8 +558,10 @@ function draftAccessCode(draft) {
 
 async function saveDraft(workspaceId, draft) {
   try {
+    const folderId = String(draft?.folderId || "").trim();
+    if (folderId) await requireFolderAccess(folderId);
     await store.saveDraft(workspaceId, draft, {
-      folderId: String(draft?.folderId || "").trim() || null,
+      folderId: folderId || null,
       respondentAccessCode: draftAccessCode(draft)
     });
   } catch (error) {
@@ -483,12 +581,53 @@ function withFormLock(workspaceId, work) {
   });
 }
 
-async function requireWorkspace(workspaceId) {
+async function requireWorkspace(workspaceId, { allowDeleted = false } = {}) {
   const cleanId = cleanWorkspaceId(workspaceId);
   if (!(await store.formExists(cleanId))) {
     throw new Error(`Form workspace not found: ${cleanId}`);
   }
+  if (!allowDeleted && await store.formDeleted(cleanId)) {
+    const error = new Error("This form has been deleted and is available from your profile archive.");
+    error.statusCode = 410;
+    throw error;
+  }
+  const user = currentRequestUser();
+  if (user && !(await store.workspaceAccess(cleanId, user.id))) {
+    const error = new Error("You do not have access to this workspace.");
+    error.statusCode = 403;
+    throw error;
+  }
   return { cleanId };
+}
+
+async function requireFieldAgentWorkspace(workspaceId, { allowDeleted = false } = {}) {
+  const cleanId = cleanWorkspaceId(workspaceId);
+  const user = currentRequestUser();
+  if (!user) throw new Error("Login required.");
+  if (user.roles.includes(ADMIN_ROLE)) return requireWorkspace(cleanId, { allowDeleted });
+  if (user.roles.includes(FIELD_AGENT_ROLE) && await store.fieldAgentWorkspaceAccess(cleanId, user.id)) return { cleanId };
+  const error = new Error("You do not have field-agent access to this published form.");
+  error.statusCode = 403;
+  throw error;
+}
+
+async function requireFolderAccess(folderId, { ownerOnly = false } = {}) {
+  const cleanId = String(folderId || "").trim();
+  const user = currentRequestUser();
+  if (!cleanId) throw new Error("Project ID is required.");
+  if (!user) return cleanId;
+  const ownerId = await store.folderOwner(cleanId);
+  if (!ownerId) {
+    const error = new Error("Project not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (ownerOnly ? ownerId !== user.id : !(ownerId === user.id || await store.folderAccess(cleanId, user.id))) {
+    const error = new Error(ownerOnly ? "Only the project owner can manage sharing or delete this project." : "You do not have access to this project.");
+    error.statusCode = 403;
+    throw error;
+  }
+  return cleanId;
 }
 
 // Groups a MetaForm's chunks into the forms it describes, with their variables.
@@ -660,7 +799,7 @@ async function folderPrimaryDetails(folderId) {
   if (!cleanId) return null;
   const folders = await readFolders();
   const folder = folders.find((item) => item.id === cleanId);
-  if (!folder) throw new Error("Folder not found.");
+  if (!folder) throw new Error("Project not found.");
   const storedVariable = String(folder.primaryIdentifierVariable || "").trim();
   if (storedVariable) {
     const forms = await listForms();
@@ -741,13 +880,13 @@ async function exportFolderResponses(folderId) {
   const folders = await readFolders();
   const folder = folders.find((item) => item.id === cleanId);
   if (!folder) {
-    const error = new Error("Folder not found.");
+    const error = new Error("Project not found.");
     error.statusCode = 404;
     throw error;
   }
   const allForms = (await listForms()).forms || [];
   const selectedForms = publishedFolderForms(allForms, cleanId);
-  if (!selectedForms.length) throw new Error("This folder has no published and unlocked forms to export.");
+  if (!selectedForms.length) throw new Error("This project has no published and unlocked forms to export.");
   const registry = await readParticipantRegistry();
   const descriptors = [];
   for (const form of selectedForms) {
@@ -830,7 +969,7 @@ async function exportFolderResponses(folderId) {
     await writeFile(inputPath, JSON.stringify({ columns, rows: [...rows.values()] }), "utf8");
     const result = await runCommand(pythonBin, [folderResponseExporterPath, inputPath, outputPath]);
     if (result.code !== 0 || !existsSync(outputPath)) {
-      throw new Error(result.stderr.trim() || "Could not create the folder response workbook.");
+      throw new Error(result.stderr.trim() || "Could not create the project response workbook.");
     }
     return {
       fileName: `${slugify(folder.name)}_responses.xlsx`,
@@ -847,18 +986,18 @@ async function claimFolderPrimaryIdentifier(folderId, variable) {
   if (!cleanId || !cleanVariable) return;
   const folders = await readFolders();
   const index = folders.findIndex((item) => item.id === cleanId);
-  if (index < 0) throw new Error("Folder not found.");
+  if (index < 0) throw new Error("Project not found.");
   const folder = folders[index];
   if (folder.participantIdentifierMode === "barcode") {
     const barcodeVariable = String(folder.participantIdentifierVariable || DEFAULT_FOLDER_BARCODE_VARIABLE).trim();
     if (cleanVariable !== barcodeVariable) {
-      throw new Error(`Forms in this folder must use the shared barcode identifier variable "${barcodeVariable}".`);
+      throw new Error(`Forms in this project must use the shared barcode identifier variable "${barcodeVariable}".`);
     }
     return;
   }
   const existing = String(folder.primaryIdentifierVariable || "").trim();
   if (existing && existing !== cleanVariable) {
-    throw new Error(`Forms in this folder must use the shared primary identifier variable "${existing}".`);
+    throw new Error(`Forms in this project must use the shared primary identifier variable "${existing}".`);
   }
   if (!existing) await store.updateFolderIdentifiers(cleanId, { primaryIdentifierVariable: cleanVariable });
 }
@@ -913,9 +1052,9 @@ async function enableFolderBarcodeParticipantMode(folderId, requestedVariable = 
   if (!/^[a-z_][a-z0-9_]*$/.test(cleanVariable)) throw new Error("Barcode question variable must start with a letter or underscore and contain only letters, numbers, or underscores.");
   const folders = await readFolders();
   const index = folders.findIndex((item) => item.id === cleanId);
-  if (index < 0) throw new Error("Folder not found.");
+  if (index < 0) throw new Error("Project not found.");
   const existingVariable = String(folders[index].participantIdentifierVariable || "").trim();
-  if (existingVariable && existingVariable !== cleanVariable) throw new Error(`This folder already uses "${existingVariable}" as its barcode variable.`);
+  if (existingVariable && existingVariable !== cleanVariable) throw new Error(`This project already uses "${existingVariable}" as its barcode variable.`);
   await store.updateFolderIdentifiers(cleanId, {
     participantIdentifierMode: "barcode",
     participantIdentifierVariable: existingVariable || cleanVariable
@@ -966,6 +1105,7 @@ async function createForm(payload) {
   const metaFormLink = normalizeMetaFormLink(payload);
   const linkedPrimary = metaFormLink ? await existingMetaFormPrimary(metaFormLink.fileName) : null;
   const folderId = String(payload.folderId || "").trim() || null;
+  if (folderId) await requireFolderAccess(folderId);
   const folderPrimary = folderId ? await folderPrimaryDetails(folderId) : null;
   const folderRecord = folderId ? (await readFolders()).find((item) => item.id === folderId) : null;
   if (metaFormLink) {
@@ -976,7 +1116,7 @@ async function createForm(payload) {
   }
   const requestedPrimaryIdentifier = String(payload.primaryIdentifierVariable || "").trim();
   if (folderPrimary?.variable && requestedPrimaryIdentifier && requestedPrimaryIdentifier !== folderPrimary.variable) {
-    throw new Error(`Forms in this folder must use the shared primary identifier variable "${folderPrimary.variable}".`);
+    throw new Error(`Forms in this project must use the shared primary identifier variable "${folderPrimary.variable}".`);
   }
   const primaryIdentifierVariable = String(linkedPrimary?.variable || requestedPrimaryIdentifier || folderPrimary?.variable || "").trim();
   const variableDetails = metaFormLink && primaryIdentifierVariable
@@ -1014,12 +1154,21 @@ async function createForm(payload) {
     createdAt: isoStamp(),
     updatedAt: isoStamp()
   };
-  await store.insertForm({ workspaceId, versionBaseId, versionNumber: 1, folderId, draft });
+  await store.insertForm({ workspaceId, versionBaseId, versionNumber: 1, folderId, ownerUserId: currentRequestUser()?.id || null, draft });
+  await notifyWorkspaceAdmins(workspaceId, "form_created", "Form created", `${title} was created${folderRecord ? ` in project ${folderRecord.name}` : ""}.`, {
+    subjectId: workspaceId,
+    details: { formTitle: title, folderId, folderName: folderRecord?.name || "" }
+  });
   return { workspaceId, draft };
 }
 
-function readFolders() {
-  return store.listFolders();
+async function readFolders() {
+  const folders = await store.listFolders();
+  const user = currentRequestUser();
+  if (!user) return folders;
+  return folders
+    .filter((folder) => folder.ownerUserId === user.id || folder.members?.some((member) => member.userId === user.id))
+    .map((folder) => ({ ...folder, isOwner: folder.ownerUserId === user.id }));
 }
 
 function readParticipantRegistry() {
@@ -1028,48 +1177,131 @@ function readParticipantRegistry() {
 
 async function createFolder(payload) {
   const name = String(payload.name || "").trim();
-  if (!name) throw new Error("Folder name is required.");
+  if (!name) throw new Error("Project name is required.");
+  const user = currentRequestUser();
+  if (!user) throw new Error("Login required.");
   const folders = await readFolders();
-  if (folders.some((folder) => folder.name.toLowerCase() === name.toLowerCase())) {
-    throw new Error("A folder with that name already exists.");
+  if (folders.some((folder) => folder.ownerUserId === user.id && folder.name.toLowerCase() === name.toLowerCase())) {
+    throw new Error("A project with that name already exists.");
   }
-  const folder = await store.insertFolder(`${timestampId()}_${slugify(name)}`, name);
+  let folder;
+  try {
+    folder = { ...(await store.insertFolder(`${timestampId()}_${slugify(name)}`, name, user.id)), members: [], isOwner: true };
+  } catch (error) {
+    if (error.code === "23505" && error.table === "folders") throw new Error("A project with that name already exists.");
+    throw error;
+  }
+  await notifyFolderAdmins(folder.id, "folder_created", "Project created", `Project ${folder.name} was created.`, {
+    subjectId: folder.id,
+    details: { folderName: folder.name, folderId: folder.id }
+  });
   return { ok: true, folder, folders: [...folders, folder] };
 }
 
 async function deleteFolder(folderId) {
-  const cleanId = String(folderId || "").trim();
-  if (!cleanId) throw new Error("Folder id is required.");
+  const cleanId = await requireFolderAccess(folderId, { ownerOnly: true });
+  if (!cleanId) throw new Error("Project ID is required.");
   const folders = await readFolders();
   const folder = folders.find((item) => item.id === cleanId);
-  if (!folder) throw new Error("Folder not found.");
+  if (!folder) throw new Error("Project not found.");
 
   const forms = await listForms();
   const deletedWorkspaceIds = forms.forms
     .filter((item) => item.folderId === cleanId)
     .map((item) => item.workspaceId);
+  const deletingUser = currentRequestUser();
+  await notifyFolderAdmins(cleanId, "folder_deleted", "Project deleted", `Project ${folder.name} was deleted. Its forms were archived in the admin profile.`, {
+    subjectId: cleanId,
+    details: { folderName: folder.name, folderId: cleanId, workspaceIds: deletedWorkspaceIds }
+  });
+  for (const member of (folder.members || []).filter((item) => item.accessRole === "field-agent")) {
+    await recordActivity(member.userId, "access_removed", "Project access removed", `Access to project ${folder.name} was removed. Saved offline copies of its forms can still sync their existing work.`, {
+      subjectId: cleanId,
+      details: { folderId: cleanId, folderName: folder.name, workspaceIds: deletedWorkspaceIds }
+    });
+  }
+  for (const workspaceId of deletedWorkspaceIds) {
+    for (const member of (folder.members || []).filter((item) => item.accessRole === "field-agent")) {
+      await store.addFormFieldAgent(workspaceId, {
+        userId: member.userId,
+        username: member.username,
+        addedBy: deletingUser?.id || folder.ownerUserId
+      });
+    }
+  }
   for (const workspaceId of deletedWorkspaceIds) await deleteForm(workspaceId);
 
   await store.deleteFolder(cleanId);
   return { ok: true, deletedFolder: folder, deletedWorkspaceIds, folders: await readFolders() };
 }
 
-async function loadDraft(workspaceId) {
-  const { cleanId } = await requireWorkspace(workspaceId);
+async function loadDraft(workspaceId, { allowDeleted = false, allowFieldAgent = false } = {}) {
+  const { cleanId } = allowFieldAgent
+    ? await requireFieldAgentWorkspace(workspaceId, { allowDeleted })
+    : await requireWorkspace(workspaceId, { allowDeleted });
   const meta = await workspaceMeta(cleanId);
   const draft = { ...(await store.getDraft(cleanId)), terminologyUseLlm: false };
   return { workspaceId: cleanId, draft, ...meta };
 }
 
-async function findWorkspaceByRespondentCode(value) {
+async function findWorkspaceByRespondentCode(value, { allowDeleted = false } = {}) {
   const code = cleanRespondentAccessCode(value);
-  const found = await store.findOpenFormByAccessCode(code);
+  const found = await store.findFormByRespondentCode(code, { includeDeleted: allowDeleted });
   if (!found) {
+    const permanentlyDeleted = await store.findPermanentlyDeletedFormByAccessCode(code);
+    if (permanentlyDeleted) {
+      const error = new Error(`Form ${code} was permanently deleted. Its queued offline data can no longer be synced.`);
+      error.statusCode = 410;
+      error.details = {
+        code,
+        formTitle: permanentlyDeleted.formTitle,
+        formWorkspaceId: permanentlyDeleted.workspaceId,
+        permanentlyDeletedAt: permanentlyDeleted.deletedAt
+      };
+      throw error;
+    }
     const error = new Error("No published form matches that respondent code.");
     error.statusCode = 404;
     throw error;
   }
-  return { code, workspaceId: found.workspace_id, draft: found.draft };
+  await requireFieldAgentWorkspace(found.workspace_id, { allowDeleted });
+  return { code, workspaceId: found.workspace_id, draft: found.draft, deletedAt: found.deleted_at || null };
+}
+
+async function requireRespondentFormGeneration(found, payload = {}) {
+  const requestedWorkspaceId = String(payload.sourceWorkspaceId || "").trim();
+  const deletedGeneration = requestedWorkspaceId
+    ? await store.findPermanentlyDeletedFormGeneration(found.code, requestedWorkspaceId)
+    : null;
+  if (deletedGeneration) {
+    const error = new Error(`Form ${found.code} was permanently deleted. Its queued offline data can no longer be synced.`);
+    error.statusCode = 410;
+    error.details = {
+      code: found.code,
+      formTitle: deletedGeneration.formTitle,
+      formWorkspaceId: deletedGeneration.workspaceId,
+      permanentlyDeletedAt: deletedGeneration.deletedAt
+    };
+    throw error;
+  }
+  if (requestedWorkspaceId && requestedWorkspaceId !== found.workspaceId) {
+    const error = new Error(`This offline data belongs to an older version of form ${found.code} and cannot be sent to the current version.`);
+    error.statusCode = 409;
+    throw error;
+  }
+  if (!requestedWorkspaceId) {
+    const priorDeletion = await store.findPermanentlyDeletedFormByAccessCode(found.code);
+    if (!priorDeletion) return;
+    const error = new Error(`Offline data for form code ${found.code} has no version identifier, and that code has been reused. It cannot be safely synced; export it before deleting it from this device.`);
+    error.statusCode = 410;
+    error.details = {
+      code: found.code,
+      formTitle: priorDeletion.formTitle,
+      formWorkspaceId: priorDeletion.workspaceId,
+      permanentlyDeletedAt: priorDeletion.deletedAt
+    };
+    throw error;
+  }
 }
 
 async function generateUniqueRespondentAccessCode(workspaceId) {
@@ -1115,11 +1347,12 @@ async function loadPublicForm(value) {
 async function listPublicForms() {
   const all = await listForms();
   const forms = [];
+  const userId = fieldAgentDataOwnerId();
   for (const item of all.forms || []) {
     if (!item.hasXml || !item.respondentAccessCode || item.collectionLocked) continue;
-    const draft = (await loadDraft(item.workspaceId)).draft;
-    const entries = await readEntries(item.workspaceId);
-    const checkpoints = await readRespondentCheckpoints(item.workspaceId);
+    const draft = await store.getDraft(item.workspaceId);
+    const entries = await readEntries(item.workspaceId, userId);
+    const checkpoints = await readRespondentCheckpoints(item.workspaceId, userId);
     forms.push({
       workspaceId: item.workspaceId,
       title: item.title,
@@ -1133,7 +1366,11 @@ async function listPublicForms() {
         id: checkpoint.id,
         primaryIdentifierVariable: checkpoint.primaryIdentifierVariable,
         primaryIdentifierValue: checkpoint.primaryIdentifierValue,
-        savedAt: checkpoint.savedAt
+        savedAt: checkpoint.savedAt,
+        userId: checkpoint.userId,
+        savedBy: checkpoint.savedBy,
+        reviewRequestedAt: checkpoint.reviewRequestedAt,
+        reviewRequestedBy: checkpoint.reviewRequestedBy
       })),
       updatedAt: item.updatedAt,
       publishedAt: item.publishedAt,
@@ -1149,38 +1386,83 @@ async function listPublicForms() {
   return { ok: true, forms };
 }
 
-async function loadPublicFormEntries(value) {
+async function loadPublicFormEntries(value, user) {
   const found = await findWorkspaceByRespondentCode(value);
   return {
     ok: true,
     accessCode: found.code,
     workspaceId: found.workspaceId,
     title: found.draft?.title || found.workspaceId,
-    entries: await readEntries(found.workspaceId)
+    entries: await readEntries(found.workspaceId, fieldAgentDataOwnerId(user))
   };
 }
 
 async function loadPublicFormXml(value) {
   const found = await findWorkspaceByRespondentCode(value);
-  const data = await loadFormXml(found.workspaceId);
+  const data = await loadFormXml(found.workspaceId, { allowFieldAgent: true });
   return { ok: true, accessCode: found.code, xml: data.xml };
 }
 
 async function loadPublicAttachment(value, fileName) {
   const found = await findWorkspaceByRespondentCode(value);
-  return loadAttachment(found.workspaceId, fileName);
+  return loadAttachment(found.workspaceId, fileName, { allowFieldAgent: true });
 }
 
 async function loadPublicAttachmentList(value) {
   const found = await findWorkspaceByRespondentCode(value);
-  const data = await listAttachments(found.workspaceId);
+  const data = await listAttachments(found.workspaceId, { allowFieldAgent: true });
   return { ok: true, accessCode: found.code, attachments: data.attachments };
 }
 
 async function submitPublicEntry(value, payload, user) {
-  const found = await findWorkspaceByRespondentCode(value);
-  const data = await submitEntry(found.workspaceId, payload, user);
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  await requireRespondentFormGeneration(found, payload);
+  const identifierName = participantIdentifierForDraft(found.draft);
+  const identifierValue = String(payload.answers?.[identifierName] || "").trim();
+  const savedCheckpoint = identifierValue
+    ? await store.getRespondentCheckpoint(found.workspaceId, checkpointIdentifierKey(identifierValue), user?.id || "")
+    : null;
+  const data = await submitEntry(found.workspaceId, payload, user, { allowDeleted: true, allowFieldAgent: true });
+  if (!data.duplicateRetry) await recordSubmittedEntryActivity(found, payload, user, data.entry, Boolean(savedCheckpoint));
   return { ok: true, accessCode: found.code, entry: data.entry };
+}
+
+async function recordSubmittedEntryActivity(found, payload, user, entry, checkpointWasSubmitted = false) {
+  const formTitle = String(found.draft?.title || found.workspaceId);
+  const identifierName = participantIdentifierForDraft(found.draft);
+  const identifierValue = String(entry?.answers?.[identifierName] || "").trim();
+  const clientId = String(payload.clientSubmissionId || "");
+  const batchId = String(payload.clientSyncBatchId || "");
+  const details = { formTitle, accessCode: found.code, entryId: entry?.id || "", primaryIdentifierValue: identifierValue };
+  const suffix = batchId ? `synced for ${formTitle}` : `submitted for ${formTitle}`;
+  await notifyWorkspaceAdmins(
+    found.workspaceId,
+    found.deletedAt ? "entry_submitted_archived_form" : "entry_submitted",
+    found.deletedAt ? "Entry synced to deleted form" : batchId ? "Entries synced" : "New entry",
+    found.deletedAt
+      ? `New entry ${suffix} in a form that is in the deleted forms archive.`
+      : `New entry ${suffix}.`,
+    { subjectId: found.workspaceId, batchId, dedupeKey: clientId ? `entry:${clientId}` : "", details }
+  );
+  if (user?.roles?.includes(FIELD_AGENT_ROLE)) {
+    await recordActivity(user.id, "sync_succeeded", "Entry synced", `Entry ${identifierValue ? `${identifierValue} ` : ""}for ${formTitle} synced successfully.`, {
+      subjectId: found.workspaceId,
+      batchId,
+      dedupeKey: clientId ? `sync-success:${user.id}:${clientId}` : "",
+      details
+    });
+  }
+  if (checkpointWasSubmitted) {
+    await notifyWorkspaceAdmins(
+      found.workspaceId,
+      "checkpoint_submitted",
+      found.deletedAt ? "Checkpoint submitted to deleted form" : "Saved checkpoint submitted",
+      found.deletedAt
+        ? `Checkpoint ${identifierValue} was submitted in ${formTitle}, which is in the deleted forms archive.`
+        : `The saved checkpoint for ${identifierValue} was submitted in ${formTitle}.`,
+      { subjectId: found.workspaceId, batchId, dedupeKey: clientId ? `checkpoint-submitted:${clientId}` : "", details }
+    );
+  }
 }
 
 async function deletePublicEntries(value, payload) {
@@ -1189,26 +1471,110 @@ async function deletePublicEntries(value, payload) {
   return { ok: true, accessCode: found.code, ...data };
 }
 
-async function loadPublicCheckpoint(value, payload) {
+async function markPublicEntriesForReview(value, payload, user) {
   const found = await findWorkspaceByRespondentCode(value);
-  const data = await loadRespondentCheckpoint(found.workspaceId, payload);
+  await requireRespondentFormGeneration(found, payload);
+  const ids = [...new Set((Array.isArray(payload?.entryIds) ? payload.entryIds : [payload?.entryId])
+    .map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!ids.length) throw new Error("Choose at least one entry to mark for review.");
+  const ownerId = fieldAgentDataOwnerId(user);
+  const updatedCount = await store.markEntriesForReview(found.workspaceId, ids, user.username, ownerId);
+  if (!updatedCount) {
+    const error = new Error("No matching entries were found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const batchId = String(payload.clientSyncBatchId || "");
+  await notifyWorkspaceAdmins(found.workspaceId, "entry_review_requested", "Entries marked for review", `${ids.length} entr${ids.length === 1 ? "y was" : "ies were"} marked for admin review in ${found.draft?.title || found.workspaceId}.`, {
+    subjectId: found.workspaceId,
+    batchId,
+    dedupeKey: String(payload.clientSubmissionId || "") ? `entry-review:${payload.clientSubmissionId}` : "",
+    details: { formTitle: found.draft?.title || found.workspaceId, accessCode: found.code, entryIds: ids }
+  });
+  if (user?.roles?.includes(FIELD_AGENT_ROLE) && payload.clientSubmissionId) {
+    await recordActivity(user.id, "sync_succeeded", "Review request synced", `${ids.length} submitted entr${ids.length === 1 ? "y" : "ies"} marked for review.`, {
+      subjectId: found.workspaceId,
+      batchId,
+      dedupeKey: `sync-success:${user.id}:${payload.clientSubmissionId}`,
+      details: { formTitle: found.draft?.title || found.workspaceId, accessCode: found.code, entryIds: ids }
+    });
+  }
+  return { ok: true, accessCode: found.code, entries: await readEntries(found.workspaceId, ownerId) };
+}
+
+async function loadPublicCheckpoint(value, payload, user) {
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  const data = await loadRespondentCheckpoint(found.workspaceId, payload, { allowDeleted: true, allowFieldAgent: true, userId: user.id });
   return { ok: true, accessCode: found.code, ...data };
 }
 
-async function savePublicCheckpoint(value, payload) {
-  const found = await findWorkspaceByRespondentCode(value);
-  const data = await saveRespondentCheckpoint(found.workspaceId, payload);
+async function savePublicCheckpoint(value, payload, user) {
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  await requireRespondentFormGeneration(found, payload);
+  const data = await saveRespondentCheckpoint(found.workspaceId, payload, { allowDeleted: true, allowFieldAgent: true, userId: user.id });
+  const title = found.draft?.title || found.workspaceId;
+  const batchId = String(payload.clientSyncBatchId || "");
+  const clientId = String(payload.clientSubmissionId || "");
+  const details = { formTitle: title, accessCode: found.code, primaryIdentifierValue: data.primaryIdentifierValue };
+  await notifyWorkspaceAdmins(found.workspaceId, found.deletedAt ? "checkpoint_saved_archived_form" : "checkpoint_saved", found.deletedAt ? "Checkpoint saved to deleted form" : batchId ? "Checkpoints synced" : "Checkpoint saved", found.deletedAt
+    ? `A partial response for ${data.primaryIdentifierValue} was saved in ${title}, which is in the deleted forms archive.`
+    : `A partial response for ${data.primaryIdentifierValue} was saved in ${title}.`, {
+    subjectId: found.workspaceId, batchId, dedupeKey: clientId ? `checkpoint:${clientId}` : "", details
+  });
+  if (user?.roles?.includes(FIELD_AGENT_ROLE) && clientId) {
+    await recordActivity(user.id, "sync_succeeded", "Checkpoint synced", `Partial response ${data.primaryIdentifierValue} for ${title} synced successfully.`, {
+      subjectId: found.workspaceId, batchId, dedupeKey: `sync-success:${user.id}:${clientId}`, details
+    });
+  }
   return { ok: true, accessCode: found.code, ...data };
+}
+
+async function markPublicCheckpointForReview(value, payload, user) {
+  if (!user.roles.includes(FIELD_AGENT_ROLE) || user.roles.includes(ADMIN_ROLE)) {
+    const error = new Error("Only field agents can request checkpoint review.");
+    error.statusCode = 403;
+    throw error;
+  }
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  await requireRespondentFormGeneration(found, payload);
+  const result = await markRespondentCheckpointForReview(found.workspaceId, payload.primaryIdentifierValue, user);
+  const title = found.draft?.title || found.workspaceId;
+  const details = { formTitle: title, accessCode: found.code, primaryIdentifierValue: result.primaryIdentifierValue };
+  await notifyWorkspaceAdmins(found.workspaceId, found.deletedAt ? "checkpoint_review_archived_form" : "checkpoint_review_requested", found.deletedAt ? "Deleted-form checkpoint marked for review" : "Checkpoint marked for review", `Partial response ${result.primaryIdentifierValue} was marked for review in ${title}${found.deletedAt ? ", which is in the deleted forms archive" : ""}.`, {
+    subjectId: found.workspaceId,
+    batchId: String(payload.clientSyncBatchId || ""),
+    dedupeKey: payload.clientSubmissionId ? `checkpoint-review:${payload.clientSubmissionId}` : "",
+    details
+  });
+  if (payload.clientSubmissionId) await recordActivity(user.id, "sync_succeeded", "Review request synced", `Partial response ${result.primaryIdentifierValue} marked for admin review.`, {
+    subjectId: found.workspaceId,
+    batchId: String(payload.clientSyncBatchId || ""),
+    dedupeKey: `sync-success:${user.id}:${payload.clientSubmissionId}`,
+    details
+  });
+  return { accessCode: found.code, ...result };
 }
 
 async function submitPublicOdkEntry(value, payload, user) {
-  const found = await findWorkspaceByRespondentCode(value);
-  const data = await submitOdkEntry(found.workspaceId, payload, user);
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  await requireRespondentFormGeneration(found, payload);
+  const odkAnswers = extractSimpleAnswersFromXml(payload.instanceXml);
+  const identifierName = participantIdentifierForDraft(found.draft);
+  const identifierValue = String(odkAnswers[identifierName] || "").trim();
+  const savedCheckpoint = identifierValue
+    ? await store.getRespondentCheckpoint(found.workspaceId, checkpointIdentifierKey(identifierValue), user?.id || "")
+    : null;
+  const data = await submitOdkEntry(found.workspaceId, payload, user, { allowDeleted: true, allowFieldAgent: true });
+  if (!data.duplicateRetry) {
+    await recordSubmittedEntryActivity(found, payload, user, { ...data.entry, answers: data.entry.answers || odkAnswers }, Boolean(savedCheckpoint));
+  }
   return { ok: true, accessCode: found.code, entry: data.entry };
 }
 
-async function loadFormXml(workspaceId) {
-  const { cleanId } = await requireWorkspace(workspaceId);
+async function loadFormXml(workspaceId, { allowFieldAgent = false } = {}) {
+  const { cleanId } = allowFieldAgent
+    ? await requireFieldAgentWorkspace(workspaceId)
+    : await requireWorkspace(workspaceId);
   const xml = await store.getFormXml(cleanId);
   if (!xml) throw new Error("Published XML not found for this form.");
   return { ok: true, workspaceId: cleanId, xml };
@@ -1221,8 +1587,10 @@ async function loadFormXlsx(workspaceId) {
   return { ok: true, workspaceId: cleanId, fileName: workbook.fileName, data: workbook.data };
 }
 
-async function listAttachments(workspaceId) {
-  const { cleanId } = await requireWorkspace(workspaceId);
+async function listAttachments(workspaceId, { allowFieldAgent = false } = {}) {
+  const { cleanId } = allowFieldAgent
+    ? await requireFieldAgentWorkspace(workspaceId)
+    : await requireWorkspace(workspaceId);
   const attachments = (await store.listFormAttachments(cleanId))
     .sort((a, b) => a.fileName.localeCompare(b.fileName))
     .map((attachment) => ({
@@ -1248,8 +1616,10 @@ async function deleteAttachment(workspaceId, fileName) {
   return { ok: true, workspaceId: cleanId, deleted: cleanName, ...(await listAttachments(cleanId)), ...(await workspaceMeta(cleanId)) };
 }
 
-async function loadAttachment(workspaceId, fileName) {
-  const { cleanId } = await requireWorkspace(workspaceId);
+async function loadAttachment(workspaceId, fileName, { allowFieldAgent = false } = {}) {
+  const { cleanId } = allowFieldAgent
+    ? await requireFieldAgentWorkspace(workspaceId)
+    : await requireWorkspace(workspaceId);
   const cleanName = cleanAttachmentName(fileName);
   const data = await store.getFormAttachment(cleanId, cleanName);
   if (!data) throw new Error(`Attachment not found: ${cleanName}`);
@@ -1816,6 +2186,7 @@ async function createFormVersion(workspaceId) {
       versionBaseId,
       versionNumber: nextVersionNumber,
       folderId: String(nextDraft.folderId || "").trim() || null,
+      ownerUserId: currentRequestUser()?.id || null,
       draft: nextDraft
     });
     await store.copyFormAttachments(sourceId, nextWorkspaceId);
@@ -1901,10 +2272,10 @@ async function exportForm(payload) {
   const isBarcodeAssignmentSource = participantRegistry.some((item) => item.workspaceId === workspaceId);
   const folderBarcodeModeForForm = folder?.participantIdentifierMode === "barcode" && !isBarcodeAssignmentSource;
   if (folderPrimary?.variable && draft.primaryIdentifierVariable && draft.primaryIdentifierVariable !== folderPrimary.variable && !folderBarcodeModeForForm) {
-    throw new Error(`Forms in this folder must use the shared primary identifier variable "${folderPrimary.variable}".`);
+    throw new Error(`Forms in this project must use the shared primary identifier variable "${folderPrimary.variable}".`);
   }
   if (firstPublish && folderId && !folderPrimary?.variable && !draft.primaryIdentifierAcknowledged) {
-    throw new Error("Acknowledge that this primary identifier is common to every form created in this folder.");
+    throw new Error("Acknowledge that this primary identifier is common to every form created in this project.");
   }
   if (!existingMeta.hasXml && draft.previousVersionWorkspaceId && !formHasVersionChanges(draft)) {
     throw new Error("Edit at least one Build item before publishing a new version.");
@@ -1915,7 +2286,7 @@ async function exportForm(payload) {
   if (folderBarcodeModeForForm) {
     const barcodeQuestion = (draft.questions || []).find((item) => item?.type === "barcode" && String(item.name || "").trim());
     if (!barcodeQuestion) {
-      throw new Error("This folder now uses assigned participant barcodes. Add a Barcode question before publishing this form.");
+      throw new Error("This project now uses assigned participant barcodes. Add a Barcode question before publishing this form.");
     }
     draft.primaryIdentifierVariable = barcodeQuestion.name;
     draft.participantIdentifierVariable = barcodeQuestion.name;
@@ -2000,6 +2371,14 @@ async function exportForm(payload) {
   const terminology = xmlOk && (await store.getTerminology(workspaceId))
     ? await loadTerminology(workspaceId)
     : null;
+
+  if (xmlOk) {
+    const eventType = firstPublish ? "form_published" : "form_updated";
+    await notifyWorkspaceAdmins(workspaceId, eventType, firstPublish ? "Form published" : "Published form updated", `${draft.title || workspaceId} was ${firstPublish ? "published" : "updated"}.`, {
+      subjectId: workspaceId,
+      details: { formTitle: draft.title || workspaceId, respondentAccessCode }
+    });
+  }
 
   return {
     ok: xmlOk,
@@ -2172,7 +2551,7 @@ async function importXlsx(payload) {
     ? String(folderRecord.participantIdentifierVariable || DEFAULT_FOLDER_BARCODE_VARIABLE).trim()
     : "";
   if (folderPrimary?.variable && requestedPrimaryIdentifier && requestedPrimaryIdentifier !== folderPrimary.variable && !folderBarcodeVariable) {
-    throw new Error(`Forms in this folder must use the shared primary identifier variable "${folderPrimary.variable}".`);
+    throw new Error(`Forms in this project must use the shared primary identifier variable "${folderPrimary.variable}".`);
   }
   const primaryIdentifierVariable = String(folderBarcodeVariable || linkedPrimary?.variable || folderPrimary?.variable || requestedPrimaryIdentifier || "").trim();
   const deferredFolderPrimary = Boolean(
@@ -2222,7 +2601,8 @@ async function importXlsx(payload) {
 	    createdAt: isoStamp(),
 	    updatedAt: isoStamp()
 	  };
-  await store.insertForm({ workspaceId, versionBaseId, versionNumber: 1, folderId, draft: updatedDraft, xlsxName: originalName, xlsx });
+  if (folderId) await requireFolderAccess(folderId);
+  await store.insertForm({ workspaceId, versionBaseId, versionNumber: 1, folderId, ownerUserId: currentRequestUser()?.id || null, draft: updatedDraft, xlsxName: originalName, xlsx });
 
   return {
     ok: true,
@@ -2275,8 +2655,12 @@ function entryInstanceName(draft, answers, submittedAt) {
   return String(answers?.instanceName || "").trim();
 }
 
-function readEntries(workspaceId) {
-  return store.listEntries(cleanWorkspaceId(workspaceId));
+function fieldAgentDataOwnerId(user = currentRequestUser()) {
+  return user?.roles?.includes(FIELD_AGENT_ROLE) && !user.roles.includes(ADMIN_ROLE) ? user.id : null;
+}
+
+function readEntries(workspaceId, userId = null) {
+  return store.listEntries(cleanWorkspaceId(workspaceId), userId);
 }
 
 function cleanCheckpointIdentifier(value) {
@@ -2293,17 +2677,17 @@ function checkpointIdentifierKey(value) {
   return cleanCheckpointIdentifier(value).toLowerCase();
 }
 
-function readRespondentCheckpoints(workspaceId) {
-  return store.listRespondentCheckpoints(cleanWorkspaceId(workspaceId));
+function readRespondentCheckpoints(workspaceId, userId = null) {
+  return store.listRespondentCheckpoints(cleanWorkspaceId(workspaceId), userId);
 }
 
-async function loadRespondentCheckpoint(workspaceId, payload) {
-  const loaded = await loadDraft(workspaceId);
+async function loadRespondentCheckpoint(workspaceId, payload, { allowDeleted = false, allowFieldAgent = false, userId = '' } = {}) {
+  const loaded = await loadDraft(workspaceId, { allowDeleted, allowFieldAgent });
   const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
   if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
   const primaryIdentifierValue = cleanCheckpointIdentifier(payload.primaryIdentifierValue);
   const key = checkpointIdentifierKey(primaryIdentifierValue);
-  const checkpoint = await store.getRespondentCheckpoint(loaded.workspaceId, key);
+  const checkpoint = await store.getRespondentCheckpoint(loaded.workspaceId, key, userId);
   return {
     workspaceId,
     primaryIdentifierVariable,
@@ -2312,13 +2696,13 @@ async function loadRespondentCheckpoint(workspaceId, payload) {
   };
 }
 
-async function deleteRespondentCheckpoint(workspaceId, primaryIdentifierValue) {
+async function deleteRespondentCheckpoint(workspaceId, primaryIdentifierValue, userId = null) {
   if (!String(primaryIdentifierValue || "").trim()) return;
-  await store.deleteRespondentCheckpoint(cleanWorkspaceId(workspaceId), checkpointIdentifierKey(primaryIdentifierValue));
+  await store.deleteRespondentCheckpoint(cleanWorkspaceId(workspaceId), checkpointIdentifierKey(primaryIdentifierValue), userId);
 }
 
-async function saveRespondentCheckpoint(workspaceId, payload) {
-  const loaded = await loadDraft(workspaceId);
+async function saveRespondentCheckpoint(workspaceId, payload, { allowDeleted = false, allowFieldAgent = false, userId = '' } = {}) {
+  const loaded = await loadDraft(workspaceId, { allowDeleted, allowFieldAgent });
   const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
   if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
   const answers = payload.answers && typeof payload.answers === "object" ? payload.answers : {};
@@ -2327,10 +2711,12 @@ async function saveRespondentCheckpoint(workspaceId, payload) {
   );
   const now = isoStamp();
   const key = checkpointIdentifierKey(primaryIdentifierValue);
-  const previous = await store.getRespondentCheckpoint(loaded.workspaceId, key);
+  const previous = await store.getRespondentCheckpoint(loaded.workspaceId, key, userId);
   const checkpoint = {
+    ...previous,
     id: previous?.id || `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     workspaceId,
+    userId,
     primaryIdentifierVariable,
     primaryIdentifierValue,
     primaryIdentifierKey: key,
@@ -2342,6 +2728,109 @@ async function saveRespondentCheckpoint(workspaceId, payload) {
   };
   await store.putRespondentCheckpoint(loaded.workspaceId, key, checkpoint);
   return { workspaceId, primaryIdentifierVariable, primaryIdentifierValue, checkpoint };
+}
+
+async function adminEditAudit(user, previous, editedAt = isoStamp()) {
+  const profile = await store.getUserProfile(user.id);
+  const audit = {
+    userId: user.id,
+    username: String(user.username || profile?.username || ""),
+    name: String(profile?.displayName || user.username || ""),
+    editedAt
+  };
+  return {
+    adminEditedAt: editedAt,
+    adminEditedByUserId: audit.userId,
+    adminEditedByUsername: audit.username,
+    adminEditedByName: audit.name,
+    adminEditHistory: [...(previous?.adminEditHistory || []), audit]
+  };
+}
+
+async function submitAdminCheckpoint(workspaceId, primaryIdentifierValue, userId, answers, admin) {
+  return withFormLock(workspaceId, async () => {
+    const loaded = await loadDraft(workspaceId);
+    const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
+    if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
+    const identifier = cleanCheckpointIdentifier(primaryIdentifierValue);
+    const key = checkpointIdentifierKey(identifier);
+    const checkpoint = await store.getRespondentCheckpoint(loaded.workspaceId, key, userId);
+    if (!checkpoint) {
+      const error = new Error("Incomplete entry not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const submittedAt = isoStamp();
+    const ownerId = checkpoint.userId || userId || admin.id;
+    const ownerProfile = ownerId ? await store.getUserProfile(ownerId) : null;
+    const audit = await adminEditAudit(admin, checkpoint, submittedAt);
+    const entryAnswers = {
+      ...(checkpoint.answers || {}),
+      ...(answers || {}),
+      [primaryIdentifierVariable]: checkpoint.primaryIdentifierValue || identifier
+    };
+    const originalEntry = checkpoint.sourceEntryId
+      ? await store.getEntryIncludingIncomplete(loaded.workspaceId, checkpoint.sourceEntryId)
+      : null;
+    await assertEntryMutationAllowed(loaded.draft, await readEntries(loaded.workspaceId), entryAnswers, originalEntry?.id || "", admin);
+    let entry;
+    if (originalEntry) {
+      const { submissionStatus: _submissionStatus, ...prior } = originalEntry;
+      entry = {
+        ...prior,
+        ...audit,
+        id: originalEntry.id,
+        userId: originalEntry.userId || ownerId,
+        submittedByUserId: originalEntry.submittedByUserId || ownerId,
+        submittedByUsername: originalEntry.submittedByUsername || ownerProfile?.username || "",
+        submittedByName: originalEntry.submittedByName || ownerProfile?.displayName || ownerProfile?.username || checkpoint.savedBy || "",
+        submittedAt,
+        adminSubmittedAt: submittedAt,
+        adminSubmittedByUserId: admin.id,
+        adminSubmittedByUsername: audit.adminEditedByUsername,
+        adminSubmittedByName: audit.adminEditedByName,
+        updatedAt: submittedAt,
+        updatedByUserId: admin.id,
+        instanceName: entryInstanceName(loaded.draft, entryAnswers, submittedAt),
+        answers: entryAnswers
+      };
+      await store.markEntrySubmitted(loaded.workspaceId, entry);
+    } else {
+      entry = {
+        id: checkpoint.id || `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
+        userId: ownerId,
+        submittedByUserId: ownerId,
+        submittedByUsername: ownerProfile?.username || "",
+        submittedByName: ownerProfile?.displayName || ownerProfile?.username || checkpoint.savedBy || "",
+        submittedAt,
+        instanceName: entryInstanceName(loaded.draft, entryAnswers, submittedAt),
+        answers: entryAnswers,
+        adminSubmittedAt: submittedAt,
+        adminSubmittedByUserId: admin.id,
+        adminSubmittedByUsername: audit.adminEditedByUsername,
+        adminSubmittedByName: audit.adminEditedByName,
+        ...audit
+      };
+      await store.insertEntry(loaded.workspaceId, entry);
+    }
+    await store.deleteRespondentCheckpoint(loaded.workspaceId, key, userId);
+    await notifyWorkspaceAdmins(loaded.workspaceId, "checkpoint_submitted_by_admin", "Incomplete entry submitted", `An admin completed and submitted ${checkpoint.primaryIdentifierValue || identifier} for ${loaded.draft.title || loaded.workspaceId}.`, {
+      subjectId: loaded.workspaceId,
+      details: { formTitle: loaded.draft.title || loaded.workspaceId, entryId: entry.id, primaryIdentifierValue: identifier, submittedByAdmin: audit.adminEditedByUsername }
+    });
+    return { ok: true, workspaceId: loaded.workspaceId, entry, entries: await readEntries(loaded.workspaceId), submitted: true };
+  });
+}
+
+async function markRespondentCheckpointForReview(workspaceId, primaryIdentifierValue, user) {
+  const key = checkpointIdentifierKey(primaryIdentifierValue);
+  const updated = await store.markRespondentCheckpointForReview(cleanWorkspaceId(workspaceId), key, user.id, user.username);
+  if (!updated) {
+    const error = new Error("No saved checkpoint was found for this field agent.");
+    error.statusCode = 404;
+    throw error;
+  }
+  return { ok: true, workspaceId, primaryIdentifierValue, reviewRequestedAt: isoStamp(), reviewRequestedBy: user.username };
 }
 
 function decodeXmlEntities(value) {
@@ -2490,7 +2979,7 @@ async function listParticipantAssignments(workspaceId) {
 async function activateFolderBarcodeParticipantIdentifier(workspaceId, payload = {}) {
   const loaded = await loadDraft(workspaceId);
   const folderId = String(loaded.draft.folderId || "").trim();
-  if (!folderId) throw new Error("This demographic form is not part of a folder.");
+  if (!folderId) throw new Error("This demographic form is not part of a project.");
   const folderForms = (await listForms()).forms.filter((item) => item.folderId === folderId);
   const sourceWorkspaceIds = new Set(folderForms.map((item) => item.workspaceId));
   const registry = await readParticipantRegistry();
@@ -2587,10 +3076,18 @@ function primaryIdentifierEntryKey(draft, answers = {}) {
   return String(entryValue(answers?.[primaryIdentifierVariable]) || "").trim().toLowerCase();
 }
 
-async function assertEntryMutationAllowed(draft, entries, answers, entryId = "") {
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function assertEntryMutationAllowed(draft, entries, answers, entryId = "", user = null) {
   const settings = normalizeResponseSettings(draft);
   const requestedEntryId = String(entryId || "").trim();
-  if (requestedEntryId && !settings.allowResponseEdits) {
+  if (requestedEntryId && !settings.allowResponseEdits && !user?.roles?.includes(ADMIN_ROLE)) {
     const error = new Error("Responses cannot be changed after submission for this form.");
     error.statusCode = 403;
     throw error;
@@ -2635,6 +3132,10 @@ async function deleteEntries(workspaceId, payload) {
     throw error;
   }
   await store.deleteEntries(loaded.workspaceId, [...ids]);
+  await notifyWorkspaceAdmins(loaded.workspaceId, "entries_deleted", "Entries deleted", `${existing.length - entries.length} entr${existing.length - entries.length === 1 ? "y was" : "ies were"} deleted from ${loaded.draft.title || loaded.workspaceId}.`, {
+    subjectId: loaded.workspaceId,
+    details: { formTitle: loaded.draft.title || loaded.workspaceId, entryIds: [...ids] }
+  });
   return {
     ok: true,
     workspaceId: loaded.workspaceId,
@@ -2656,28 +3157,84 @@ function runIdempotentSubmission(workspaceId, payload, submit) {
   return pending;
 }
 
-function submitEntry(workspaceId, payload, user) {
-  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitEntryUnlocked(workspaceId, payload, user)));
+function submitEntry(workspaceId, payload, user, { allowDeleted = false, allowFieldAgent = false } = {}) {
+  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitEntryUnlocked(workspaceId, payload, user, { allowDeleted, allowFieldAgent })));
 }
 
-async function submitEntryUnlocked(requestedWorkspaceId, payload, user) {
-  const loaded = await loadDraft(requestedWorkspaceId);
+async function returnEntryToIncomplete(workspaceId, entryId, answers, admin) {
+  return withFormLock(workspaceId, async () => {
+    const loaded = await loadDraft(workspaceId);
+    const entry = await store.getEntryIncludingIncomplete(loaded.workspaceId, entryId);
+    if (!entry || entry.submissionStatus === "incomplete") {
+      const error = new Error("Submitted entry not found.");
+      error.statusCode = 404;
+      throw error;
+    }
+    const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
+    if (!primaryIdentifierVariable) throw new Error("This form does not have a primary identifier variable.");
+    const identifier = String(entry.answers?.[primaryIdentifierVariable] || answers?.[primaryIdentifierVariable] || "").trim();
+    if (!identifier) throw new Error(`The incomplete response needs a value for ${primaryIdentifierVariable}.`);
+    const ownerId = entry.userId || entry.submittedByUserId || "";
+    const key = checkpointIdentifierKey(identifier);
+    const previousCheckpoint = await store.getRespondentCheckpoint(loaded.workspaceId, key, ownerId);
+    const now = isoStamp();
+    const audit = await adminEditAudit(admin, entry, now);
+    const checkpoint = {
+      ...previousCheckpoint,
+      id: previousCheckpoint?.id || entry.id,
+      workspaceId: loaded.workspaceId,
+      userId: ownerId,
+      primaryIdentifierVariable,
+      primaryIdentifierValue: identifier,
+      primaryIdentifierKey: key,
+      sourceEntryId: entry.id,
+      savedAt: now,
+      answers: {
+        ...(entry.answers || {}),
+        ...(answers || {}),
+        [primaryIdentifierVariable]: identifier
+      },
+      ...audit
+    };
+    const incompleteEntry = {
+      ...entry,
+      submissionStatus: "incomplete",
+      updatedAt: now,
+      updatedByUserId: admin.id,
+      answers: checkpoint.answers,
+      ...audit
+    };
+    await store.putRespondentCheckpoint(loaded.workspaceId, key, checkpoint);
+    await store.updateEntry(loaded.workspaceId, incompleteEntry);
+    await notifyWorkspaceAdmins(loaded.workspaceId, "entry_returned_to_incomplete", "Entry moved to incomplete", `${identifier} was moved from submitted entries to incomplete entries by an admin.`, {
+      subjectId: loaded.workspaceId,
+      details: { formTitle: loaded.draft.title || loaded.workspaceId, entryId: entry.id, primaryIdentifierValue: identifier, editedBy: audit.adminEditedByUsername }
+    });
+    return { ok: true, workspaceId: loaded.workspaceId, checkpoint, entries: await readEntries(loaded.workspaceId) };
+  });
+}
+
+async function submitEntryUnlocked(requestedWorkspaceId, payload, user, { allowDeleted = false, allowFieldAgent = false } = {}) {
+  const loaded = await loadDraft(requestedWorkspaceId, { allowDeleted, allowFieldAgent });
   const workspaceId = loaded.workspaceId;
   const submittedAt = isoStamp();
   const answers = payload.answers || {};
   const primaryIdentifierVariable = participantIdentifierForDraft(loaded.draft);
-  const existing = await readEntries(workspaceId);
+  const existing = await readEntries(workspaceId, fieldAgentDataOwnerId(user));
   const clientSubmissionId = String(payload.clientSubmissionId || "").trim().slice(0, 120);
   const previousSubmission = clientSubmissionId && existing.find((item) => item.clientSubmissionId === clientSubmissionId);
   if (previousSubmission) return { ok: true, workspaceId, entry: previousSubmission, entries: existing, duplicateRetry: true };
   const requestedEntryId = String(payload.entryId || "").trim();
-  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
+  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId, user);
   if (requestedEntryId) {
     const index = existing.findIndex((item) => String(item.id || "") === requestedEntryId);
     if (index < 0) {
       const error = new Error("Entry not found.");
       error.statusCode = 404;
       throw error;
+    }
+    if (stableJson(existing[index].answers || {}) === stableJson(answers)) {
+      return { ok: true, workspaceId, entry: existing[index], entries: existing, updated: false, unchanged: true };
     }
     const updatedAt = isoStamp();
     const entry = {
@@ -2688,18 +3245,67 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload, user) {
       instanceName: entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt),
       answers
     };
+    if (user.roles?.includes(ADMIN_ROLE)) {
+      const editorProfile = await store.getUserProfile(user.id);
+      const adminEdit = {
+        userId: user.id,
+        username: String(user.username || editorProfile?.username || ""),
+        name: String(editorProfile?.displayName || user.username || ""),
+        editedAt: updatedAt
+      };
+      entry.adminEditedAt = updatedAt;
+      entry.adminEditedByUserId = adminEdit.userId;
+      entry.adminEditedByUsername = adminEdit.username;
+      entry.adminEditedByName = adminEdit.name;
+      entry.adminEditHistory = [...(existing[index].adminEditHistory || []), adminEdit];
+    }
     const entries = [...existing];
     entries[index] = entry;
     await store.updateEntry(workspaceId, entry);
     if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
-      await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable]);
+      await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable], user.id);
     }
     return { ok: true, workspaceId, entry, entries, updated: true };
   }
+  if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
+    const checkpointKey = checkpointIdentifierKey(answers[primaryIdentifierVariable]);
+    const checkpoint = await store.getRespondentCheckpoint(workspaceId, checkpointKey, user.id);
+    if (checkpoint?.sourceEntryId) {
+      const originalEntry = await store.getEntryIncludingIncomplete(workspaceId, checkpoint.sourceEntryId);
+      if (originalEntry?.submissionStatus === "incomplete") {
+        const { submissionStatus: _submissionStatus, ...prior } = originalEntry;
+        const entry = {
+          ...prior,
+          ...(clientSubmissionId ? { clientSubmissionId } : {}),
+          userId: originalEntry.userId || user.id,
+          submittedAt,
+          updatedAt: submittedAt,
+          updatedByUserId: user.id,
+          instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
+          source: "odk-web-forms",
+          payloadType: payload?.payloadType || "monolithic",
+          submissionMeta: payload?.submissionMeta || null,
+          instanceXml,
+          answers
+        };
+        if (user.roles?.includes(ADMIN_ROLE)) Object.assign(entry, await adminEditAudit(user, originalEntry, submittedAt));
+        if (uploadSummaries.length) entry.attachments = [...(entry.attachments || []), ...uploadSummaries];
+        await store.markEntrySubmitted(workspaceId, entry);
+        for (const upload of uploads) await store.putEntryAttachment(workspaceId, entry.id, upload);
+        await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable], user.id);
+        return { ok: true, workspaceId, entry, entries: await readEntries(workspaceId, fieldAgentDataOwnerId(user)), updated: true };
+      }
+    }
+  }
+  const submitterProfile = await store.getUserProfile(user.id);
+  const submittedByUsername = String(user.username || submitterProfile?.username || "");
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     ...(clientSubmissionId ? { clientSubmissionId } : {}),
     userId: user.id,
+    submittedByUserId: user.id,
+    submittedByUsername,
+    submittedByName: String(submitterProfile?.displayName || submittedByUsername),
     submittedAt,
     instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
     answers
@@ -2707,28 +3313,28 @@ async function submitEntryUnlocked(requestedWorkspaceId, payload, user) {
   const entries = [...existing, entry];
   await store.insertEntry(workspaceId, entry);
   if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
-    await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable]);
+    await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable], user.id);
   }
   return { ok: true, workspaceId, entry, entries };
 }
 
-function submitOdkEntry(workspaceId, payload, user) {
-  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitOdkEntryUnlocked(workspaceId, payload, user)));
+function submitOdkEntry(workspaceId, payload, user, { allowDeleted = false, allowFieldAgent = false } = {}) {
+  return runIdempotentSubmission(workspaceId, payload, () => withFormLock(workspaceId, () => submitOdkEntryUnlocked(workspaceId, payload, user, { allowDeleted, allowFieldAgent })));
 }
 
-async function submitOdkEntryUnlocked(requestedWorkspaceId, payload, user) {
-  const loaded = await loadDraft(requestedWorkspaceId);
+async function submitOdkEntryUnlocked(requestedWorkspaceId, payload, user, { allowDeleted = false, allowFieldAgent = false } = {}) {
+  const loaded = await loadDraft(requestedWorkspaceId, { allowDeleted, allowFieldAgent });
   const workspaceId = loaded.workspaceId;
   const instanceXml = String(payload.instanceXml || "").trim();
   if (!instanceXml) throw new Error("ODK submission XML is required.");
   const submittedAt = isoStamp();
   const answers = extractSimpleAnswersFromXml(instanceXml);
-  const existing = await readEntries(workspaceId);
+  const existing = await readEntries(workspaceId, fieldAgentDataOwnerId(user));
   const clientSubmissionId = String(payload.clientSubmissionId || "").trim().slice(0, 120);
   const previousSubmission = clientSubmissionId && existing.find((item) => item.clientSubmissionId === clientSubmissionId);
   if (previousSubmission) return { ok: true, workspaceId, entry: previousSubmission, entries: existing, duplicateRetry: true };
   const requestedEntryId = String(payload.entryId || "").trim();
-  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId);
+  await assertEntryMutationAllowed(loaded.draft, existing, answers, requestedEntryId, user);
   const uploads = prepareSubmissionAttachments(payload.attachments);
   const uploadSummaries = uploads.map(({ fileName, contentType, data }) => ({ fileName, contentType, sizeBytes: data.length }));
   if (requestedEntryId) {
@@ -2750,6 +3356,20 @@ async function submitOdkEntryUnlocked(requestedWorkspaceId, payload, user) {
       answers,
       instanceName: String(answers.instanceName || "").trim() || entryInstanceName(loaded.draft, answers, existing[index].submittedAt || submittedAt)
     };
+    if (user.roles?.includes(ADMIN_ROLE)) {
+      const editorProfile = await store.getUserProfile(user.id);
+      const adminEdit = {
+        userId: user.id,
+        username: String(user.username || editorProfile?.username || ""),
+        name: String(editorProfile?.displayName || user.username || ""),
+        editedAt: entry.updatedAt
+      };
+      entry.adminEditedAt = entry.updatedAt;
+      entry.adminEditedByUserId = adminEdit.userId;
+      entry.adminEditedByUsername = adminEdit.username;
+      entry.adminEditedByName = adminEdit.name;
+      entry.adminEditHistory = [...(existing[index].adminEditHistory || []), adminEdit];
+    }
     if (uploadSummaries.length) entry.attachments = [...(entry.attachments || []), ...uploadSummaries];
     const entries = [...existing];
     entries[index] = entry;
@@ -2757,10 +3377,39 @@ async function submitOdkEntryUnlocked(requestedWorkspaceId, payload, user) {
     for (const upload of uploads) await store.putEntryAttachment(workspaceId, entry.id, upload);
     return { ok: true, workspaceId, entry, entries, updated: true };
   }
+  if (primaryIdentifierVariable && answers[primaryIdentifierVariable]) {
+    const checkpointKey = checkpointIdentifierKey(answers[primaryIdentifierVariable]);
+    const checkpoint = await store.getRespondentCheckpoint(workspaceId, checkpointKey, user.id);
+    if (checkpoint?.sourceEntryId) {
+      const originalEntry = await store.getEntryIncludingIncomplete(workspaceId, checkpoint.sourceEntryId);
+      if (originalEntry?.submissionStatus === "incomplete") {
+        const { submissionStatus: _submissionStatus, ...prior } = originalEntry;
+        const entry = {
+          ...prior,
+          ...(clientSubmissionId ? { clientSubmissionId } : {}),
+          userId: originalEntry.userId || user.id,
+          submittedAt,
+          updatedAt: submittedAt,
+          updatedByUserId: user.id,
+          instanceName: entryInstanceName(loaded.draft, answers, submittedAt),
+          answers
+        };
+        if (user.roles?.includes(ADMIN_ROLE)) Object.assign(entry, await adminEditAudit(user, originalEntry, submittedAt));
+        await store.markEntrySubmitted(workspaceId, entry);
+        await deleteRespondentCheckpoint(workspaceId, answers[primaryIdentifierVariable], user.id);
+        return { ok: true, workspaceId, entry, entries: await readEntries(workspaceId, fieldAgentDataOwnerId(user)), updated: true };
+      }
+    }
+  }
+  const submitterProfile = await store.getUserProfile(user.id);
+  const submittedByUsername = String(user.username || submitterProfile?.username || "");
   const entry = {
     id: `${timestampId()}_${Math.random().toString(36).slice(2, 8)}`,
     ...(clientSubmissionId ? { clientSubmissionId } : {}),
     userId: user.id,
+    submittedByUserId: user.id,
+    submittedByUsername,
+    submittedByName: String(submitterProfile?.displayName || submittedByUsername),
     submittedAt,
     source: "odk-web-forms",
     payloadType: payload.payloadType || "monolithic",
@@ -2792,10 +3441,10 @@ function prepareSubmissionAttachments(attachments = []) {
   return prepared;
 }
 
-async function loadSubmissionAttachment(workspaceId, entryId, fileName) {
+async function loadSubmissionAttachment(workspaceId, entryId, fileName, userId = null) {
   const cleanId = cleanWorkspaceId(workspaceId);
   const entryKey = String(entryId || "").trim();
-  const entry = (await readEntries(cleanId)).find((item) => item.id === entryKey);
+  const entry = (await readEntries(cleanId, userId)).find((item) => item.id === entryKey);
   if (!entry) {
     const error = new Error("Submission not found.");
     error.statusCode = 404;
@@ -2957,6 +3606,7 @@ async function formMeta(cleanId, row, folders) {
     pipelineStage,
     questionCount: draft?.questions?.length || 0,
     entryCount,
+    checkpointCount: Number(row?.checkpoint_count) || 0,
     fhirBundleCount,
     hasXml,
     hasXlsx: Boolean(row?.has_xlsx),
@@ -2971,6 +3621,7 @@ async function formMeta(cleanId, row, folders) {
     versionChangeSummary: draft?.versionChangeSummary || [],
     hasVersionChanges: formHasVersionChanges(draft || {}),
     attachmentCount: attachmentNames.length,
+    isShared: Boolean((folder?.members || []).length || Number(row?.field_agent_count) > 0),
     attachmentNames,
     offlineVersion: offlineVersionFor(row, attachmentNames),
     updatedAt: draft?.updatedAt || (row?.updated_at || new Date(0)).toISOString(),
@@ -2983,6 +3634,8 @@ async function formMeta(cleanId, row, folders) {
     folderParticipantIdentifierVariable: String(folder?.participantIdentifierVariable || "").trim() || null,
     responseSettings: normalizeResponseSettings(draft || {}),
     collectionLocked: Boolean(draft?.collectionLocked),
+    deletedAt: row?.deleted_at || null,
+    deletedBy: row?.deleted_by_username || null,
     buildFinishedAt: draft?.buildFinishedAt || null,
     publishedAt: draft?.publishedAt || null,
     respondentAccessCode: draft?.respondentAccessCode || draft?.publicAccessCode || null
@@ -2991,8 +3644,17 @@ async function formMeta(cleanId, row, folders) {
 
 async function listForms() {
   const folders = await readFolders();
+  const user = currentRequestUser();
+  if (user?.roles.includes(FIELD_AGENT_ROLE) && !user.roles.includes(ADMIN_ROLE)) {
+    await store.updateFolderMemberRolesForUser(user.id, "field-agent");
+  }
   const forms = [];
   for (const row of await store.formSummaries()) {
+    if (user) {
+      const canManage = user.roles.includes(ADMIN_ROLE) && await store.workspaceAccess(row.workspace_id, user.id);
+      const canCollect = user.roles.includes(FIELD_AGENT_ROLE) && await store.fieldAgentWorkspaceAccess(row.workspace_id, user.id);
+      if (!canManage && !canCollect) continue;
+    }
     forms.push(await formMeta(row.workspace_id, row, folders));
   }
   forms.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
@@ -3001,16 +3663,89 @@ async function listForms() {
 
 async function deleteForm(workspaceId) {
   const cleanId = cleanWorkspaceId(workspaceId);
+  await requireWorkspace(cleanId);
+  const user = currentRequestUser();
+  if (!user) throw new Error("Login required.");
   const draft = await store.getDraft(cleanId);
-  if (!draft) throw new Error(`Form workspace not found: ${cleanId}`);
   terminologyRuns.get(cleanId)?.child.kill();
-  // Entries, attachments, checkpoints, FHIR bundles and barcode assignments go with the form.
-  await store.deleteForm(cleanId);
-  await releaseSharedIdentifiersForForm(draft);
+  await store.setFormDeleted(cleanId, user);
+  const title = draft?.title || cleanId;
+  await notifyWorkspaceAdmins(cleanId, "form_archived", "Form deleted", `${title} was moved to the admin's deleted forms. Saved field-agent work can still sync.`, {
+    subjectId: cleanId,
+    details: { formTitle: title, deletedBy: user.username, respondentAccessCode: draftAccessCode(draft) || "" }
+  });
+  const fieldAgents = await store.workspaceFieldAgentIds(cleanId);
+  await Promise.all(fieldAgents.map((userId) => recordActivity(userId, "form_archived", "Form deleted by admin", `${title} was deleted by an admin. Saved offline work can still sync.`, {
+    subjectId: cleanId,
+    details: { formTitle: title, respondentAccessCode: draftAccessCode(draft) || "" }
+  })));
   return { ok: true, workspaceId: cleanId };
 }
 
-const server = createServer(async (req, res) => {
+async function listDeletedFormsForUser(user) {
+  const folders = await readFolders();
+  const rows = await store.deletedFormSummaries(user.id);
+  const forms = await Promise.all(rows.map(async (row) => ({
+    ...await formMeta(row.workspace_id, row, folders),
+    deletedAt: row.deleted_at,
+    deletedBy: row.deleted_by_username
+  })));
+  return { ok: true, forms };
+}
+
+async function restoreDeletedForm(workspaceId, user) {
+  const cleanId = cleanWorkspaceId(workspaceId);
+  const restored = await store.restoreDeletedForm(cleanId, user.id);
+  if (!restored) {
+    const error = new Error("Deleted form not found in your profile.");
+    error.statusCode = 404;
+    throw error;
+  }
+  const draft = await store.getDraft(cleanId);
+  await notifyWorkspaceAdmins(cleanId, "form_restored", "Form restored", `${draft?.title || cleanId} was restored to the active list.`, {
+    subjectId: cleanId,
+    details: { formTitle: draft?.title || cleanId, restoredBy: user.username }
+  });
+  const fieldAgents = await store.workspaceFieldAgentIds(cleanId);
+  await Promise.all(fieldAgents.map((userId) => recordActivity(userId, "form_restored", "Form restored", `${draft?.title || cleanId} is available again.`, {
+    subjectId: cleanId,
+    details: { formTitle: draft?.title || cleanId }
+  })));
+  return { ok: true, workspaceId: cleanId };
+}
+
+async function permanentlyDeleteArchivedForm(workspaceId, user) {
+  const cleanId = cleanWorkspaceId(workspaceId);
+  const draft = await store.getDraft(cleanId);
+  if (!draft || !await store.formDeleted(cleanId)) {
+    const error = new Error("Deleted form not found in your profile.");
+    error.statusCode = 404;
+    throw error;
+  }
+  terminologyRuns.get(cleanId)?.child.kill();
+  const adminRecipients = await store.workspaceAdminIds(cleanId);
+  const fieldAgentRecipients = await store.workspaceFieldAgentIds(cleanId);
+  const deleted = await store.permanentlyDeleteArchivedForm(cleanId, user.id);
+  if (!deleted) {
+    const error = new Error("You can permanently delete only forms in your own profile archive.");
+    error.statusCode = 404;
+    throw error;
+  }
+  await releaseSharedIdentifiersForForm(draft);
+  const title = draft.title || cleanId;
+  const deletedFormDetails = { formTitle: title, formWorkspaceId: cleanId, accessCode: draftAccessCode(draft) || "" };
+  await Promise.all(adminRecipients.map((userId) => recordActivity(userId, "form_permanently_deleted", "Form permanently deleted", `${title} and its server-stored entries and checkpoints were permanently deleted.`, {
+    subjectId: cleanId,
+    details: { ...deletedFormDetails, deletedBy: user.username }
+  })));
+  await Promise.all(fieldAgentRecipients.map((userId) => recordActivity(userId, "form_permanently_deleted", "Form permanently deleted", `${title} was permanently deleted. Offline copies can no longer sync to the server.`, {
+    subjectId: cleanId,
+    details: deletedFormDetails
+  })));
+  return { ok: true, workspaceId: cleanId };
+}
+
+const server = createServer((req, res) => requestContext.run({ user: null }, async () => {
   const startedAt = Date.now();
   res.on("finish", () => {
     const who = req.user ? ` user=${req.user.username}` : "";
@@ -3027,12 +3762,65 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/auth/config") {
       return jsonResponse(res, 200, { ok: true, url: keycloakPublicUrl, realm: keycloakRealm, clientId: keycloakClientId, offlineSignInDays });
     }
+    if (pathname === "/api/profile" && ["GET", "PUT"].includes(req.method)) {
+      const profileUser = await requireRole(req, ADMIN_ROLE, FIELD_AGENT_ROLE);
+      if (req.method === "GET") {
+        const profile = await store.getUserProfile(profileUser.id);
+        return jsonResponse(res, 200, {
+          ok: true,
+          username: profileUser.username,
+          displayName: profile?.displayName || profileUser.username
+        });
+      }
+      const displayName = String((await requestBody(req)).displayName || "").trim();
+      if (displayName.length > 80) {
+        const error = new Error("Name must be 80 characters or fewer.");
+        error.statusCode = 400;
+        throw error;
+      }
+      const profile = await store.saveUserProfile(profileUser.id, profileUser.username, displayName || profileUser.username);
+      return jsonResponse(res, 200, { ok: true, ...profile });
+    }
+    if (pathname.startsWith("/api/notifications")) {
+      const notificationUser = await requireRole(req, ADMIN_ROLE, FIELD_AGENT_ROLE);
+      if (req.method === "GET" && pathname === "/api/notifications") {
+        return jsonResponse(res, 200, { ok: true, notifications: await store.listNotifications(notificationUser.id) });
+      }
+      if (req.method === "GET" && pathname === "/api/notifications/unread-count") {
+        return jsonResponse(res, 200, { ok: true, count: await store.unreadNotificationCount(notificationUser.id) });
+      }
+      if (req.method === "PUT" && pathname === "/api/notifications/read") {
+        const body = await requestBody(req);
+        await store.markNotificationsRead(notificationUser.id, Array.isArray(body.ids) ? body.ids : null);
+        return jsonResponse(res, 200, { ok: true, count: await store.unreadNotificationCount(notificationUser.id) });
+      }
+      if (req.method === "POST" && pathname === "/api/notifications/confirm-deleted-data") {
+        const fieldAgent = await requireRole(req, FIELD_AGENT_ROLE);
+        const body = await requestBody(req);
+        const accessCode = cleanRespondentAccessCode(body.accessCode);
+        const formWorkspaceId = String(body.formWorkspaceId || "").trim();
+        const tombstone = await store.findPermanentlyDeletedFormGeneration(accessCode, formWorkspaceId);
+        if (!tombstone) {
+          const error = new Error("This permanently deleted form record could not be verified.");
+          error.statusCode = 409;
+          throw error;
+        }
+        await recordActivity(fieldAgent.id, "offline_data_purged", "Offline form data deleted from device", `You confirmed that exported data for ${tombstone.formTitle} (${accessCode}) was saved and deleted from this device.`, {
+          subjectId: formWorkspaceId,
+          dedupeKey: `offline-data-purged:${fieldAgent.id}:${formWorkspaceId}`,
+          details: { accessCode, formWorkspaceId, formTitle: tombstone.formTitle }
+        });
+        return jsonResponse(res, 200, { ok: true });
+      }
+    }
     // Collection routes: filling in and reviewing published forms by form code.
     const collector = pathname.startsWith("/api/public/") ? await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE) : null;
     const publicFormMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)$/);
     const publicXmlMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/xml$/);
     const publicEntriesMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries$/);
+    const publicEntryReviewMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries\/review$/);
     const publicCheckpointMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/checkpoint$/);
+    const publicCheckpointReviewMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/checkpoint\/review$/);
     const publicOdkSubmissionMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/odk-submissions$/);
     const publicAttachmentListMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments$/);
     const publicAttachmentFileMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/attachments\/([^/]+)$/);
@@ -3050,7 +3838,8 @@ const server = createServer(async (req, res) => {
       const attachment = await loadSubmissionAttachment(
         (await findWorkspaceByRespondentCode(decodeURIComponent(publicSubmissionAttachmentMatch[1]))).workspaceId,
         decodeURIComponent(publicSubmissionAttachmentMatch[2]),
-        decodeURIComponent(publicSubmissionAttachmentMatch[3])
+        decodeURIComponent(publicSubmissionAttachmentMatch[3]),
+        fieldAgentDataOwnerId(collector)
       );
       return binaryResponse(res, 200, attachment.data, attachment.contentType);
     }
@@ -3065,21 +3854,254 @@ const server = createServer(async (req, res) => {
       return jsonResponse(res, 200, await submitPublicEntry(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req), collector));
     }
     if (req.method === "GET" && publicEntriesMatch) {
-      return jsonResponse(res, 200, await loadPublicFormEntries(decodeURIComponent(publicEntriesMatch[1])));
+      return jsonResponse(res, 200, await loadPublicFormEntries(decodeURIComponent(publicEntriesMatch[1]), collector));
+    }
+    if (req.method === "PUT" && publicEntryReviewMatch) {
+      return jsonResponse(res, 200, await markPublicEntriesForReview(decodeURIComponent(publicEntryReviewMatch[1]), await requestBody(req), collector));
     }
     if (req.method === "DELETE" && publicEntriesMatch) {
+      if (!collector.roles.includes(ADMIN_ROLE)) {
+        const error = new Error("Field agents cannot delete entries. Mark an entry for admin review instead.");
+        error.statusCode = 403;
+        throw error;
+      }
       return jsonResponse(res, 200, await deletePublicEntries(decodeURIComponent(publicEntriesMatch[1]), await requestBody(req)));
     }
     if (req.method === "POST" && publicCheckpointMatch) {
-      return jsonResponse(res, 200, await savePublicCheckpoint(decodeURIComponent(publicCheckpointMatch[1]), await requestBody(req)));
+      return jsonResponse(res, 200, await savePublicCheckpoint(decodeURIComponent(publicCheckpointMatch[1]), await requestBody(req), collector));
     }
     if (req.method === "PUT" && publicCheckpointMatch) {
-      return jsonResponse(res, 200, await loadPublicCheckpoint(decodeURIComponent(publicCheckpointMatch[1]), await requestBody(req)));
+      return jsonResponse(res, 200, await loadPublicCheckpoint(decodeURIComponent(publicCheckpointMatch[1]), await requestBody(req), collector));
+    }
+    if (req.method === "PUT" && publicCheckpointReviewMatch) {
+      return jsonResponse(res, 200, await markPublicCheckpointForReview(decodeURIComponent(publicCheckpointReviewMatch[1]), await requestBody(req), collector));
     }
     if (req.method === "POST" && publicOdkSubmissionMatch) {
       return jsonResponse(res, 200, await submitPublicOdkEntry(decodeURIComponent(publicOdkSubmissionMatch[1]), await requestBody(req), collector));
     }
+    const formArchiveActionMatch = pathname.match(/^\/api\/forms\/([^/]+)\/(restore|permanent-delete)$/);
+    const formWorkspaceMatch = pathname.match(/^\/api\/forms\/([^/]+)(?:\/|$)/);
+    const formCollectionRoutes = new Set(["new", "save", "export", "inspect-xlsx", "import-xlsx", "deleted"]);
     const admin = await requireRole(req, ADMIN_ROLE);
+    if (req.method === "GET" && pathname === "/api/forms/deleted") {
+      return jsonResponse(res, 200, await listDeletedFormsForUser(admin));
+    }
+    if (formArchiveActionMatch && req.method === "POST") {
+      const workspaceId = decodeURIComponent(formArchiveActionMatch[1]);
+      if (formArchiveActionMatch[2] === "restore") {
+        return jsonResponse(res, 200, await restoreDeletedForm(workspaceId, admin));
+      }
+      return jsonResponse(res, 200, await permanentlyDeleteArchivedForm(workspaceId, admin));
+    }
+    if (pathname === "/api/users/search" && req.method === "GET") {
+      const requestedRole = url.searchParams.get("role");
+      const users = await searchKeycloakUsers(url.searchParams.get("q"), { limit: requestedRole ? 50 : 12 });
+      return jsonResponse(res, 200, {
+        ok: true,
+        users: users.filter((user) => user.id !== admin.id && (!requestedRole || user.accessRole === requestedRole))
+      });
+    }
+    const folderMembersMatch = pathname.match(/^\/api\/folders\/([^/]+)\/members(?:\/([^/]+))?$/);
+    if (folderMembersMatch) {
+      const folderId = decodeURIComponent(folderMembersMatch[1]);
+      await requireFolderAccess(folderId, { ownerOnly: true });
+      if (req.method === "GET" && !folderMembersMatch[2]) {
+        const folder = (await readFolders()).find((item) => item.id === folderId);
+        for (const existingMember of folder?.members || []) {
+          const [account] = await searchKeycloakUsers(existingMember.username, { exact: true, limit: 2 });
+          if (account && account.accessRole !== existingMember.accessRole) {
+            await store.updateFolderMemberRole(folderId, existingMember.userId, account.accessRole);
+            existingMember.accessRole = account.accessRole;
+          }
+        }
+        return jsonResponse(res, 200, { ok: true, members: folder?.members || [] });
+      }
+      if (req.method === "POST" && !folderMembersMatch[2]) {
+        const username = String((await requestBody(req)).username || "").trim();
+        if (!username) throw new Error("Enter a username to share this project.");
+        const [member] = await searchKeycloakUsers(username, { exact: true, limit: 2 });
+        if (!member || member.username.toLowerCase() !== username.toLowerCase()) {
+          const error = new Error(`No account found for username "${username}".`);
+          error.statusCode = 404;
+          throw error;
+        }
+        if (member.id === admin.id) throw new Error("You already own this project.");
+        await store.addFolderMember(folderId, { userId: member.id, username: member.username, accessRole: member.accessRole, addedBy: admin.id });
+        const folder = (await readFolders()).find((item) => item.id === folderId);
+        if (member.accessRole === "field-agent") {
+          await recordActivity(member.id, "access_granted", "Project access granted", `You were given access to project ${folder?.name || folderId}.`, {
+            subjectId: folderId,
+            details: { folderId, folderName: folder?.name || folderId, grantedBy: admin.username }
+          });
+        }
+        return jsonResponse(res, 200, { ok: true, members: folder?.members || [] });
+      }
+      if (req.method === "DELETE" && folderMembersMatch[2]) {
+        const folder = (await readFolders()).find((item) => item.id === folderId);
+        const removedName = decodeURIComponent(folderMembersMatch[2]);
+        const removed = (folder?.members || []).find((item) => item.username.toLowerCase() === removedName.toLowerCase());
+        await store.removeFolderMember(folderId, decodeURIComponent(folderMembersMatch[2]));
+        if (removed?.accessRole === "field-agent") {
+          await recordActivity(removed.userId, "access_removed", "Project access removed", `Your access to project ${folder?.name || folderId} was removed.`, {
+            subjectId: folderId,
+            details: { folderId, folderName: folder?.name || folderId, removedBy: admin.username }
+          });
+        }
+        const updatedFolder = (await readFolders()).find((item) => item.id === folderId);
+        return jsonResponse(res, 200, { ok: true, members: updatedFolder?.members || [] });
+      }
+    }
+    const folderResourceMatch = pathname.match(/^\/api\/folders\/([^/]+)(?:\/|$)/);
+    if (folderResourceMatch && !folderMembersMatch) {
+      await requireFolderAccess(decodeURIComponent(folderResourceMatch[1]));
+    }
+    if (formWorkspaceMatch && !formCollectionRoutes.has(formWorkspaceMatch[1]) && !formArchiveActionMatch) {
+      await requireWorkspace(decodeURIComponent(formWorkspaceMatch[1]));
+    }
+    const checkpointSubmitMatch = pathname.match(/^\/api\/forms\/([^/]+)\/checkpoints\/([^/]+)\/submit$/);
+    if (req.method === "POST" && checkpointSubmitMatch) {
+      const workspaceId = decodeURIComponent(checkpointSubmitMatch[1]);
+      const identifier = decodeURIComponent(checkpointSubmitMatch[2]);
+      const payload = await requestBody(req);
+      const result = await submitAdminCheckpoint(workspaceId, identifier, String(payload.userId || ""), payload.answers || {}, admin);
+      const formTitle = (await store.getDraft(workspaceId))?.title || workspaceId;
+      const ownerId = result.entry.userId;
+      if (ownerId && ownerId !== admin.id) await recordActivity(ownerId, "checkpoint_submitted_by_admin", "Incomplete entry submitted", `An admin completed and submitted your saved response for ${formTitle}.`, {
+        subjectId: workspaceId,
+        details: { formTitle, entryId: result.entry.id, primaryIdentifierValue: identifier, submittedByAdmin: admin.username }
+      });
+      return jsonResponse(res, 200, result);
+    }
+    const checkpointsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/checkpoints(?:\/([^/]+))?$/);
+    if (checkpointsMatch) {
+      const workspaceId = decodeURIComponent(checkpointsMatch[1]);
+      await requireRole(req, ADMIN_ROLE);
+      if (req.method === "GET" && !checkpointsMatch[2]) {
+        return jsonResponse(res, 200, { ok: true, checkpoints: await readRespondentCheckpoints(workspaceId) });
+      }
+      if (req.method === "GET" && checkpointsMatch[2]) {
+        const identifier = decodeURIComponent(checkpointsMatch[2]);
+        const checkpointOwnerId = url.searchParams.get("userId") || "";
+        const checkpoint = (await readRespondentCheckpoints(workspaceId)).find((item) => (
+          String(item.primaryIdentifierValue || "").toLowerCase() === identifier.toLowerCase()
+          && String(item.userId || "") === checkpointOwnerId
+        ));
+        if (!checkpoint) {
+          const error = new Error("Incomplete entry not found.");
+          error.statusCode = 404;
+          throw error;
+        }
+        return jsonResponse(res, 200, { ok: true, checkpoint });
+      }
+      if (req.method === "PUT" && checkpointsMatch[2]) {
+        const identifier = decodeURIComponent(checkpointsMatch[2]);
+        const payload = await requestBody(req);
+        const checkpointOwnerId = String(payload.userId || "");
+        const checkpoint = (await readRespondentCheckpoints(workspaceId)).find((item) => (
+          String(item.primaryIdentifierValue || "").toLowerCase() === identifier.toLowerCase()
+          && String(item.userId || "") === checkpointOwnerId
+        ));
+        if (!checkpoint) {
+          const error = new Error("Incomplete entry not found.");
+          error.statusCode = 404;
+          throw error;
+        }
+        const answers = payload.answers && typeof payload.answers === "object" ? payload.answers : {};
+        const normalizedAnswers = { ...(checkpoint.answers || {}), ...answers, [checkpoint.primaryIdentifierVariable]: checkpoint.primaryIdentifierValue };
+        if (stableJson(checkpoint.answers || {}) === stableJson(normalizedAnswers)) {
+          return jsonResponse(res, 200, { ok: true, checkpoint, unchanged: true });
+        }
+        const now = isoStamp();
+        const editor = req.user;
+        const editorProfile = await store.getUserProfile(editor.id);
+        const edit = {
+          userId: editor.id,
+          username: String(editor.username || editorProfile?.username || ""),
+          name: String(editorProfile?.displayName || editor.username || ""),
+          editedAt: now
+        };
+        const updated = {
+          ...checkpoint,
+          savedAt: now,
+          answers: normalizedAnswers,
+          adminEditedAt: now,
+          adminEditedByUserId: edit.userId,
+          adminEditedByUsername: edit.username,
+          adminEditedByName: edit.name,
+          adminEditHistory: [...(checkpoint.adminEditHistory || []), edit]
+        };
+        await store.putRespondentCheckpoint(workspaceId, checkpointIdentifierKey(identifier), updated);
+        return jsonResponse(res, 200, { ok: true, checkpoint: updated, checkpoints: await readRespondentCheckpoints(workspaceId) });
+      }
+      if (req.method === "DELETE" && checkpointsMatch[2]) {
+        const identifier = decodeURIComponent(checkpointsMatch[2]);
+        const checkpointOwnerId = url.searchParams.has("userId") ? url.searchParams.get("userId") : null;
+        const checkpoint = (await readRespondentCheckpoints(workspaceId)).find((item) => (
+          String(item.primaryIdentifierValue || "").toLowerCase() === identifier.toLowerCase()
+          && (checkpointOwnerId === null || String(item.userId || "") === checkpointOwnerId)
+        ));
+        if (checkpoint?.sourceEntryId) await store.deleteEntries(workspaceId, [checkpoint.sourceEntryId]);
+        await deleteRespondentCheckpoint(workspaceId, identifier, checkpointOwnerId);
+        if (checkpoint) await notifyWorkspaceAdmins(workspaceId, "checkpoint_deleted", "Partial response deleted", `Checkpoint ${identifier} was deleted from ${ (await store.getDraft(workspaceId))?.title || workspaceId}.`, {
+          subjectId: workspaceId,
+          details: { formTitle: (await store.getDraft(workspaceId))?.title || workspaceId, primaryIdentifierValue: identifier, userId: checkpoint.userId || "" }
+        });
+        return jsonResponse(res, 200, { ok: true, checkpoints: await readRespondentCheckpoints(workspaceId) });
+      }
+    }
+    const formFieldAgentsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/field-agents(?:\/([^/]+))?$/);
+    if (formFieldAgentsMatch) {
+      const workspaceId = decodeURIComponent(formFieldAgentsMatch[1]);
+      const meta = await workspaceMeta(workspaceId);
+      if (!meta.hasXml || !meta.respondentAccessCode) {
+        const error = new Error("Field-agent access can only be managed for published forms.");
+        error.statusCode = 409;
+        throw error;
+      }
+      if (req.method === "GET" && !formFieldAgentsMatch[2]) {
+        return jsonResponse(res, 200, { ok: true, members: await store.listFormFieldAgents(workspaceId) });
+      }
+      if (req.method === "POST" && !formFieldAgentsMatch[2]) {
+        const username = String((await requestBody(req)).username || "").trim();
+        if (!username) throw new Error("Enter a field-agent username.");
+        const [member] = await searchKeycloakUsers(username, { exact: true, limit: 2 });
+        if (!member || member.username.toLowerCase() !== username.toLowerCase()) {
+          const error = new Error(`No account found for username "${username}".`);
+          error.statusCode = 404;
+          throw error;
+        }
+        if (member.accessRole !== "field-agent") {
+          const error = new Error(`The account "${username}" does not have the field-agent role.`);
+          error.statusCode = 400;
+          throw error;
+        }
+        const existingGrant = (await store.listFormFieldAgents(workspaceId)).find((item) => item.userId === member.id);
+        if (existingGrant) {
+          const source = existingGrant.accessType === "folder" ? "through the project" : "to this form";
+          const error = new Error(`Field agent "${username}" already has access ${source}.`);
+          error.statusCode = 409;
+          throw error;
+        }
+        await store.addFormFieldAgent(workspaceId, { userId: member.id, username: member.username, addedBy: admin.id });
+        await recordActivity(member.id, "access_granted", "Form access granted", `You were given access to ${meta.title || workspaceId}.`, {
+          subjectId: workspaceId,
+          details: { workspaceId, formTitle: meta.title || workspaceId, accessCode: meta.respondentAccessCode, grantedBy: admin.username }
+        });
+        return jsonResponse(res, 200, { ok: true, members: await store.listFormFieldAgents(workspaceId) });
+      }
+      if (req.method === "DELETE" && formFieldAgentsMatch[2]) {
+        const username = decodeURIComponent(formFieldAgentsMatch[2]);
+        const removed = (await store.listFormFieldAgents(workspaceId)).find((item) => item.username.toLowerCase() === username.toLowerCase());
+        await store.removeFormFieldAgent(workspaceId, username);
+        if (removed) {
+          await recordActivity(removed.userId, "access_removed", "Form access removed", `Your access to ${meta.title || workspaceId} was removed.`, {
+            subjectId: workspaceId,
+            details: { workspaceId, formTitle: meta.title || workspaceId, accessCode: meta.respondentAccessCode, removedBy: admin.username }
+          });
+        }
+        return jsonResponse(res, 200, { ok: true, members: await store.listFormFieldAgents(workspaceId) });
+      }
+    }
     if (req.method === "GET" && pathname === "/api/forms") {
       return jsonResponse(res, 200, await listForms());
     }
@@ -3134,6 +4156,8 @@ const server = createServer(async (req, res) => {
     }
     const formMatch = pathname.match(/^\/api\/forms\/([^/]+)$/);
     const entriesMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries$/);
+    const entryIncompleteMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries\/([^/]+)\/incomplete$/);
+    const entryReviewMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries\/([^/]+)\/review$/);
     const submissionAttachmentMatch = pathname.match(/^\/api\/forms\/([^/]+)\/entries\/([^/]+)\/attachments\/([^/]+)$/);
     const participantsMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants$/);
     const participantAssignMatch = pathname.match(/^\/api\/forms\/([^/]+)\/participants\/assign$/);
@@ -3159,6 +4183,23 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && entriesMatch) {
       return jsonResponse(res, 200, { ok: true, entries: await readEntries(decodeURIComponent(entriesMatch[1])) });
+    }
+    if (req.method === "POST" && entryIncompleteMatch) {
+      const workspaceId = decodeURIComponent(entryIncompleteMatch[1]);
+      const entryId = decodeURIComponent(entryIncompleteMatch[2]);
+      const payload = await requestBody(req);
+      return jsonResponse(res, 200, await returnEntryToIncomplete(workspaceId, entryId, payload.answers || {}, admin));
+    }
+    if (req.method === "DELETE" && entryReviewMatch) {
+      const workspaceId = decodeURIComponent(entryReviewMatch[1]);
+      const entryId = decodeURIComponent(entryReviewMatch[2]);
+      const updatedCount = await store.clearEntryReview(workspaceId, entryId);
+      if (!updatedCount) {
+        const error = new Error("No matching entry was found.");
+        error.statusCode = 404;
+        throw error;
+      }
+      return jsonResponse(res, 200, { ok: true, entries: await readEntries(workspaceId) });
     }
     if (req.method === "GET" && submissionAttachmentMatch) {
       const attachment = await loadSubmissionAttachment(
@@ -3261,15 +4302,39 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const message = error.message || String(error);
     const status = error.statusCode || (/not found/i.test(message) ? 404 : 500);
+    if (
+      status >= 400 &&
+      req.user?.roles?.includes(FIELD_AGENT_ROLE) &&
+      req.url.startsWith("/api/public/forms/") &&
+      req.method !== "GET"
+    ) {
+      try {
+        const code = decodeURIComponent(req.url.match(/^\/api\/public\/forms\/([^/?]+)/)?.[1] || "");
+        const clientId = String(req.parsedBody?.clientSubmissionId || "");
+        await recordActivity(
+          req.user.id,
+          status === 410 ? "sync_discarded" : "sync_failed",
+          status === 410 ? `Offline data needs export · ${code}` : code ? `Sync failed · ${code}` : "Sync failed",
+          status === 410 ? `${message} The queued data remains on this device until it is exported and confirmed for deletion.` : `${message}${code ? ` · Form ${code}` : ""}`,
+          {
+            subjectId: code,
+            details: { path: req.url, code, clientSubmissionId: clientId, status, ...(error.details || {}) },
+            dedupeKey: clientId ? `sync-failed:${req.user.id}:${clientId}:${message}` : ""
+          }
+        );
+      } catch (notificationError) {
+        console.warn("[notifications] Could not record failed field-agent sync:", notificationError.message || notificationError);
+      }
+    }
     if (status >= 500) console.error(`[http] ${req.method} ${req.url} failed:`, error);
     else console.warn(`[http] ${req.method} ${req.url} -> ${status}: ${message}`);
-    jsonResponse(res, status, { ok: false, error: message });
+    jsonResponse(res, status, { ok: false, error: message, ...(error.details ? { details: error.details } : {}) });
   }
-});
+}));
 
 await migrate();
 await logTablePrivileges();
 await importLegacyMetaForms();
-server.listen(port, "0.0.0.0", () => {
+server.listen(port, process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1", () => {
   console.log(`ICPH form-builder API listening on http://localhost:${port}`);
 });

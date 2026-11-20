@@ -53,9 +53,9 @@ RUN mkdir -p /app/agentic-entity-mapper/SchemaTerminologies \
 USER node
 WORKDIR /app/form-builder
 
-EXPOSE 5173 8787
+EXPOSE 5174 8787
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD node -e "Promise.all([fetch('http://127.0.0.1:5173/'), fetch('http://127.0.0.1:8787/api/health')]).then(([web, api]) => process.exit(web.ok && api.ok ? 0 : 1)).catch(() => process.exit(1))"
+    CMD node -e "Promise.all([fetch('http://127.0.0.1:5174/'), fetch('http://127.0.0.1:8787/api/health')]).then(([web, api]) => process.exit(web.ok && api.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["npm", "run", "start"]
