@@ -1336,6 +1336,7 @@ async function loadPublicForm(value) {
   return {
     ok: true,
     accessCode: found.code,
+    workspaceId: found.workspaceId,
     title: found.draft?.title || meta.title,
     formId: found.draft?.formId || meta.formId,
     hasXml: meta.hasXml,

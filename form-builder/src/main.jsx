@@ -1630,7 +1630,9 @@ async function saveOfflineFormPackage(formPackage) {
   const ownerId = currentOfflineOwnerId();
   const accessCode = normalizeAccessCodeInput(formPackage?.accessCode);
   const workspaceId = String(formPackage?.workspaceId || "").trim();
-  if (!ownerId || !accessCode || !workspaceId) throw new Error("A signed-in account and form version are required to save an offline form.");
+  if (!ownerId) throw new Error("A signed-in account is required to save an offline form.");
+  if (!accessCode) throw new Error("The form access code is missing, so this form cannot be saved offline.");
+  if (!workspaceId) throw new Error("The published form is missing its workspace/version ID, so this form cannot be saved offline.");
   await offlineStoreRequest("accountFormPackages", "readwrite", (store) => store.put({
     ...formPackage,
     id: `${ownerId}:${accessCode}:${workspaceId}`,
