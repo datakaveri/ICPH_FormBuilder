@@ -14683,6 +14683,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         let loadedWorkspaceId = workspaceId || "";
         let loadedOffline = false;
         let packageCached = false;
+        let packageCacheError = null;
         try {
           const fetched = await fetchFormPackage(formApiBase, accessCode);
           const savedPackage = fetched.formPackage;
@@ -14697,7 +14698,9 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
             await saveOfflineFormPackage(savedPackage);
             await offlineCryptoKey();
             packageCached = true;
-          } catch {}
+          } catch (error) {
+            packageCacheError = error;
+          }
           cachedPackageRef.current = savedPackage;
         } catch (networkError) {
           // A deleted, inaccessible, or temporarily unreachable server copy
@@ -14830,7 +14833,10 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         setSubmissionSuccess(false);
         setStatus(packageCached
           ? { kind: "ok", message: loadedOffline ? "Offline form ready." : entryToEdit ? "Editing submitted entry." : loadedCheckpointAnswers ? "Loaded saved checkpoint." : "Ready" }
-          : { kind: "error", message: "Loaded online, but this device could not save an offline copy." });
+          : {
+            kind: "error",
+            message: `Loaded online, but this device could not save an offline copy${packageCacheError?.message ? `: ${packageCacheError.message}` : "."}`
+          });
       } catch (error) {
         setStatus({ kind: "error", message: error.message || String(error) });
       }
