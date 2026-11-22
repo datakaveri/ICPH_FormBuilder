@@ -1550,6 +1550,10 @@ async function purgeLocalDeletedFormData({ accessCode, workspaceId, ownerId }) {
     .filter((item) => normalizeAccessCodeInput(item.accessCode || String(item.id || "").split(":")[0]) === code && (!workspaceId || !item.workspaceId || item.workspaceId === workspaceId));
   for (const cachedEntries of cachedEntryRecords) {
     if (cachedEntries.ownerUserId && cachedEntries.ownerUserId !== ownerId) continue;
+    if (cachedEntries.ownerUserId === ownerId) {
+      await offlineStoreRequest("entryCache", "readwrite", (store) => store.delete(cachedEntries.id));
+      continue;
+    }
     const remaining = (cachedEntries.entries || []).filter((entry) => !entry.userId || entry.userId !== ownerId);
     if (remaining.length) await saveEncryptedOfflineRecord("entryCache", { ...cachedEntries, entries: remaining, ownerUserId: "" });
     else await offlineStoreRequest("entryCache", "readwrite", (store) => store.delete(cachedEntries.id));
@@ -1919,6 +1923,19 @@ async function syncPendingSubmissions(onlyId = "") {
           body: JSON.stringify({ ...record.payload, sourceWorkspaceId: record.payload?.sourceWorkspaceId || record.formWorkspaceId || "", clientSubmissionId: record.id, clientSyncBatchId: syncBatchId, clientQueuedAt: record.createdAt })
         });
         await offlineStoreRequest("submissionQueue", "readwrite", (store) => store.delete(record.id));
+        const syncedCode = queuedRecordAccessCode(record);
+        const syncedWorkspaceId = String(record.payload?.sourceWorkspaceId || record.formWorkspaceId || "");
+        if (syncedCode && syncedWorkspaceId) {
+          const draftId = offlineDraftId(syncedCode, syncedWorkspaceId, record.payload?.entryId || "");
+          const localDraft = await readEncryptedOfflineRecords("offlineDrafts").then((items) => items.find((item) => item.id === draftId)).catch(() => null);
+          const syncedAnswers = record.payload?.answers || {};
+          const localDraftCoveredBySync = localDraft && Object.entries(localDraft.answers || {}).every(([name, value]) => (
+            Object.prototype.hasOwnProperty.call(syncedAnswers, name) && JSON.stringify(syncedAnswers[name]) === JSON.stringify(value)
+          ));
+          if (localDraftCoveredBySync) {
+            await offlineStoreRequest("offlineDrafts", "readwrite", (store) => store.delete(draftId)).catch(() => {});
+          }
+        }
         syncedIds.push(record.id);
       } catch (error) {
         const message = error.message || String(error);
@@ -4854,6 +4871,7 @@ function FieldAgentGate({ children }) {
 function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
   const [forms, setForms] = useState([]);
   const [revokedFormAccess, setRevokedFormAccess] = useState({});
+  const [localCleanupOptions, setLocalCleanupOptions] = useState({});
   const [selectedCode, setSelectedCode] = useState("");
   const [displayFieldByCode, setDisplayFieldByCode] = useState({});
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
@@ -4894,6 +4912,75 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
     .map((item) => normalizeAccessCodeInput(item.respondentAccessCode))
     .filter((code) => code && !savedForms[code]);
   const fieldAgentAllSelected = fieldAgentEntryIds.length > 0 && selectedEntryIds.length === fieldAgentEntryIds.length;
+
+  async function refreshLocalCleanupOptions(formItems = forms) {
+    const ownerId = currentOfflineOwnerId();
+    const [queue, drafts] = await Promise.all([
+      readEncryptedOfflineRecords("submissionQueue").catch(() => []),
+      readEncryptedOfflineRecords("offlineDrafts").catch(() => [])
+    ]);
+    const next = {};
+    for (const item of formItems) {
+      const code = normalizeAccessCodeInput(item.respondentAccessCode || item.accessCode);
+      const workspaceId = String(item.workspaceId || "");
+      if (!code || !workspaceId) continue;
+      const belongsToForm = (record) => queuedRecordAccessCode(record) === code
+        && String(record.payload?.sourceWorkspaceId || record.formWorkspaceId || "") === workspaceId;
+      const matchingQueue = queue.filter((record) => ownerId && record.ownerUserId === ownerId && belongsToForm(record));
+      const matchingDrafts = drafts.filter((record) => ownerId && record.ownerUserId === ownerId
+        && normalizeAccessCodeInput(record.accessCode) === code && String(record.workspaceId || "") === workspaceId
+        && Object.values(record.answers || {}).some((value) => value !== "" && value != null && !(Array.isArray(value) && !value.length)));
+      const key = `${workspaceId}:${code}`;
+      next[key] = matchingQueue.some((record) => record.permanentlyDeletedAt)
+        ? { canDelete: false, reason: "Export permanently deleted form data from Profile → Updates first." }
+        : matchingQueue.length
+          ? { canDelete: false, reason: `${matchingQueue.length} item${matchingQueue.length === 1 ? " is" : "s are"} still waiting to sync.` }
+          : matchingDrafts.length
+            ? { canDelete: false, reason: "A saved draft has not been submitted or checkpointed. Save or submit it before removing local data." }
+            : { canDelete: true, reason: "All queued work is synced. Local form data can be removed." };
+    }
+    setLocalCleanupOptions(next);
+    return next;
+  }
+
+  async function removeFormDataFromDevice(formItem) {
+    const code = normalizeAccessCodeInput(formItem?.respondentAccessCode);
+    const workspaceId = String(formItem?.workspaceId || "");
+    if (!code || !workspaceId) return;
+    if (!isOnline()) {
+      setStatus({ kind: "error", message: "Connect to the internet and sync first. Local form data has not been removed." });
+      return;
+    }
+    try {
+      const live = await requestJson("/api/public/forms");
+      if ((live.forms || []).some((item) => item.workspaceId === workspaceId)) {
+        await loadPublishedForms();
+        setStatus({ kind: "error", message: "This form is active again for your account. The local copy was kept." });
+        return;
+      }
+    } catch (error) {
+      setStatus({ kind: "error", message: `Could not verify current form access: ${error.message || String(error)}. Local data was kept.` });
+      return;
+    }
+    const currentOptions = await refreshLocalCleanupOptions([formItem]);
+    const option = currentOptions[`${workspaceId}:${code}`];
+    if (!option?.canDelete) {
+      setStatus({ kind: "error", message: option?.reason || "Local data is not ready to be removed." });
+      return;
+    }
+    const warning = `This removes the downloaded form, cached entries, checkpoints, and drafts for “${formItem.title || code}” from this device. Synced data remains in the server. Continue?`;
+    if (!window.confirm(warning)) return;
+    try {
+      await purgeLocalDeletedFormData({ accessCode: code, workspaceId, ownerId: currentOfflineOwnerId() });
+      setForms((current) => current.filter((item) => !(String(item.workspaceId || "") === workspaceId
+        && normalizeAccessCodeInput(item.respondentAccessCode) === code)));
+      await refreshSavedForms();
+      notifyCollectionChanged();
+      setStatus({ kind: "ok", message: `Local data for ${formItem.title || code} was removed from this device. Synced server data remains available to admins.` });
+    } catch (error) {
+      setStatus({ kind: "error", message: `Could not remove local form data: ${error.message || String(error)}` });
+    }
+  }
 
   async function fetchFormAccessRevocations() {
     const data = await requestJson("/api/public/forms/access-revocations");
@@ -4946,6 +5033,7 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
         code: String(record.path || "").match(/\/api\/public\/forms\/([^/]+)/)?.[1] || ""
       })).slice(-5).reverse());
       if (result?.syncedIds?.length) await loadPublishedForms();
+      await refreshLocalCleanupOptions();
     } catch {
       setPendingSyncCount(await getPendingSubmissionCount());
     }
@@ -5085,6 +5173,7 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
         });
       nextForms.push(...locallySavedButUnlisted);
       setForms(nextForms);
+      await refreshLocalCleanupOptions(nextForms);
       setSelectedCode((current) => nextForms.some((item) => item.respondentAccessCode === current)
         ? current
         : nextForms[0]?.respondentAccessCode || "");
@@ -5302,6 +5391,11 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
                     {formItem.offlineOnly ? (
                       <small className="offline-saved-note">Server access unavailable · local data preserved</small>
                     ) : null}
+                    {formItem.accessRevoked || formItem.offlineOnly ? (
+                      <small className="offline-saved-note">
+                        {localCleanupOptions[`${formItem.workspaceId}:${code}`]?.reason || "Checking whether all local work is synced…"}
+                      </small>
+                    ) : null}
                     {saved ? (
                       <small className="offline-saved-note">
                         {outdated ? "Update available" : `Saved offline ${new Date(saved.cachedAt).toLocaleDateString()}`} · {formatStorageSize(saved.sizeBytes)}
@@ -5316,7 +5410,7 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
                       none: online ? "Download for offline use" : "Connect to download for offline use",
                       downloading: "Downloading...",
                       outdated: "Download the latest version",
-                      saved: "Saved on this device. Field agents cannot delete offline form data."
+                      saved: "Saved on this device. A local copy can be removed after all work is synced."
                     }[offlineState]}
                     aria-label={{
                       none: `Download ${formItem.title} for offline use`,
@@ -5347,6 +5441,20 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
                 <button className="primary" disabled={selectedForm.accessRevoked} onClick={() => openFillForm(selectedForm)}>
                   <ExternalLink size={16} /> {selectedForm.accessRevoked ? "Access removed" : "Fill Form"}
                 </button>
+                {selectedForm.accessRevoked || selectedForm.offlineOnly ? (() => {
+                  const cleanup = localCleanupOptions[`${selectedForm.workspaceId}:${normalizeAccessCodeInput(selectedForm.respondentAccessCode)}`];
+                  return (
+                    <button
+                      className="secondary small icon-text-button"
+                      type="button"
+                      disabled={!online || !cleanup?.canDelete}
+                      title={!online ? "Connect before removing local data" : cleanup?.reason || "Checking local sync status"}
+                      onClick={() => removeFormDataFromDevice(selectedForm)}
+                    >
+                      <Trash2 size={14} /> Remove local data
+                    </button>
+                  );
+                })() : null}
                 <button
                   className="secondary small statistics-trigger"
                   type="button"
