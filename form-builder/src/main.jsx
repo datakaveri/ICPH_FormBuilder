@@ -1916,7 +1916,7 @@ async function syncPendingSubmissions(onlyId = "") {
         await requestJson(record.path, {
           method: record.method || "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ ...record.payload, sourceWorkspaceId: record.payload?.sourceWorkspaceId || record.formWorkspaceId || "", clientSubmissionId: record.id, clientSyncBatchId: syncBatchId })
+          body: JSON.stringify({ ...record.payload, sourceWorkspaceId: record.payload?.sourceWorkspaceId || record.formWorkspaceId || "", clientSubmissionId: record.id, clientSyncBatchId: syncBatchId, clientQueuedAt: record.createdAt })
         });
         await offlineStoreRequest("submissionQueue", "readwrite", (store) => store.delete(record.id));
         syncedIds.push(record.id);
@@ -4853,6 +4853,7 @@ function FieldAgentGate({ children }) {
 
 function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
   const [forms, setForms] = useState([]);
+  const [revokedFormAccess, setRevokedFormAccess] = useState({});
   const [selectedCode, setSelectedCode] = useState("");
   const [displayFieldByCode, setDisplayFieldByCode] = useState({});
   const [selectedEntryIds, setSelectedEntryIds] = useState([]);
@@ -4894,9 +4895,45 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
     .filter((code) => code && !savedForms[code]);
   const fieldAgentAllSelected = fieldAgentEntryIds.length > 0 && selectedEntryIds.length === fieldAgentEntryIds.length;
 
+  async function fetchFormAccessRevocations() {
+    const data = await requestJson("/api/public/forms/access-revocations");
+    const byWorkspace = Object.fromEntries((data.revocations || []).map((item) => [item.workspaceId, item]));
+    setRevokedFormAccess(byWorkspace);
+    return byWorkspace;
+  }
+
+  async function completeDrainedFormRevocations(revocations) {
+    const ownerId = currentOfflineOwnerId();
+    const queue = (await readEncryptedOfflineRecords("submissionQueue"))
+      .filter((record) => ownerId && record.ownerUserId === ownerId && !record.permanentlyDeletedAt);
+    for (const item of revocations) {
+      if (item.syncCompletedAt) continue;
+      const hasQueuedWork = queue.some((record) => {
+        const code = String(record.path || "").match(/\/api\/public\/forms\/([^/]+)/)?.[1] || "";
+        return normalizeAccessCodeInput(decodeURIComponent(code)) === normalizeAccessCodeInput(item.accessCode)
+          && String(record.payload?.sourceWorkspaceId || record.formWorkspaceId || "") === item.workspaceId;
+      });
+      if (!hasQueuedWork) {
+        await requestJson(`/api/public/forms/${encodeURIComponent(item.accessCode)}/access-revocation/complete`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workspaceId: item.workspaceId })
+        });
+      }
+    }
+  }
+
   async function refreshFieldAgentSyncStatus(sync = false) {
     try {
+      let revocations = [];
+      if (isOnline()) {
+        const data = await requestJson("/api/public/forms/access-revocations");
+        revocations = data.revocations || [];
+        const byWorkspace = Object.fromEntries(revocations.map((item) => [item.workspaceId, item]));
+        setRevokedFormAccess(byWorkspace);
+        setForms((current) => current.map((item) => ({ ...item, accessRevoked: Boolean(byWorkspace[item.workspaceId]) })));
+      }
       const result = sync && isOnline() ? await syncPendingSubmissions() : null;
+      if (result && revocations.length) await completeDrainedFormRevocations(revocations).catch(() => {});
       setPendingSyncCount(result?.pendingCount ?? await getPendingSubmissionCount());
       const ownerId = currentOfflineOwnerId();
       const queued = (await readEncryptedOfflineRecords("submissionQueue"))
@@ -4985,6 +5022,7 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
       const entries = mergeQueuedEntries(cachedEntriesForForm(cachedEntries, code, item.workspaceId), queuedEntries.get(code) || []);
       return {
         ...item,
+        accessRevoked: Boolean(revokedFormAccess[item.workspaceId]),
         respondentAccessCode: item.accessCode,
         entries,
         entryCount: entries.length,
@@ -5003,6 +5041,9 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
     setStatus({ kind: "busy", message: "Loading published forms..." });
     try {
       const data = await requestJson("/api/public/forms");
+      const revocationData = await requestJson("/api/public/forms/access-revocations").catch(() => ({ revocations: [] }));
+      const revokedByWorkspace = Object.fromEntries((revocationData.revocations || []).map((item) => [item.workspaceId, item]));
+      setRevokedFormAccess(revokedByWorkspace);
       await adoptAuthorizedLegacyFormPackages(data.forms || []);
       const localCheckpoints = await listOfflineCheckpointMetadata().catch(() => new Map());
       const queuedEntries = await listQueuedEntriesByCode().catch(() => new Map());
@@ -5022,17 +5063,18 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
           )));
         const checkpoints = [...serverCheckpoints, ...localOnly];
         const entries = mergeQueuedEntries(form.entries || [], queuedEntries.get(normalizeAccessCodeInput(form.respondentAccessCode)) || []);
-        return { ...form, entries, entryCount: entries.length, checkpoints, checkpointCount: checkpoints.length };
+        return { ...form, entries, entryCount: entries.length, checkpoints, checkpointCount: checkpoints.length, accessRevoked: Boolean(revokedByWorkspace[form.workspaceId]) };
       });
       const listedCodes = new Set(nextForms.map((item) => normalizeAccessCodeInput(item.respondentAccessCode)));
       const locallySavedButUnlisted = savedPackages
         .filter((item) => !listedCodes.has(normalizeAccessCodeInput(item.accessCode)))
         .map((item) => {
           const code = normalizeAccessCodeInput(item.accessCode);
-          const entries = mergeQueuedEntries(cachedEntriesForForm(cachedEntries, code, form.workspaceId), queuedEntries.get(code) || []);
+          const entries = mergeQueuedEntries(cachedEntriesForForm(cachedEntries, code, item.workspaceId), queuedEntries.get(code) || []);
           const checkpoints = localCheckpoints.get(code) || [];
           return {
             ...item,
+            accessRevoked: Boolean(revokedByWorkspace[item.workspaceId]),
             respondentAccessCode: item.accessCode,
             entries,
             entryCount: entries.length,
@@ -5102,6 +5144,10 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
   }, []);
 
   function openFillForm(form, entryId = "", checkpointIdentifierValue = "") {
+    if (form?.accessRevoked) {
+      setStatus({ kind: "error", message: "Your access to this form was removed. Saved work is being kept on this device, and you can no longer fill or edit it." });
+      return;
+    }
     const code = normalizeAccessCodeInput(form?.respondentAccessCode);
     if (!code) return;
     const params = new URLSearchParams();
@@ -5250,6 +5296,9 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
                     <span>{formItem.title}</span>
                     <strong>{formItem.respondentAccessCode}</strong>
                     <small>{formItem.entryCount || 0} entries · {formItem.checkpointCount || 0} incomplete</small>
+                    {formItem.accessRevoked ? (
+                      <small className="offline-saved-note">Access removed · saved work retained · filling disabled</small>
+                    ) : null}
                     {formItem.offlineOnly ? (
                       <small className="offline-saved-note">Server access unavailable · local data preserved</small>
                     ) : null}
@@ -5295,8 +5344,8 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
                   <h2>{selectedForm.title}</h2>
                   <p>{selectedForm.formId || selectedForm.workspaceId}</p>
                 </div>
-                <button className="primary" onClick={() => openFillForm(selectedForm)}>
-                  <ExternalLink size={16} /> Fill Form
+                <button className="primary" disabled={selectedForm.accessRevoked} onClick={() => openFillForm(selectedForm)}>
+                  <ExternalLink size={16} /> {selectedForm.accessRevoked ? "Access removed" : "Fill Form"}
                 </button>
                 <button
                   className="secondary small statistics-trigger"
@@ -14596,6 +14645,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   const [cachedAttachmentUrls, setCachedAttachmentUrls] = useState({});
   const [offlineReady, setOfflineReady] = useState(false);
   const [localDraftSaved, setLocalDraftSaved] = useState(false);
+  const [formAccessRevoked, setFormAccessRevoked] = useState(false);
   const online = useOnline();
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const cachedPackageRef = useRef(null);
@@ -14686,6 +14736,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         let loadedOffline = false;
         let packageCached = false;
         let packageCacheError = null;
+        let accessRevoked = false;
         try {
           const fetched = await fetchFormPackage(formApiBase, accessCode);
           const savedPackage = fetched.formPackage;
@@ -14729,6 +14780,13 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           attachmentBlobs = savedPackage.attachments || [];
           externalChoiceData = savedPackage.externalChoices || {};
         }
+        if (accessCode && isOnline()) {
+          try {
+            const revocationData = await requestJson("/api/public/forms/access-revocations");
+            accessRevoked = (revocationData.revocations || []).some((item) => item.workspaceId === loadedWorkspaceId);
+          } catch {}
+        }
+        setFormAccessRevoked(accessRevoked);
         setFormGenerationId(loadedWorkspaceId);
         setFormXml(xml);
         setForm(publishedForm);
@@ -14833,7 +14891,9 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           }, () => {});
         }
         setSubmissionSuccess(false);
-        setStatus(packageCached
+        setStatus(accessRevoked
+          ? { kind: "error", message: "Your access to this form was removed. Saved responses and drafts remain on this device; filling is disabled." }
+          : packageCached
           ? { kind: "ok", message: loadedOffline ? "Offline form ready." : entryToEdit ? "Editing submitted entry." : loadedCheckpointAnswers ? "Loaded saved checkpoint." : "Ready" }
           : {
             kind: "error",
@@ -14847,6 +14907,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   }, [accessCode, adminCheckpointIdentifier, adminCheckpointUserId, checkpointAnswers, entryId, formApiBase, fresh, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
 
   function setAnswer(name, value) {
+    if (formAccessRevoked) return;
     setSubmissionSuccess(false);
     setAnswers((current) => ({ ...current, [name]: value }));
   }
@@ -14879,6 +14940,21 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   async function submitEntry() {
     setStatus({ kind: "busy", message: "Saving local entry..." });
     try {
+      if (accessCode && isOnline()) {
+        const access = await requestJson("/api/public/forms/access-revocations");
+        const revoked = (access.revocations || []).some((item) => item.workspaceId === formGenerationId);
+        if (revoked) {
+          setFormAccessRevoked(true);
+          if (!localDraftSaved) {
+            setStatus({ kind: "error", message: "Your access to this form was removed. Saved work is retained on this device, but there is no saved response ready to sync." });
+            return;
+          }
+        }
+      }
+      if (formAccessRevoked) {
+        setStatus({ kind: "error", message: "Your access to this form was removed. Your saved work is retained on this device, but you can no longer add or edit responses." });
+        return;
+      }
       const validation = validateAnswers(form, answers);
       if (validation.errors.length) {
         const missingRequired = validation.errors.filter((error) => error.endsWith(" is required."));
@@ -14936,6 +15012,22 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   }
 
   async function saveCheckpoint() {
+    if (accessCode && formAccessRevoked) {
+      setStatus({ kind: "error", message: "Your access to this form was removed. The saved work is retained on this device, but you can no longer change it." });
+      return;
+    }
+    if (accessCode && isOnline()) {
+      try {
+        const access = await requestJson("/api/public/forms/access-revocations");
+        if ((access.revocations || []).some((item) => item.workspaceId === formGenerationId)) {
+          setFormAccessRevoked(true);
+          if (!localDraftSaved) {
+            setStatus({ kind: "error", message: "Your access to this form was removed. Saved work is retained on this device, but there is no saved checkpoint ready to sync." });
+            return;
+          }
+        }
+      } catch {}
+    }
     if (adminCheckpointIdentifier) {
       const validation = validateAnswers(form, answers);
       const primaryIdentifierVariable = String(form?.participantIdentifierVariable || form?.primaryIdentifierVariable || "").trim();
@@ -15130,22 +15222,22 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
 	        </div>
 	        <div className="footer-actions">
           {!adminCheckpointIdentifier ? (
-            <button className="secondary" disabled={!form || status.kind === "busy"} onClick={saveCheckpoint}>
+            <button className="secondary" disabled={!form || formAccessRevoked || status.kind === "busy"} onClick={saveCheckpoint}>
               <Save size={16} /> Save Checkpoint
             </button>
           ) : null}
 	          {hasGroupSections && activeGroupPage > 0 ? (
-            <button className="secondary group-page-back" disabled={status.kind === "busy"} onClick={goBackGroupPage}>
+            <button className="secondary group-page-back" disabled={formAccessRevoked || status.kind === "busy"} onClick={goBackGroupPage}>
               <ChevronRight size={16} /> Back
             </button>
           ) : null}
           {hasGroupSections && !isLastGroupPage ? (
             // Stay clickable while invalid so the click can report what is missing.
-            <button className="primary" disabled={!form || status.kind === "busy"} onClick={advanceGroupPage}>
+            <button className="primary" disabled={!form || formAccessRevoked || status.kind === "busy"} onClick={advanceGroupPage}>
               Next <ChevronRight size={16} />
             </button>
           ) : (
-            <button className="primary" disabled={!form || status.kind === "busy"} onClick={adminCheckpointIdentifier ? saveCheckpoint : submitEntry}>
+            <button className="primary" disabled={!form || formAccessRevoked || status.kind === "busy"} onClick={adminCheckpointIdentifier ? saveCheckpoint : submitEntry}>
               <Check size={16} /> {adminCheckpointIdentifier ? answerValidation.errors.length ? "Update" : "Submit" : editingEntry || entryId ? "Update" : "Submit"}
             </button>
           )}

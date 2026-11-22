@@ -70,6 +70,13 @@ export async function addFolderMember(folderId, { userId, username, accessRole, 
      ON CONFLICT (folder_id, user_id) DO UPDATE SET username = EXCLUDED.username, access_role = EXCLUDED.access_role`,
     [folderId, userId, username, accessRole, addedBy]
   );
+  if (accessRole === "field-agent") {
+    await query(
+      `DELETE FROM field_agent_form_revocations r USING forms f
+        WHERE r.workspace_id = f.workspace_id AND f.folder_id = $1 AND r.user_id = $2`,
+      [folderId, userId]
+    );
+  }
 }
 
 export async function updateFolderMemberRole(folderId, userId, accessRole) {
@@ -82,6 +89,90 @@ export async function updateFolderMemberRolesForUser(userId, accessRole) {
 
 export async function removeFolderMember(folderId, username) {
   await query("DELETE FROM folder_members WHERE folder_id = $1 AND lower(username) = lower($2)", [folderId, username]);
+}
+
+export async function revokeFolderFieldAgentAccess(folderId, userId, username, revokedBy) {
+  return withTransaction(async () => {
+    const forms = (await query(
+      `SELECT f.workspace_id AS "workspaceId", f.respondent_access_code AS "accessCode",
+              coalesce(f.draft->>'title', f.workspace_id) AS "formTitle"
+         FROM forms f
+        WHERE f.folder_id = $1 AND f.xml IS NOT NULL AND f.respondent_access_code IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM form_field_agents a WHERE a.workspace_id = f.workspace_id AND a.user_id = $2)`,
+      [folderId, userId]
+    )).rows;
+    await query("DELETE FROM folder_members WHERE folder_id = $1 AND lower(username) = lower($2)", [folderId, username]);
+    const revoked = [];
+    for (const form of forms) {
+      const stillHasFolderAccess = (await query(
+        `SELECT 1 FROM forms f JOIN folder_members m ON m.folder_id = f.folder_id
+          WHERE f.workspace_id = $1 AND m.user_id = $2 AND m.access_role = 'field-agent' LIMIT 1`,
+        [form.workspaceId, userId]
+      )).rowCount > 0;
+      if (stillHasFolderAccess) continue;
+      await query(
+        `INSERT INTO field_agent_form_revocations (workspace_id, user_id, access_code, form_title, revoked_by)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET access_code = EXCLUDED.access_code,
+           form_title = EXCLUDED.form_title, revoked_by = EXCLUDED.revoked_by,
+           revoked_at = now(), sync_completed_at = NULL`,
+        [form.workspaceId, userId, form.accessCode, form.formTitle, revokedBy]
+      );
+      revoked.push(form);
+    }
+    return revoked;
+  });
+}
+
+export async function revokeFormFieldAgentAccess(workspaceId, userId, username, revokedBy) {
+  return withTransaction(async () => {
+    const row = (await query(
+      `SELECT f.workspace_id AS "workspaceId", f.respondent_access_code AS "accessCode",
+              coalesce(f.draft->>'title', f.workspace_id) AS "formTitle",
+              EXISTS (SELECT 1 FROM folders d JOIN folder_members m ON m.folder_id = d.id
+                       WHERE d.id = f.folder_id AND m.user_id = $2 AND m.access_role = 'field-agent') AS "hasFolderAccess"
+         FROM forms f WHERE f.workspace_id = $1 AND f.xml IS NOT NULL AND f.respondent_access_code IS NOT NULL`,
+      [workspaceId, userId]
+    )).rows[0];
+    await query("DELETE FROM form_field_agents WHERE workspace_id = $1 AND lower(username) = lower($2)", [workspaceId, username]);
+    if (row && !row.hasFolderAccess) {
+      await query(
+        `INSERT INTO field_agent_form_revocations (workspace_id, user_id, access_code, form_title, revoked_by)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET access_code = EXCLUDED.access_code,
+           form_title = EXCLUDED.form_title, revoked_by = EXCLUDED.revoked_by,
+           revoked_at = now(), sync_completed_at = NULL`,
+        [workspaceId, userId, row.accessCode, row.formTitle, revokedBy]
+      );
+      return [row];
+    }
+    return [];
+  });
+}
+
+export async function pendingFormAccessRevocations(userId) {
+  return (await query(
+    `SELECT workspace_id AS "workspaceId", access_code AS "accessCode", form_title AS "formTitle",
+            revoked_at AS "revokedAt", sync_completed_at AS "syncCompletedAt"
+       FROM field_agent_form_revocations WHERE user_id = $1 ORDER BY revoked_at`,
+    [userId]
+  )).rows.map((row) => ({ ...row, revokedAt: iso(row.revokedAt), syncCompletedAt: iso(row.syncCompletedAt) }));
+}
+
+export async function hasPendingFormAccessRevocation(workspaceId, userId) {
+  return (await query(
+    `SELECT 1 FROM field_agent_form_revocations
+      WHERE workspace_id = $1 AND user_id = $2 AND sync_completed_at IS NULL`,
+    [workspaceId, userId]
+  )).rowCount > 0;
+}
+
+export async function completeFormAccessRevocation(workspaceId, userId) {
+  await query(
+    `UPDATE field_agent_form_revocations SET sync_completed_at = now()
+      WHERE workspace_id = $1 AND user_id = $2 AND sync_completed_at IS NULL`,
+    [workspaceId, userId]
+  );
 }
 
 export async function workspaceAccess(workspaceId, userId) {
@@ -152,6 +243,7 @@ export async function addFormFieldAgent(workspaceId, { userId, username, addedBy
      ON CONFLICT (workspace_id, user_id) DO UPDATE SET username = EXCLUDED.username`,
     [workspaceId, userId, username, addedBy]
   );
+  await query("DELETE FROM field_agent_form_revocations WHERE workspace_id = $1 AND user_id = $2", [workspaceId, userId]);
 }
 
 export async function removeFormFieldAgent(workspaceId, username) {

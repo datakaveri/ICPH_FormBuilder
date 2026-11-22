@@ -605,7 +605,10 @@ async function requireFieldAgentWorkspace(workspaceId, { allowDeleted = false } 
   const user = currentRequestUser();
   if (!user) throw new Error("Login required.");
   if (user.roles.includes(ADMIN_ROLE)) return requireWorkspace(cleanId, { allowDeleted });
-  if (user.roles.includes(FIELD_AGENT_ROLE) && await store.fieldAgentWorkspaceAccess(cleanId, user.id)) return { cleanId };
+  if (user.roles.includes(FIELD_AGENT_ROLE) && (
+    await store.fieldAgentWorkspaceAccess(cleanId, user.id)
+    || requestContext.getStore()?.allowRevokedSyncWorkspaceId === cleanId
+  )) return { cleanId };
   const error = new Error("You do not have field-agent access to this published form.");
   error.statusCode = 403;
   throw error;
@@ -1244,7 +1247,7 @@ async function loadDraft(workspaceId, { allowDeleted = false, allowFieldAgent = 
   return { workspaceId: cleanId, draft, ...meta };
 }
 
-async function findWorkspaceByRespondentCode(value, { allowDeleted = false } = {}) {
+async function findWorkspaceByRespondentCode(value, { allowDeleted = false, allowRevokedSync = false, payload = {} } = {}) {
   const code = cleanRespondentAccessCode(value);
   const found = await store.findFormByRespondentCode(code, { includeDeleted: allowDeleted });
   if (!found) {
@@ -1263,6 +1266,16 @@ async function findWorkspaceByRespondentCode(value, { allowDeleted = false } = {
     const error = new Error("No published form matches that respondent code.");
     error.statusCode = 404;
     throw error;
+  }
+  const user = currentRequestUser();
+  const activeAccess = user?.roles?.includes(ADMIN_ROLE) || await store.fieldAgentWorkspaceAccess(found.workspace_id, user?.id || "");
+  if (!activeAccess && allowRevokedSync && user?.roles?.includes(FIELD_AGENT_ROLE)
+      && String(payload.sourceWorkspaceId || "") === found.workspace_id
+      && String(payload.clientSubmissionId || "").trim()
+      && String(payload.clientSyncBatchId || "").trim()
+      && await store.hasPendingFormAccessRevocation(found.workspace_id, user.id)) {
+    const context = requestContext.getStore();
+    if (context) context.allowRevokedSyncWorkspaceId = found.workspace_id;
   }
   await requireFieldAgentWorkspace(found.workspace_id, { allowDeleted });
   return { code, workspaceId: found.workspace_id, draft: found.draft, deletedAt: found.deleted_at || null };
@@ -1416,7 +1429,7 @@ async function loadPublicAttachmentList(value) {
 }
 
 async function submitPublicEntry(value, payload, user) {
-  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true, allowRevokedSync: true, payload });
   await requireRespondentFormGeneration(found, payload);
   const identifierName = participantIdentifierForDraft(found.draft);
   const identifierValue = String(payload.answers?.[identifierName] || "").trim();
@@ -1473,7 +1486,7 @@ async function deletePublicEntries(value, payload) {
 }
 
 async function markPublicEntriesForReview(value, payload, user) {
-  const found = await findWorkspaceByRespondentCode(value);
+  const found = await findWorkspaceByRespondentCode(value, { allowRevokedSync: true, payload });
   await requireRespondentFormGeneration(found, payload);
   const ids = [...new Set((Array.isArray(payload?.entryIds) ? payload.entryIds : [payload?.entryId])
     .map((id) => String(id || "").trim()).filter(Boolean))];
@@ -1510,7 +1523,7 @@ async function loadPublicCheckpoint(value, payload, user) {
 }
 
 async function savePublicCheckpoint(value, payload, user) {
-  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true, allowRevokedSync: true, payload });
   await requireRespondentFormGeneration(found, payload);
   const data = await saveRespondentCheckpoint(found.workspaceId, payload, { allowDeleted: true, allowFieldAgent: true, userId: user.id });
   const title = found.draft?.title || found.workspaceId;
@@ -1536,7 +1549,7 @@ async function markPublicCheckpointForReview(value, payload, user) {
     error.statusCode = 403;
     throw error;
   }
-  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true, allowRevokedSync: true, payload });
   await requireRespondentFormGeneration(found, payload);
   const result = await markRespondentCheckpointForReview(found.workspaceId, payload.primaryIdentifierValue, user);
   const title = found.draft?.title || found.workspaceId;
@@ -1557,7 +1570,7 @@ async function markPublicCheckpointForReview(value, payload, user) {
 }
 
 async function submitPublicOdkEntry(value, payload, user) {
-  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true });
+  const found = await findWorkspaceByRespondentCode(value, { allowDeleted: true, allowRevokedSync: true, payload });
   await requireRespondentFormGeneration(found, payload);
   const odkAnswers = extractSimpleAnswersFromXml(payload.instanceXml);
   const identifierName = participantIdentifierForDraft(found.draft);
@@ -3816,6 +3829,31 @@ const server = createServer((req, res) => requestContext.run({ user: null }, asy
     }
     // Collection routes: filling in and reviewing published forms by form code.
     const collector = pathname.startsWith("/api/public/") ? await requireRole(req, FIELD_AGENT_ROLE, ADMIN_ROLE) : null;
+    if (req.method === "GET" && pathname === "/api/public/forms/access-revocations") {
+      const revocations = collector.roles.includes(FIELD_AGENT_ROLE) && !collector.roles.includes(ADMIN_ROLE)
+        ? await store.pendingFormAccessRevocations(collector.id)
+        : [];
+      return jsonResponse(res, 200, { ok: true, revocations });
+    }
+    const accessRevocationCompleteMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/access-revocation\/complete$/);
+    if (req.method === "POST" && accessRevocationCompleteMatch) {
+      if (!collector.roles.includes(FIELD_AGENT_ROLE) || collector.roles.includes(ADMIN_ROLE)) {
+        const error = new Error("Only field agents can complete a form access revocation sync.");
+        error.statusCode = 403;
+        throw error;
+      }
+      const payload = await requestBody(req);
+      const code = cleanRespondentAccessCode(decodeURIComponent(accessRevocationCompleteMatch[1]));
+      const revocations = await store.pendingFormAccessRevocations(collector.id);
+      const revocation = revocations.find((item) => item.workspaceId === String(payload.workspaceId || "") && item.accessCode === code);
+      if (!revocation) {
+        const error = new Error("No matching revoked form access was found for this account.");
+        error.statusCode = 404;
+        throw error;
+      }
+      await store.completeFormAccessRevocation(revocation.workspaceId, collector.id);
+      return jsonResponse(res, 200, { ok: true });
+    }
     const publicFormMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)$/);
     const publicXmlMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/xml$/);
     const publicEntriesMatch = pathname.match(/^\/api\/public\/forms\/([^/]+)\/entries$/);
@@ -3941,7 +3979,11 @@ const server = createServer((req, res) => requestContext.run({ user: null }, asy
         const folder = (await readFolders()).find((item) => item.id === folderId);
         const removedName = decodeURIComponent(folderMembersMatch[2]);
         const removed = (folder?.members || []).find((item) => item.username.toLowerCase() === removedName.toLowerCase());
-        await store.removeFolderMember(folderId, decodeURIComponent(folderMembersMatch[2]));
+        if (removed?.accessRole === "field-agent") {
+          await store.revokeFolderFieldAgentAccess(folderId, removed.userId, decodeURIComponent(folderMembersMatch[2]), admin.username);
+        } else {
+          await store.removeFolderMember(folderId, decodeURIComponent(folderMembersMatch[2]));
+        }
         if (removed?.accessRole === "field-agent") {
           await recordActivity(removed.userId, "access_removed", "Project access removed", `Your access to project ${folder?.name || folderId} was removed.`, {
             subjectId: folderId,
@@ -4093,7 +4135,8 @@ const server = createServer((req, res) => requestContext.run({ user: null }, asy
       if (req.method === "DELETE" && formFieldAgentsMatch[2]) {
         const username = decodeURIComponent(formFieldAgentsMatch[2]);
         const removed = (await store.listFormFieldAgents(workspaceId)).find((item) => item.username.toLowerCase() === username.toLowerCase());
-        await store.removeFormFieldAgent(workspaceId, username);
+        if (removed) await store.revokeFormFieldAgentAccess(workspaceId, removed.userId, username, admin.username);
+        else await store.removeFormFieldAgent(workspaceId, username);
         if (removed) {
           await recordActivity(removed.userId, "access_removed", "Form access removed", `Your access to ${meta.title || workspaceId} was removed.`, {
             subjectId: workspaceId,
