@@ -4749,7 +4749,6 @@ function RespondentPortal({ initialCode = "" }) {
     return (
       <FillForm
         accessCode={session.accessCode}
-        fresh={session.mode === "fresh"}
         checkpointAnswers={session.checkpoint?.answers || null}
         resumePrimaryIdentifierValue={session.primaryIdentifierValue || ""}
         onBackToRespondent={() => {
@@ -4920,10 +4919,7 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
 
   async function refreshLocalCleanupOptions(formItems = forms) {
     const ownerId = currentOfflineOwnerId();
-    const [queue, drafts] = await Promise.all([
-      readEncryptedOfflineRecords("submissionQueue").catch(() => []),
-      readEncryptedOfflineRecords("offlineDrafts").catch(() => [])
-    ]);
+    const queue = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
     const next = {};
     for (const item of formItems) {
       const code = normalizeAccessCodeInput(item.respondentAccessCode || item.accessCode);
@@ -4932,17 +4928,12 @@ function FieldAgentPortal({ session, onLogout, onSessionExpired }) {
       const belongsToForm = (record) => queuedRecordAccessCode(record) === code
         && String(record.payload?.sourceWorkspaceId || record.formWorkspaceId || "") === workspaceId;
       const matchingQueue = queue.filter((record) => ownerId && record.ownerUserId === ownerId && belongsToForm(record));
-      const matchingDrafts = drafts.filter((record) => ownerId && record.ownerUserId === ownerId
-        && normalizeAccessCodeInput(record.accessCode) === code && String(record.workspaceId || "") === workspaceId
-        && Object.values(record.answers || {}).some((value) => value !== "" && value != null && !(Array.isArray(value) && !value.length)));
       const key = `${workspaceId}:${code}`;
       next[key] = matchingQueue.some((record) => record.permanentlyDeletedAt)
         ? { canDelete: false, reason: "Export permanently deleted form data from Profile → Updates first." }
         : matchingQueue.length
           ? { canDelete: false, reason: `${matchingQueue.length} item${matchingQueue.length === 1 ? " is" : "s are"} still waiting to sync.` }
-          : matchingDrafts.length
-            ? { canDelete: false, reason: "A saved draft has not been submitted or checkpointed. Save or submit it before removing local data." }
-            : { canDelete: true, reason: "All queued work is synced. Local form data can be removed." };
+          : { canDelete: true, reason: "All queued work is synced. Local form data can be removed." };
     }
     setLocalCleanupOptions(next);
     return next;
@@ -5718,17 +5709,20 @@ function RespondentAccessPanel({ initialCode = "", onOpen }) {
       });
     } catch (error) {
       try {
-        const offlinePackage = await loadOfflineFormPackage(normalizedCode);
-        const draft = offlinePackage?.draft || {};
-        const identifier = draft.participantIdentifierVariable || draft.primaryIdentifierVariable || "";
-        const localDraft = await readEncryptedOfflineRecords("offlineDrafts");
-        const saved = localDraft.find((item) => item.id === offlineDraftId(normalizedCode) && String(item.answers?.[identifier] || "").trim() === resumeIdentifierValue.trim());
+        const ownerId = currentOfflineOwnerId();
+        const localQueue = await readEncryptedOfflineRecords("submissionQueue");
+        const saved = localQueue.slice().reverse().find((item) => (
+          ownerId && item.ownerUserId === ownerId
+          && String(item.path || "").endsWith("/checkpoint")
+          && queuedRecordAccessCode(item) === normalizedCode
+          && String(item.payload?.primaryIdentifierValue || "").trim().toLowerCase() === resumeIdentifierValue.trim().toLowerCase()
+        ));
         if (!saved) throw error;
         onOpen({
           accessCode: normalizedCode,
           mode: "resume",
           primaryIdentifierValue: resumeIdentifierValue.trim(),
-          checkpoint: { answers: saved.answers }
+          checkpoint: { answers: saved.payload?.answers || {} }
         });
       } catch (offlineError) {
         setStatus({ kind: "error", message: offlineError.message || error.message || String(error) });
@@ -14750,15 +14744,13 @@ function QuestionEditor({ form, question, updateQuestion, uploadQuestionMedia, u
   );
 }
 
-function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkpointAnswers = null, resumePrimaryIdentifierValue = "", resumeCheckpointIdentifier = "", adminCheckpointIdentifier = "", adminCheckpointUserId = "", onBackToRespondent }) {
+function FillForm({ workspaceId, accessCode, entryId = "", checkpointAnswers = null, resumePrimaryIdentifierValue = "", resumeCheckpointIdentifier = "", adminCheckpointIdentifier = "", adminCheckpointUserId = "", onBackToRespondent }) {
   const [formGenerationId, setFormGenerationId] = useState(workspaceId || "");
   const [form, setForm] = useState(null);
   const [formXml, setFormXml] = useState("");
   const [answers, setAnswers] = useState({});
-  const [answersReady, setAnswersReady] = useState(false);
   const [cachedAttachmentUrls, setCachedAttachmentUrls] = useState({});
   const [offlineReady, setOfflineReady] = useState(false);
-  const [localDraftSaved, setLocalDraftSaved] = useState(false);
   const [formAccessRevoked, setFormAccessRevoked] = useState(false);
   const online = useOnline();
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
@@ -14838,21 +14830,6 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
       window.removeEventListener("focus", refreshQueue);
     };
   }, [online]);
-
-  useEffect(() => {
-    if (!form || !answersReady || !accessCode) return undefined;
-    const timeout = window.setTimeout(() => {
-      saveEncryptedOfflineRecord("offlineDrafts", {
-        id: offlineDraftId(accessCode, formGenerationId, entryId),
-        ownerUserId: currentOfflineOwnerId(),
-        accessCode,
-        workspaceId: formGenerationId,
-        answers,
-        updatedAt: Date.now()
-      }).then(() => setLocalDraftSaved(true)).catch(() => {});
-    }, 250);
-    return () => window.clearTimeout(timeout);
-  }, [accessCode, answers, answersReady, entryId, form, formGenerationId]);
 
   useEffect(() => () => {
     Object.values(cachedAttachmentUrls).forEach((url) => URL.revokeObjectURL(url));
@@ -14970,9 +14947,11 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
             const queued = await readEncryptedOfflineRecords("submissionQueue").catch(() => []);
             const normalizedIdentifier = resumeCheckpointIdentifier.trim().toLowerCase();
             const localCheckpoint = queued.reverse().find((record) => (
-              String(record.path || "").endsWith("/checkpoint")
+              record.ownerUserId === currentOfflineOwnerId()
+                && String(record.path || "").endsWith("/checkpoint")
                 && normalizeAccessCodeInput(String(record.path || "").split("/forms/")[1]?.split("/")[0] || "")
                   === normalizeAccessCodeInput(accessCode)
+                && String(record.payload?.sourceWorkspaceId || record.formWorkspaceId || "") === loadedWorkspaceId
                 && String(record.payload?.primaryIdentifierValue || "").trim().toLowerCase() === normalizedIdentifier
             ));
             if (!localCheckpoint) throw checkpointError;
@@ -14981,15 +14960,6 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           }
         }
         const resumedAnswers = loadedCheckpointAnswers || {};
-        let interruptedAnswers = {};
-        if (!fresh && !entryId && !Object.keys(resumedAnswers).length && accessCode) {
-          try {
-            const drafts = await readEncryptedOfflineRecords("offlineDrafts");
-            const saved = drafts.find((item) => item.id === offlineDraftId(accessCode, loadedWorkspaceId, entryId));
-            interruptedAnswers = saved?.answers || {};
-            setLocalDraftSaved(Object.keys(interruptedAnswers).length > 0);
-          } catch {}
-        }
         let entryAnswers = {};
         let entryToEdit = null;
         if (entryId) {
@@ -15006,7 +14976,6 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         const seededAnswers = normalizeStoredRepeatAnswers(publishedForm, {
           ...defaults,
           ...resumedAnswers,
-          ...interruptedAnswers,
           ...entryAnswers
         });
         if (primaryIdentifierVariable && loadedCheckpointIdentifierValue) {
@@ -15014,7 +14983,6 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         }
         setEditingEntry(entryToEdit);
         setAnswers(seededAnswers);
-        setAnswersReady(true);
         const startLocationQuestion = publishedForm.questions?.find((question) => question.type === "start-geopoint");
         if (startLocationQuestion && navigator.geolocation && !seededAnswers[startLocationQuestion.name]) {
           navigator.geolocation.getCurrentPosition((position) => {
@@ -15027,9 +14995,13 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         }
         setSubmissionSuccess(false);
         setStatus(accessRevoked
-          ? { kind: "error", message: "Your access to this form was removed. Saved responses and drafts remain on this device; filling is disabled." }
+          ? { kind: "error", message: "Your access to this form was removed. Previously saved work remains on this device; unsaved answers cannot be saved." }
           : packageCached
-          ? { kind: "ok", message: loadedOffline ? "Offline form ready." : entryToEdit ? "Editing submitted entry." : loadedCheckpointAnswers ? "Loaded saved checkpoint." : "Ready" }
+          ? { kind: "ok", message: accessCode
+            ? loadedCheckpointAnswers
+              ? "Loaded saved checkpoint. Changes stay in this tab until you save or submit."
+              : `Form ready${loadedOffline ? " offline" : ""}. Answers stay in this tab until you save a checkpoint or submit.`
+            : entryToEdit ? "Editing submitted entry." : loadedCheckpointAnswers ? "Loaded saved checkpoint." : "Ready" }
           : {
             kind: "error",
             message: `Loaded online, but this device could not save an offline copy${packageCacheError?.message ? `: ${packageCacheError.message}` : "."}`
@@ -15039,7 +15011,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
       }
     }
     loadPublishedForm();
-  }, [accessCode, adminCheckpointIdentifier, adminCheckpointUserId, checkpointAnswers, entryId, formApiBase, fresh, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
+  }, [accessCode, adminCheckpointIdentifier, adminCheckpointUserId, checkpointAnswers, entryId, formApiBase, resumeCheckpointIdentifier, resumePrimaryIdentifierValue, workspaceId]);
 
   function setAnswer(name, value) {
     if (formAccessRevoked) return;
@@ -15081,14 +15053,12 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         const revoked = (access.revocations || []).some((item) => item.workspaceId === formGenerationId);
         if (revoked) {
           setFormAccessRevoked(true);
-          if (!localDraftSaved) {
-            setStatus({ kind: "error", message: "Your access to this form was removed. Saved work is retained on this device, but there is no saved response ready to sync." });
-            return;
-          }
+          setStatus({ kind: "error", message: "Your access to this form was removed. Previously saved work can still sync, but these unsaved answers cannot be submitted." });
+          return;
         }
       }
       if (formAccessRevoked) {
-        setStatus({ kind: "error", message: "Your access to this form was removed. Your saved work is retained on this device, but you can no longer add or edit responses." });
+        setStatus({ kind: "error", message: "Your access to this form was removed. Previously saved work can still sync, but these unsaved answers cannot be submitted." });
         return;
       }
       const validation = validateAnswers(form, answers);
@@ -15148,7 +15118,6 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           ? { kind: "ok", message: "Saved on this device. It will sync when the connection is available." }
           : { kind: "ok", message: editingEntry || entryId ? "Entry updated and synced." : "Submitted and synced." });
       setSubmissionSuccess(!result.unchanged);
-      setLocalDraftSaved(false);
       if (!editingEntry && !entryId) setAnswers({});
     } catch (error) {
       setStatus({ kind: "error", message: error.message || String(error) });
@@ -15157,7 +15126,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
 
   async function saveCheckpoint() {
     if (accessCode && formAccessRevoked) {
-      setStatus({ kind: "error", message: "Your access to this form was removed. The saved work is retained on this device, but you can no longer change it." });
+      setStatus({ kind: "error", message: "Your access to this form was removed. Previously saved work can still sync, but these unsaved answers cannot be checkpointed." });
       return;
     }
     if (accessCode && isOnline()) {
@@ -15165,10 +15134,8 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
         const access = await requestJson("/api/public/forms/access-revocations");
         if ((access.revocations || []).some((item) => item.workspaceId === formGenerationId)) {
           setFormAccessRevoked(true);
-          if (!localDraftSaved) {
-            setStatus({ kind: "error", message: "Your access to this form was removed. Saved work is retained on this device, but there is no saved checkpoint ready to sync." });
-            return;
-          }
+          setStatus({ kind: "error", message: "Your access to this form was removed. Previously saved work can still sync, but these unsaved answers cannot be checkpointed." });
+          return;
         }
       } catch {}
     }
