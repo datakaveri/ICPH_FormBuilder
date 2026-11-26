@@ -144,6 +144,7 @@ services:
       KC_DIRECTORY_CLIENT_ID: "${KEYCLOAK_DIRECTORY_CLIENT_ID:-icph-user-directory}"
       KC_DIRECTORY_CLIENT_SECRET: "${KEYCLOAK_DIRECTORY_CLIENT_SECRET:-}"
       APP_URLS: "${ICPH_APP_URLS:-http://localhost:5174}"
+      APP_RESET_PASSWORDS: "${APP_RESET_PASSWORDS:-}"
     command: python /setup/setup.py
 
 volumes:

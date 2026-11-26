@@ -552,6 +552,13 @@ button:disabled {
   padding: 0 10px;
 }
 
+.version-delete-action {
+  gap: 6px;
+  padding-inline: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .builder-footer {
   position: fixed;
   left: 0;
@@ -649,8 +656,24 @@ button:disabled {
   min-width: 0;
 }
 
+.profile-archive-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
 .profile-archive-row .entry-actions {
   flex-wrap: wrap;
+}
+
+@media (max-width: 620px) {
+  .profile-archive-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .profile-archive-row .entry-actions {
+    justify-content: flex-start;
+  }
 }
 
 .app-shell:has(.field-agent-footer.has-sync-errors) .field-agent-layout {
@@ -5343,6 +5366,10 @@ button:disabled {
   padding: 18px;
   display: grid;
   gap: 14px;
+}
+
+.fill-question {
+  scroll-margin-block: 24px 120px;
 }
 
 .group-page-progress {

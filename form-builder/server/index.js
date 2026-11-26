@@ -566,7 +566,7 @@ async function saveDraft(workspaceId, draft) {
     });
   } catch (error) {
     if (error.code === "23505" && error.constraint === "forms_respondent_access_code_key") {
-      const conflict = new Error("That respondent code is already used by another published form.");
+      const conflict = new Error("That respondent code is already reserved by another published or archived form. Check Profile → Deleted forms; permanently delete an archived form before reusing its code.");
       conflict.statusCode = 409;
       throw conflict;
     }
@@ -1331,7 +1331,10 @@ async function ensureUniqueRespondentAccessCode(code, workspaceId) {
   const cleanCode = cleanRespondentAccessCode(code);
   const owner = await store.accessCodeOwner(cleanCode);
   if (owner && owner !== cleanWorkspaceId(workspaceId)) {
-    const error = new Error("That respondent code is already used by another published form.");
+    const existingForm = await store.formSummary(owner);
+    const error = new Error(existingForm?.deleted_at
+      ? `The code ${cleanCode} is reserved by archived form “${existingForm.draft?.title || owner}”. Permanently delete that form from Profile → Deleted forms before reusing the code.`
+      : "That respondent code is already used by another published form.");
     error.statusCode = 409;
     throw error;
   }

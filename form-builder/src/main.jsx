@@ -1266,6 +1266,7 @@ function groupedQuestionPages(questions = []) {
 function validateAnswers(form, answers, questionSubset = null) {
   const calculated = computeCalculatedAnswers(form, answers);
   const errors = [];
+  const errorQuestionIds = [];
   for (const question of questionSubset || visibleQuestions(form, calculated)) {
     // Group headers hold no answer; "required" on a group row means nothing in ODK.
     if (question.type === "note" || question.type === "calculate" || STRUCTURAL_TYPES.has(question.type)) continue;
@@ -1277,13 +1278,17 @@ function validateAnswers(form, answers, questionSubset = null) {
       : false;
     if ((question.required || requiredByExpression) && String(value).trim() === "") {
       errors.push(`${plainFormText(question.label) || question.name}${question.repeatIndex ? ` (repeat ${question.repeatIndex})` : ""} is required.`);
+      errorQuestionIds.push(question.id);
     }
     if (String(value).trim() && question.constraint?.trim()) {
       const ok = Boolean(evaluateXlsExpression(question.constraint, scopedAnswers, value));
-      if (!ok) errors.push(plainFormText(question.constraintMessage) || `${plainFormText(question.label) || question.name} does not satisfy its constraint.`);
+      if (!ok) {
+        errors.push(plainFormText(question.constraintMessage) || `${plainFormText(question.label) || question.name} does not satisfy its constraint.`);
+        errorQuestionIds.push(question.id);
+      }
     }
   }
-  return { answers: calculated, errors };
+  return { answers: calculated, errors, errorQuestionIds };
 }
 
 const OFFLINE_MESSAGE = "You are offline. Connect to the internet and try again.";
@@ -7725,8 +7730,8 @@ function HomePage({
                         {item.collectionLocked ? <Check size={16} /> : <X size={16} />} {item.collectionLocked ? "Unlock Access" : "Lock Access"}
                       </button>
                     ) : null}
-                    <button className="secondary danger-action" onClick={() => deleteWorkspace(item.workspaceId, item.title)}>
-                      <Trash2 size={16} /> Delete
+                    <button className={`secondary danger-action ${group.versions.length > 1 ? "version-delete-action" : ""}`} onClick={() => deleteWorkspace(item.workspaceId, item.title)}>
+                      <Trash2 size={group.versions.length > 1 ? 14 : 16} /> {group.versions.length > 1 ? "Delete this version" : "Delete"}
 	                    </button>
 	                  </div>
 	                </article>
@@ -8781,6 +8786,7 @@ function PublishSettings({
               onChange={(event) => setCustomRespondentCode(normalizeAccessCodeInput(event.target.value))}
             />
             <small>Use up to 10 letters or numbers. It will be locked once the form is published.</small>
+            <small>Archived forms keep their code reserved. Permanently delete the archived form in Profile → Deleted forms before reusing its code.</small>
           </label>
         ) : (
           <p className="publish-muted-note">A unique code will be generated when publishing succeeds.</p>
@@ -14758,6 +14764,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const cachedPackageRef = useRef(null);
   const [activeGroupPage, setActiveGroupPage] = useState(0);
+  const [validationTargetQuestionId, setValidationTargetQuestionId] = useState("");
   const [editingEntry, setEditingEntry] = useState(null);
   const [languageMode, setLanguageMode] = useState("default");
   const [externalChoices, setExternalChoices] = useState({});
@@ -14794,6 +14801,26 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   useEffect(() => {
     setActiveGroupPage(0);
   }, [form?.formId, entryId, checkpointAnswers, resumeCheckpointIdentifier]);
+
+  useEffect(() => {
+    if (!validationTargetQuestionId) return undefined;
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        const target = [...document.querySelectorAll(".fill-question")]
+          .find((element) => element.dataset.questionId === validationTargetQuestionId);
+        if (target) {
+          target.scrollIntoView({ behavior: "smooth", block: "center" });
+          target.querySelector("input:not(:disabled), select:not(:disabled), textarea:not(:disabled), button:not(:disabled)")?.focus({ preventScroll: true });
+        }
+        setValidationTargetQuestionId("");
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [activeGroupPage, validationTargetQuestionId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -15034,6 +15061,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
   function advanceGroupPage() {
     if (!canAdvanceGroup) {
       setStatus({ kind: "error", message: pageValidation.errors[0] || "Complete this section before continuing." });
+      setValidationTargetQuestionId(pageValidation.errorQuestionIds[0] || "");
       return;
     }
     setStatus({ kind: "ok", message: "Ready" });
@@ -15083,6 +15111,14 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
           return;
         }
         setStatus({ kind: "error", message: validation.errors[0] });
+        const firstErrorQuestionId = validation.errorQuestionIds[0] || "";
+        if (firstErrorQuestionId) {
+          if (hasGroupSections) {
+            const targetPage = groupPages.findIndex((page) => page.some((question) => question.id === firstErrorQuestionId));
+            if (targetPage >= 0) setActiveGroupPage(targetPage);
+          }
+          setValidationTargetQuestionId(firstErrorQuestionId);
+        }
         return;
       }
       const visibleNames = new Set(visibleQuestions(form, validation.answers).map(questionAnswerKey));
@@ -15301,7 +15337,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
             const previousQuestion = pageQuestions[index - 1];
             const startsRepeat = question.repeatIndex && question.repeatIndex !== previousQuestion?.repeatIndex;
             return (
-              <React.Fragment key={question.id}>
+              <div className="fill-question" data-question-id={question.id} key={question.id}>
                 {startsRepeat ? <div className="repeat-instance-heading">{question.repeatLabel || "Repeat"} {question.repeatIndex}</div> : null}
                 <PreviewField
                   question={question}
@@ -15314,7 +15350,7 @@ function FillForm({ workspaceId, accessCode, entryId = "", fresh = false, checkp
                   accessCode={accessCode}
                   cachedAttachments={cachedAttachmentUrls}
                 />
-              </React.Fragment>
+              </div>
             );
         })}
 	        {submissionSuccess ? (

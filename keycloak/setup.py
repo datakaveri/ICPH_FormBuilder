@@ -38,7 +38,11 @@ USERS = [(os.environ.get("APP_ADMIN_USERNAME", "admin"), os.environ.get("APP_ADM
          (os.environ.get("APP_ADMIN3_USERNAME", "admin3"), os.environ.get("APP_ADMIN3_PASSWORD", "password3"),
           "ICPH", "Admin Three", ADMIN_ROLE),
          (os.environ.get("APP_FIELD_AGENT_USERNAME", "fieldagent"), os.environ.get("APP_FIELD_AGENT_PASSWORD", "password"),
-          "Field", "Agent", FIELD_AGENT_ROLE)]
+          "Field", "Agent", FIELD_AGENT_ROLE),
+         (os.environ.get("APP_FIELD_AGENT2_USERNAME", "fieldagent2"), os.environ.get("APP_FIELD_AGENT2_PASSWORD", "password2"),
+          "Field", "Agent Two", FIELD_AGENT_ROLE),
+         (os.environ.get("APP_FIELD_AGENT3_USERNAME", "fieldagent3"), os.environ.get("APP_FIELD_AGENT3_PASSWORD", "password3"),
+          "Field", "Agent Three", FIELD_AGENT_ROLE)]
 RESET_APP_USER_PASSWORDS = {
     username.strip()
     for username in os.environ.get("APP_RESET_PASSWORDS", "").split(",")
